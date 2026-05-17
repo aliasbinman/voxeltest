@@ -41,15 +41,19 @@ Both shipped as plain files in this repo; no submodule init required.
 
 ## Getting set up
 
-1. **Get the source dataset.** Two options:
+1. **Get the dataset.** Two options:
 
-   * **Quick start (mirror):**
-     [Google Drive link](https://drive.google.com/file/d/1QPXVkngvJHYemeVSTTIfTmskaMJy4_do/view?usp=sharing)
-     — pre-packaged copy of the rungholt files this project expects.
-   * **Original source:** Morgan McGuire's
-     [Computer Graphics Archive](https://casual-effects.com/data/).
+   * **Quick start (recommended):** download the bundle from
+     [Google Drive](https://drive.google.com/file/d/1QPXVkngvJHYemeVSTTIfTmskaMJy4_do/view?usp=sharing).
+     Unzip its contents directly into the repo's `assets/` folder. The zip
+     already contains both the raw rungholt OBJ files **and** the
+     pre-processed `.vox` / `.msh` outputs, so you can skip step 3 and go
+     straight to running the viewer.
+   * **From scratch:** grab Morgan McGuire's rungholt archive from his
+     [Computer Graphics Archive](https://casual-effects.com/data/) and
+     unzip it into `assets/rungholt/`.
 
-   Either way, unzip so `assets/rungholt/` looks like:
+   Either way, after unzipping `assets/` should contain:
 
    ```
    assets/rungholt/rungholt.obj
@@ -58,12 +62,21 @@ Both shipped as plain files in this repo; no submodule init required.
    ...
    ```
 
+   and (if you used the bundle) also:
+
+   ```
+   assets/rungholt.vox
+   assets/rungholt_culled.vox
+   assets/rungholt_merged.msh
+   ```
+
 2. **Build.** Open `voxeltest.sln` in Visual Studio 2022, set configuration
    to `Release | x64`, build. Two exes drop into `build/Release/`:
    * `voxelize.exe` — offline tool.
    * `voxeltest.exe` — the viewer.
 
-3. **Bake the voxel data once.** From a shell at the repo root:
+3. **Bake the voxel data once** (skip if you used the bundle in step 1).
+   From a shell at the repo root:
 
    ```
    build\Release\voxelize.exe
