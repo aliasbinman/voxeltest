@@ -41,9 +41,15 @@ Both shipped as plain files in this repo; no submodule init required.
 
 ## Getting set up
 
-1. **Get the source dataset.** Download Morgan McGuire's rungholt archive
-   ([Computer Graphics Archive](https://casual-effects.com/data/)),
-   unzip into `assets/rungholt/` so the structure looks like:
+1. **Get the source dataset.** Two options:
+
+   * **Quick start (mirror):**
+     [Google Drive link](https://drive.google.com/file/d/1QPXVkngvJHYemeVSTTIfTmskaMJy4_do/view?usp=sharing)
+     — pre-packaged copy of the rungholt files this project expects.
+   * **Original source:** Morgan McGuire's
+     [Computer Graphics Archive](https://casual-effects.com/data/).
+
+   Either way, unzip so `assets/rungholt/` looks like:
 
    ```
    assets/rungholt/rungholt.obj
