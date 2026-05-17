@@ -1,0 +1,14 @@
+I want to create a voxel test demo. This will be a playground to test some advanced rendering ideas. 
+To start with it will be quite naieve but can extend with some funky effects.
+
+The app will be Win32 + DX11 + ImGUI. All building via Visual studio so create a sln file. 
+
+Initially create a window with a DX11 renderer. Have a camera with WASD to move and RMB + mouse to look around.
+
+Load a model using the dataset here. 
+
+C:\Users\alias\Downloads\rungholt.zip
+
+ideally I want normal and flat color. 
+
+Have some performance metrics in a ImGUI window

@@ -1,0 +1,39 @@
+# Build outputs
+build/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.lib
+*.exp
+*.tlog
+*.log
+
+# Visual Studio user/temp files
+.vs/
+*.user
+*.suo
+*.aps
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Vendored library inner repos (cloned into third_party/)
+third_party/*/.git/
+
+# Generated voxel assets (regenerate via build/Release/voxelize.exe)
+assets/rungholt.vox
+assets/rungholt_culled.vox
+assets/rungholt_merged.msh
+
+# Source dataset (Mineways extract — third-party; user downloads separately)
+assets/rungholt/
+
+# OS junk
+Thumbs.db
+.DS_Store
