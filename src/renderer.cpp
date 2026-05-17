@@ -290,6 +290,9 @@ bool Renderer::CreateShaders() {
     ComPtr<ID3DBlob> vsbM, psbM;
     if (!compile("vsmain_merged", "vs_5_0", vsbM)) return false;
     if (!compile("psmain_merged", "ps_5_0", psbM)) return false;
+    ComPtr<ID3DBlob> vsbA, psbA;
+    if (!compile("vsmain_atlas", "vs_5_0", vsbA)) return false;
+    if (!compile("psmain_atlas", "ps_5_0", psbA)) return false;
     ComPtr<ID3DBlob> vsbSp, psbSp, csbSp;
     if (!compile("vsmain_splat",  "vs_5_0", vsbSp)) return false;
     if (!compile("psmain_splat",  "ps_5_0", psbSp)) return false;
@@ -331,6 +334,20 @@ bool Renderer::CreateShaders() {
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbM->GetBufferPointer(), psbM->GetBufferSize(), nullptr, psMerged_.GetAddressOf());
     if (FAILED(hr)) return false;
+    hr = device_->CreateVertexShader(vsbA->GetBufferPointer(), vsbA->GetBufferSize(), nullptr, vsAtlas_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    hr = device_->CreatePixelShader(psbA->GetBufferPointer(), psbA->GetBufferSize(), nullptr, psAtlas_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    {
+        D3D11_INPUT_ELEMENT_DESC ilA[] = {
+            { "POSITION", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "UV",       0, DXGI_FORMAT_R16G16_UINT,       0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        };
+        hr = device_->CreateInputLayout(ilA, _countof(ilA),
+                                        vsbA->GetBufferPointer(), vsbA->GetBufferSize(),
+                                        atlasInputLayout_.GetAddressOf());
+        if (FAILED(hr)) return false;
+    }
     hr = device_->CreateVertexShader(vsbSp->GetBufferPointer(), vsbSp->GetBufferSize(), nullptr, vsSplat_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbSp->GetBufferPointer(), psbSp->GetBufferSize(), nullptr, psSplat_.GetAddressOf());
@@ -668,6 +685,72 @@ void Renderer::UploadMergedMesh(const MergedMesh& mesh) {
     mergedIndexCount_ = (uint32_t)mesh.indices.size();
 }
 
+void Renderer::UploadAtlasMesh(const AtlasMesh& mesh) {
+    atlasVb_.Reset();
+    atlasIb_.Reset();
+    atlasTex_.Reset();
+    atlasSrv_.Reset();
+    atlasIndexCount_ = 0;
+    if (mesh.vertices.empty() || mesh.indices.empty()
+        || mesh.atlasPixels.empty() || mesh.atlasW == 0 || mesh.atlasH == 0) return;
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    D3D11_SUBRESOURCE_DATA sd = {};
+
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.ByteWidth = (UINT)(mesh.vertices.size() * sizeof(AtlasVertex));
+    sd.pSysMem = mesh.vertices.data();
+    if (FAILED(device_->CreateBuffer(&bd, &sd, atlasVb_.GetAddressOf()))) return;
+
+    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    bd.ByteWidth = (UINT)(mesh.indices.size() * sizeof(uint32_t));
+    sd.pSysMem = mesh.indices.data();
+    if (FAILED(device_->CreateBuffer(&bd, &sd, atlasIb_.GetAddressOf()))) return;
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = mesh.atlasW;
+    td.Height = mesh.atlasH;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA tsd = {};
+    tsd.pSysMem = mesh.atlasPixels.data();
+    tsd.SysMemPitch = mesh.atlasW * 4;
+    if (FAILED(device_->CreateTexture2D(&td, &tsd, atlasTex_.GetAddressOf()))) return;
+    if (FAILED(device_->CreateShaderResourceView(atlasTex_.Get(), nullptr, atlasSrv_.GetAddressOf()))) return;
+
+    atlasIndexCount_ = (uint32_t)mesh.indices.size();
+    atlasOrigin_[0] = (float)mesh.origin[0];
+    atlasOrigin_[1] = (float)mesh.origin[1];
+    atlasOrigin_[2] = (float)mesh.origin[2];
+
+    atlasSubs_.clear();
+    atlasSubByChunk_.clear();
+    atlasSubs_.reserve(mesh.chunks.size());
+    for (const auto& c : mesh.chunks) {
+        GpuAtlasSub s;
+        s.cx = c.cx; s.cy = c.cy; s.cz = c.cz;
+        for (int d = 0; d < 3; ++d) {
+            s.aabbMin[d] = (float)c.aabbMin[d];
+            s.aabbMax[d] = (float)c.aabbMax[d];
+        }
+        s.firstIndex = c.firstIndex;
+        s.indexCount = c.indexCount;
+        uint64_t key = ((uint64_t)s.cx) | ((uint64_t)s.cy << 20) | ((uint64_t)s.cz << 40);
+        atlasSubByChunk_[key] = (uint32_t)atlasSubs_.size();
+        atlasSubs_.push_back(s);
+    }
+
+    // Use AABB span for grid replication (same convention as MergedMesh).
+    sceneSpan_[0] = mesh.aabbMax[0] - mesh.aabbMin[0] + 1.0f;
+    sceneSpan_[1] = mesh.aabbMax[1] - mesh.aabbMin[1] + 1.0f;
+    sceneSpan_[2] = mesh.aabbMax[2] - mesh.aabbMin[2] + 1.0f;
+}
+
 void Renderer::BeginFrame(float clear[4]) {
     lastClear_[0] = clear[0];
     lastClear_[1] = clear[1];
@@ -846,6 +929,8 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
                     billTriJobs.push_back(j);
                 } else if (tech == RenderTech::MergedMesh) {
                     // MergedMesh has its own draw pass; per-chunk jobs unused.
+                } else if (tech == RenderTech::AtlasMesh) {
+                    // AtlasMesh draws the whole scene in one call; no per-chunk jobs.
                 } else if (tech == RenderTech::Splat) {
                     pointJobs.push_back(j);   // reuse pointJobs as the splat list
                 } else if (tech == RenderTech::SplatHybrid) {
@@ -1154,22 +1239,52 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         ctx_->OMSetRenderTargets(1, rtvs, splatDsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
-        // SplatHybrid: polygons up close, into the same splat RT (depth-tested
-        // against splatDsv_ so points can fill gaps behind/beside them).
-        if (tech == RenderTech::SplatHybrid && !polyJobs.empty()) {
-            ctx_->IASetInputLayout(inputLayout_.Get());
+        // SplatHybrid: polygons up close, drawn from the per-chunk atlas mesh
+        // into the same splat RT (depth-tested against splatDsv_ so points can
+        // fill gaps behind/beside them).
+        if (tech == RenderTech::SplatHybrid && !polyJobs.empty()
+            && atlasVb_ && atlasIb_ && atlasSrv_) {
+            ctx_->IASetInputLayout(atlasInputLayout_.Get());
             ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx_->VSSetShader(vs_.Get(), nullptr, 0);
-            ctx_->PSSetShader(ps_.Get(), nullptr, 0);
-            ID3D11Buffer* vbsP[] = { vb_.Get() };
-            ctx_->IASetVertexBuffers(0, 1, vbsP, &stride, &offset);
-            ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
+            ctx_->VSSetShader(vsAtlas_.Get(), nullptr, 0);
+            ctx_->PSSetShader(psAtlas_.Get(), nullptr, 0);
+            UINT stridA = sizeof(AtlasVertex);
+            UINT offsA = 0;
+            ID3D11Buffer* vbsA[] = { atlasVb_.Get() };
+            ctx_->IASetVertexBuffers(0, 1, vbsA, &stridA, &offsA);
+            ctx_->IASetIndexBuffer(atlasIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
+            ID3D11ShaderResourceView* srvs[] = { nullptr, nullptr, nullptr, atlasSrv_.Get() };
+            ctx_->PSSetShaderResources(0, 4, srvs);
+
             for (const auto& j : polyJobs) {
-                issueChunkCb(j);
-                ctx_->DrawIndexed(j.gs->indexCount, j.gs->firstIndex, j.gs->baseVertex);
+                // (chunkBase - origin) / chunkDim = (cx,cy,cz). Integer-exact.
+                int cx = (int)((j.gs->chunkBase[0] - atlasOrigin_[0]) / (float)chunkDim_);
+                int cy = (int)((j.gs->chunkBase[1] - atlasOrigin_[1]) / (float)chunkDim_);
+                int cz = (int)((j.gs->chunkBase[2] - atlasOrigin_[2]) / (float)chunkDim_);
+                uint64_t key = ((uint64_t)(uint16_t)cx)
+                             | ((uint64_t)(uint16_t)cy << 20)
+                             | ((uint64_t)(uint16_t)cz << 40);
+                auto it = atlasSubByChunk_.find(key);
+                if (it == atlasSubByChunk_.end()) continue;
+                const GpuAtlasSub& s = atlasSubs_[it->second];
+                if (s.indexCount == 0) continue;
+
+                D3D11_MAPPED_SUBRESOURCE mm;
+                ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+                CBPerChunk cc = {};
+                cc.chunkBase[0] = atlasOrigin_[0] + j.ox;
+                cc.chunkBase[1] = atlasOrigin_[1];
+                cc.chunkBase[2] = atlasOrigin_[2] + j.oz;
+                memcpy(mm.pData, &cc, sizeof(cc));
+                ctx_->Unmap(cbPerChunk_.Get(), 0);
+
+                ctx_->DrawIndexed(s.indexCount, s.firstIndex, 0);
                 ++lastDrawn_;
-                lastDrawnTris_ += j.gs->indexCount / 3;
+                lastDrawnTris_ += s.indexCount / 3;
             }
+            ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr };
+            ctx_->PSSetShaderResources(0, 4, nullSrvs);
+            ctx_->IASetInputLayout(inputLayout_.Get());
         }
 
         ctx_->IASetInputLayout(inputLayout_.Get());
@@ -1254,6 +1369,59 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
                 lastDrawnTris_ += mergedIndexCount_ / 3;
             }
         }
+        ctx_->IASetInputLayout(inputLayout_.Get());
+    }
+
+    if (tech == RenderTech::AtlasMesh && atlasVb_ && atlasIb_ && atlasSrv_) {
+        ctx_->IASetInputLayout(atlasInputLayout_.Get());
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx_->VSSetShader(vsAtlas_.Get(), nullptr, 0);
+        ctx_->PSSetShader(psAtlas_.Get(), nullptr, 0);
+        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+        UINT stridA = sizeof(AtlasVertex);
+        UINT offsA  = 0;
+        ID3D11Buffer* vbs[] = { atlasVb_.Get() };
+        ctx_->IASetVertexBuffers(0, 1, vbs, &stridA, &offsA);
+        ctx_->IASetIndexBuffer(atlasIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
+        ID3D11ShaderResourceView* srvs[] = { nullptr, nullptr, nullptr, atlasSrv_.Get() };
+        ctx_->PSSetShaderResources(0, 4, srvs);
+        for (int gz = 0; gz < gridSize; ++gz) {
+            for (int gx = 0; gx < gridSize; ++gx) {
+                float ox = gx * sceneSpan_[0];
+                float oz = gz * sceneSpan_[2];
+                // Vertex pos is uint16 scene-local (origin already subtracted).
+                // Pass world offset = atlasOrigin + grid shift via gChunkBase.
+                D3D11_MAPPED_SUBRESOURCE mm;
+                ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+                CBPerChunk cc = {};
+                cc.chunkBase[0] = atlasOrigin_[0] + ox;
+                cc.chunkBase[1] = atlasOrigin_[1];
+                cc.chunkBase[2] = atlasOrigin_[2] + oz;
+                memcpy(mm.pData, &cc, sizeof(cc));
+                ctx_->Unmap(cbPerChunk_.Get(), 0);
+
+                for (const auto& s : atlasSubs_) {
+                    if (s.indexCount == 0) continue;
+                    // World AABB of this chunk in this grid copy.
+                    float wMin[3] = { s.aabbMin[0] + ox, s.aabbMin[1], s.aabbMin[2] + oz };
+                    float wMax[3] = { s.aabbMax[0] + ox, s.aabbMax[1], s.aabbMax[2] + oz };
+                    bool outside = false;
+                    for (int pi = 0; pi < 6; ++pi) {
+                        const float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
+                        float px = a >= 0 ? wMax[0] : wMin[0];
+                        float py = b >= 0 ? wMax[1] : wMin[1];
+                        float pz = c >= 0 ? wMax[2] : wMin[2];
+                        if (a * px + b * py + c * pz + d < 0.0f) { outside = true; break; }
+                    }
+                    if (outside) continue;
+                    ctx_->DrawIndexed(s.indexCount, s.firstIndex, 0);
+                    ++lastDrawn_;
+                    lastDrawnTris_ += s.indexCount / 3;
+                }
+            }
+        }
+        ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr };
+        ctx_->PSSetShaderResources(0, 4, nullSrvs);
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 

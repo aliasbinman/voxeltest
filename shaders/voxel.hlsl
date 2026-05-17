@@ -444,6 +444,59 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
     gSplatFinalUav[pix] = float4(c0.rgb, 1.0);
 }
 
+// ---------------- AtlasMesh technique ----------------
+// Compact 12 B vertex: uint16 px,py,pz; uint8 face; uint8 _pad; uint16 u,v.
+// Sampled with Load (no sampler/no atlas-size needed) — UV is already in
+// texel coords; linear interp + truncation gives exact texel per pixel.
+Texture2D<float4> gAtlasTex : register(t3);
+
+struct VSAtlasIn {
+    uint4 pos : POSITION;   // .xyz = scene-local grid coords (uint16), .w = (pad<<8)|face
+    uint2 uv  : UV;         // atlas texel coords (uint16)
+};
+struct VSAtlasOut {
+    float4 svpos : SV_Position;
+    float3 wpos  : WPOS;
+    float2 uv    : UV;
+    nointerpolation uint face : FIDX;
+};
+
+VSAtlasOut vsmain_atlas(VSAtlasIn i)
+{
+    VSAtlasOut o;
+    float3 local = float3(i.pos.xyz);
+    float3 world = gChunkBase + local;
+    o.svpos = mul(float4(world, 1.0), gViewProj);
+    o.wpos  = world;
+    o.uv    = float2(i.uv);
+    o.face  = i.pos.w & 0xFFu;
+    return o;
+}
+
+float4 psmain_atlas(VSAtlasOut i) : SV_Target
+{
+    int2 tx = int2(i.uv);                            // truncate -> exact texel
+    float3 col = gAtlasTex.Load(int3(tx, 0)).rgb;
+
+    static const float3 kFaceNormals[6] = {
+        float3( 1, 0, 0), float3(-1, 0, 0),
+        float3( 0, 1, 0), float3( 0,-1, 0),
+        float3( 0, 0, 1), float3( 0, 0,-1)
+    };
+    float3 n = kFaceNormals[i.face & 7];
+
+    int mode = (int)gMode;
+    float fogDist = length(i.wpos - gCamPos);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
+    if (mode == 1) return float4(ApplyFog(col, fogDist), 1.0);
+
+    float ndotl = saturate(dot(n, normalize(gLightDir)));
+    float3 amb  = kAmbientCube[i.face & 7];
+    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
+    float3 light = amb + gAmbient * sun;
+    return float4(ApplyFog(col * light, fogDist), 1.0);
+}
+
 // ---------------- MergedMesh technique ----------------
 // Greedy-meshed triangles, single big VB/IB. Float3 pos + rgba8 color.
 // Normal computed per-pixel via ddx/ddy of world position.

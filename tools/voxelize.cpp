@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <cmath>
 #include <climits>
+#include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <unordered_map>
 #include <intrin.h>
 
@@ -486,6 +488,328 @@ int main(int argc, char** argv) {
         fclose(mf);
         printf("Wrote %s: %.2f MB, %u verts, %u tris\n",
                mOut.c_str(), mb / (1024.0 * 1024.0), vc, ic / 3);
+    }
+
+    // ---------------------------------------------------------------------
+    // Atlas mesh: per-chunk binary greedy-merge coplanar visible faces, store
+    // per-voxel colors in a global UV-indexed texture atlas. Each chunk emits
+    // an indexed submesh so the renderer can frustum-cull.
+    // Output: assets/rungholt_atlas.msh (MSH2)
+    //   magic[4]="MSH2"
+    //   uint32 vertCount, indexCount, atlasW, atlasH, vertexBytes(=12)
+    //   int32  origin[3]
+    //   uint32 chunkCount
+    //   ChunkSub[chunkCount]:
+    //     uint16 cx,cy,cz,_pad
+    //     int32  aabbMin[3]   (world voxel coords)
+    //     int32  aabbMax[3]
+    //     uint32 firstIndex, indexCount
+    //   AtlasVertex[vertCount] (12 B): uint16 px,py,pz; uint8 face; uint8 _pad; uint16 u,v
+    //   uint32 indices[indexCount]
+    //   uint32 atlas[atlasW*atlasH]  (RGBA8)
+    // ---------------------------------------------------------------------
+    #pragma pack(push, 1)
+    struct AVert {
+        uint16_t px, py, pz;
+        uint8_t  face;
+        uint8_t  _pad;
+        uint16_t u, v;
+    };
+    struct AChunkSub {
+        uint16_t cx, cy, cz, _pad;
+        int32_t  aabbMin[3];
+        int32_t  aabbMax[3];
+        uint32_t firstIndex, indexCount;
+    };
+    #pragma pack(pop)
+    static_assert(sizeof(AVert) == 12, "AVert size");
+    static_assert(sizeof(AChunkSub) == 40, "AChunkSub size");
+
+    struct AtlasRect {
+        int axis, sign, sliceA;
+        int u0, v0, w, h;          // u0/v0 in world voxel coords
+        int atlasX, atlasY;
+        int chunkIdx;
+        std::vector<uint32_t> pixels;
+    };
+
+    int32_t spanXm = maxX - minX + 1;
+    int32_t spanYm = maxY - minY + 1;
+    int32_t spanZm = maxZ - minZ + 1;
+    if (spanXm > 65535 || spanYm > 65535 || spanZm > 65535) {
+        fprintf(stderr, "Atlas mesh: span exceeds uint16 (%d,%d,%d)\n", spanXm, spanYm, spanZm);
+        return 1;
+    }
+
+    const int CD = CHUNK_DIM;
+    int nCX = (spanXm + CD - 1) / CD;
+    int nCY = (spanYm + CD - 1) / CD;
+    int nCZ = (spanZm + CD - 1) / CD;
+
+    std::vector<AtlasRect> rects;
+    std::vector<AChunkSub> aSubs;
+    aSubs.reserve(64);
+
+    for (int cz = 0; cz < nCZ; ++cz)
+    for (int cy = 0; cy < nCY; ++cy)
+    for (int cx = 0; cx < nCX; ++cx) {
+        int chunkMinX = minX + cx * CD;
+        int chunkMinY = minY + cy * CD;
+        int chunkMinZ = minZ + cz * CD;
+        int chunkMaxX = chunkMinX + CD - 1; if (chunkMaxX > maxX) chunkMaxX = maxX;
+        int chunkMaxY = chunkMinY + CD - 1; if (chunkMaxY > maxY) chunkMaxY = maxY;
+        int chunkMaxZ = chunkMinZ + CD - 1; if (chunkMaxZ > maxZ) chunkMaxZ = maxZ;
+
+        size_t firstRectIdx = rects.size();
+        int    abMin[3] = { INT32_MAX, INT32_MAX, INT32_MAX };
+        int    abMax[3] = { INT32_MIN, INT32_MIN, INT32_MIN };
+
+        for (int axis = 0; axis < 3; ++axis) {
+            int uAxis = (axis + 1) % 3;
+            int vAxis = (axis + 2) % 3;
+            int aLow  = (axis == 0) ? chunkMinX : (axis == 1) ? chunkMinY : chunkMinZ;
+            int aHigh = (axis == 0) ? chunkMaxX : (axis == 1) ? chunkMaxY : chunkMaxZ;
+            int uLow  = (uAxis == 0) ? chunkMinX : (uAxis == 1) ? chunkMinY : chunkMinZ;
+            int uHigh = (uAxis == 0) ? chunkMaxX : (uAxis == 1) ? chunkMaxY : chunkMaxZ;
+            int vLow  = (vAxis == 0) ? chunkMinX : (vAxis == 1) ? chunkMinY : chunkMinZ;
+            int vHigh = (vAxis == 0) ? chunkMaxX : (vAxis == 1) ? chunkMaxY : chunkMaxZ;
+            int spanU = uHigh - uLow + 1;
+            int spanV = vHigh - vLow + 1;
+            std::vector<uint8_t>  mask((size_t)spanU * spanV);
+            std::vector<uint32_t> col((size_t)spanU * spanV);
+
+            for (int sign = 0; sign < 2; ++sign) {
+                int fi = axis * 2 + sign;
+                for (int sliceA = aLow; sliceA <= aHigh; ++sliceA) {
+                    // Scene viewed from outside its AABB: bottom -Y faces in
+                    // the lowest 2 voxel layers are never visible.
+                    if (fi == 3 && sliceA <= minY + 1) continue;
+                    std::fill(mask.begin(), mask.end(), (uint8_t)0);
+                    std::fill(col.begin(), col.end(), 0u);
+                    for (int vv = 0; vv < spanV; ++vv) {
+                        for (int uu = 0; uu < spanU; ++uu) {
+                            int xyz[3];
+                            xyz[axis]  = sliceA;
+                            xyz[uAxis] = uu + uLow;
+                            xyz[vAxis] = vv + vLow;
+                            if (!isFilled(xyz[0], xyz[1], xyz[2])) continue;
+                            if (!faceExposed(xyz[0], xyz[1], xyz[2], fi)) continue;
+                            size_t idx = (size_t)uu + (size_t)vv * spanU;
+                            mask[idx] = 1;
+                            col[idx]  = colorGrid[bitIdx(xyz[0], xyz[1], xyz[2])];
+                        }
+                    }
+
+                    for (int vv = 0; vv < spanV; ++vv) {
+                        for (int uu = 0; uu < spanU; ) {
+                            if (!mask[(size_t)uu + (size_t)vv * spanU]) { ++uu; continue; }
+                            int w = 1;
+                            while (uu + w < spanU && mask[(size_t)(uu+w) + (size_t)vv * spanU]) ++w;
+                            int h = 1;
+                            while (vv + h < spanV) {
+                                bool ok = true;
+                                for (int j = 0; j < w; ++j) {
+                                    if (!mask[(size_t)(uu+j) + (size_t)(vv+h) * spanU]) { ok = false; break; }
+                                }
+                                if (!ok) break;
+                                ++h;
+                            }
+                            AtlasRect r;
+                            r.axis = axis; r.sign = sign; r.sliceA = sliceA;
+                            // Store in world voxel coords for uniform emission.
+                            r.u0 = uLow + uu;
+                            r.v0 = vLow + vv;
+                            r.w = w; r.h = h;
+                            r.atlasX = r.atlasY = 0;
+                            r.chunkIdx = (int)aSubs.size();
+                            r.pixels.resize((size_t)w * h);
+                            for (int dv = 0; dv < h; ++dv)
+                                for (int du = 0; du < w; ++du)
+                                    r.pixels[(size_t)du + (size_t)dv * w]
+                                        = col[(size_t)(uu+du) + (size_t)(vv+dv) * spanU];
+
+                            // Update chunk AABB by the 4 corners of this quad.
+                            int aFaceOffset = (r.sign == 0) ? 1 : 0;
+                            int corners[4][3];
+                            corners[0][axis] = corners[1][axis] = corners[2][axis] = corners[3][axis]
+                                = r.sliceA + aFaceOffset;
+                            corners[0][uAxis] = r.u0;        corners[0][vAxis] = r.v0;
+                            corners[1][uAxis] = r.u0 + r.w;  corners[1][vAxis] = r.v0;
+                            corners[2][uAxis] = r.u0 + r.w;  corners[2][vAxis] = r.v0 + r.h;
+                            corners[3][uAxis] = r.u0;        corners[3][vAxis] = r.v0 + r.h;
+                            for (int k = 0; k < 4; ++k) {
+                                for (int d = 0; d < 3; ++d) {
+                                    if (corners[k][d] < abMin[d]) abMin[d] = corners[k][d];
+                                    if (corners[k][d] > abMax[d]) abMax[d] = corners[k][d];
+                                }
+                            }
+
+                            rects.push_back(std::move(r));
+                            for (int dv = 0; dv < h; ++dv)
+                                for (int du = 0; du < w; ++du)
+                                    mask[(size_t)(uu+du) + (size_t)(vv+dv) * spanU] = 0;
+                            uu += w;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (rects.size() == firstRectIdx) continue;   // empty chunk
+
+        AChunkSub sub;
+        sub.cx = (uint16_t)cx; sub.cy = (uint16_t)cy; sub.cz = (uint16_t)cz; sub._pad = 0;
+        for (int d = 0; d < 3; ++d) { sub.aabbMin[d] = abMin[d]; sub.aabbMax[d] = abMax[d]; }
+        sub.firstIndex = 0;   // patched after global index emit
+        sub.indexCount = (uint32_t)((rects.size() - firstRectIdx) * 6);
+        aSubs.push_back(sub);
+    }
+    printf("Atlas rects: %zu  chunks: %zu\n", rects.size(), aSubs.size());
+
+    // Pick atlas width so total area packs into ~square. Pad slack ~33%.
+    uint64_t totalArea = 0;
+    for (auto& r : rects) totalArea += (uint64_t)r.w * r.h;
+    uint32_t atlasW = 64;
+    while ((uint64_t)atlasW * atlasW < totalArea * 4 / 3) atlasW *= 2;
+    if (atlasW > 16384) atlasW = 16384;
+
+    // Shelf pack, tallest first.
+    std::vector<size_t> order(rects.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (rects[a].h != rects[b].h) return rects[a].h > rects[b].h;
+        return rects[a].w > rects[b].w;
+    });
+
+    uint32_t shelfY = 0, shelfX = 0, shelfH = 0;
+    for (size_t k : order) {
+        AtlasRect& r = rects[k];
+        if ((uint32_t)r.w > atlasW) atlasW = (uint32_t)r.w;
+        if (shelfX + (uint32_t)r.w > atlasW) {
+            shelfY += shelfH;
+            shelfX = 0;
+            shelfH = 0;
+        }
+        r.atlasX = (int)shelfX;
+        r.atlasY = (int)shelfY;
+        shelfX += (uint32_t)r.w;
+        if ((uint32_t)r.h > shelfH) shelfH = (uint32_t)r.h;
+    }
+    uint32_t atlasH = shelfY + shelfH;
+    atlasH = (atlasH + 3u) & ~3u;
+    if (atlasH < 4) atlasH = 4;
+
+    double atlasMB = (double)atlasW * atlasH * 4.0 / (1024.0 * 1024.0);
+    printf("Atlas: %u x %u (%.2f MB, fill %.1f%%)\n",
+           atlasW, atlasH, atlasMB,
+           100.0 * (double)totalArea / ((double)atlasW * atlasH));
+
+    // Blit each rect's pixels into the atlas buffer.
+    std::vector<uint32_t> atlas((size_t)atlasW * atlasH, 0xFFFF00FFu);
+    for (auto& r : rects) {
+        for (int dv = 0; dv < r.h; ++dv) {
+            uint32_t* dst = &atlas[(size_t)(r.atlasY + dv) * atlasW + r.atlasX];
+            const uint32_t* src = &r.pixels[(size_t)dv * r.w];
+            memcpy(dst, src, sizeof(uint32_t) * (size_t)r.w);
+        }
+    }
+
+    // Emit vertices/indices per chunk so each AChunkSub points at a contiguous
+    // index range. Pos stored as uint16 scene-local (origin subtracted).
+    std::vector<AVert> aVerts;
+    std::vector<uint32_t> aIdx;
+    aVerts.reserve(rects.size() * 4);
+    aIdx.reserve(rects.size() * 6);
+
+    // Bin rects by chunk index for emission order.
+    std::vector<std::vector<size_t>> rectsByChunk(aSubs.size());
+    for (size_t i = 0; i < rects.size(); ++i) {
+        rectsByChunk[rects[i].chunkIdx].push_back(i);
+    }
+
+    for (size_t ci = 0; ci < aSubs.size(); ++ci) {
+        aSubs[ci].firstIndex = (uint32_t)aIdx.size();
+        for (size_t ri : rectsByChunk[ci]) {
+            AtlasRect& r = rects[ri];
+            int axis = r.axis;
+            int uAxis = (axis + 1) % 3;
+            int vAxis = (axis + 2) % 3;
+            int aFaceOffset = (r.sign == 0) ? 1 : 0;
+
+            int p0[3], p1[3], p2[3], p3[3];
+            p0[axis] = p1[axis] = p2[axis] = p3[axis] = r.sliceA + aFaceOffset;
+            p0[uAxis] = r.u0;          p0[vAxis] = r.v0;
+            p1[uAxis] = r.u0 + r.w;    p1[vAxis] = r.v0;
+            p2[uAxis] = r.u0 + r.w;    p2[vAxis] = r.v0 + r.h;
+            p3[uAxis] = r.u0;          p3[vAxis] = r.v0 + r.h;
+
+            int uv0[2] = { r.atlasX,         r.atlasY         };
+            int uv1[2] = { r.atlasX + r.w,   r.atlasY         };
+            int uv2[2] = { r.atlasX + r.w,   r.atlasY + r.h   };
+            int uv3[2] = { r.atlasX,         r.atlasY + r.h   };
+
+            uint8_t face = (uint8_t)(r.axis * 2 + r.sign);
+            auto store = [&](const int p[3], const int uv[2]) {
+                AVert v;
+                v.px = (uint16_t)(p[0] - minX);
+                v.py = (uint16_t)(p[1] - minY);
+                v.pz = (uint16_t)(p[2] - minZ);
+                v.face = face;
+                v._pad = 0;
+                v.u = (uint16_t)uv[0];
+                v.v = (uint16_t)uv[1];
+                aVerts.push_back(v);
+            };
+            uint32_t base = (uint32_t)aVerts.size();
+            store(p0, uv0);
+            store(p1, uv1);
+            store(p2, uv2);
+            store(p3, uv3);
+
+            if (r.sign == 0) {
+                aIdx.push_back(base + 0); aIdx.push_back(base + 1); aIdx.push_back(base + 2);
+                aIdx.push_back(base + 0); aIdx.push_back(base + 2); aIdx.push_back(base + 3);
+            } else {
+                aIdx.push_back(base + 0); aIdx.push_back(base + 3); aIdx.push_back(base + 2);
+                aIdx.push_back(base + 0); aIdx.push_back(base + 2); aIdx.push_back(base + 1);
+            }
+        }
+        aSubs[ci].indexCount = (uint32_t)aIdx.size() - aSubs[ci].firstIndex;
+    }
+    printf("Atlas mesh: %zu verts, %zu tris  (vertex=%zu B, index=%zu B, atlas=%.2f MB)\n",
+           aVerts.size(), aIdx.size() / 3,
+           sizeof(AVert) * aVerts.size(),
+           sizeof(uint32_t) * aIdx.size(),
+           atlasMB);
+
+    {
+        std::string aOut = std::string(out);
+        size_t dot = aOut.find_last_of('.');
+        if (dot != std::string::npos) aOut = aOut.substr(0, dot) + "_atlas.msh";
+        else aOut += "_atlas.msh";
+        FILE* af = fopen(aOut.c_str(), "wb");
+        if (!af) { fprintf(stderr, "open %s failed\n", aOut.c_str()); return 1; }
+        const char amagic[4] = { 'M','S','H','2' };
+        fwrite(amagic, 1, 4, af);
+        uint32_t vc = (uint32_t)aVerts.size();
+        uint32_t ic = (uint32_t)aIdx.size();
+        uint32_t vbytes = (uint32_t)sizeof(AVert);
+        int32_t  aorigin[3] = { minX, minY, minZ };
+        uint32_t chunkCount = (uint32_t)aSubs.size();
+        fwrite(&vc,         sizeof(uint32_t), 1, af);
+        fwrite(&ic,         sizeof(uint32_t), 1, af);
+        fwrite(&atlasW,     sizeof(uint32_t), 1, af);
+        fwrite(&atlasH,     sizeof(uint32_t), 1, af);
+        fwrite(&vbytes,     sizeof(uint32_t), 1, af);
+        fwrite(aorigin,     sizeof(int32_t),  3, af);
+        fwrite(&chunkCount, sizeof(uint32_t), 1, af);
+        fwrite(aSubs.data(), sizeof(AChunkSub), aSubs.size(), af);
+        fwrite(aVerts.data(), sizeof(AVert),    aVerts.size(), af);
+        fwrite(aIdx.data(),   sizeof(uint32_t), aIdx.size(),   af);
+        fwrite(atlas.data(),  sizeof(uint32_t), atlas.size(),  af);
+        long ab = ftell(af);
+        fclose(af);
+        printf("Wrote %s: %.2f MB\n", aOut.c_str(), ab / (1024.0 * 1024.0));
     }
 
     return 0;

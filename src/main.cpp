@@ -62,6 +62,8 @@ struct AppState {
     Scene       pendingScene;
     MergedMesh  pendingMerged;
     bool        mergedLoaded = false;
+    AtlasMesh   pendingAtlas;
+    bool        atlasLoaded = false;
     int         voxSource = 0;   // 0=original, 1=culled
     std::atomic<bool> reloadRequested{ false };
     std::atomic<bool> loadDone{ false };
@@ -174,10 +176,10 @@ void FrameTopBar() {
     ImGui::PlotLines("FPS", g_app.fpsHist, IM_ARRAYSIZE(g_app.fpsHist),
                      g_app.fpsHistIdx, nullptr, 0.0f, 240.0f, ImVec2(0, 60));
 
-    const char* techs[] = { "PolygonBased", "Points", "Hybrid", "HexSprite", "PointCS", "PolyVID", "Billboard", "BillboardTri", "Hybrid2", "MergedMesh", "Splat", "SplatHybrid" };
+    const char* techs[] = { "PolygonBased", "Points", "Hybrid", "HexSprite", "PointCS", "PolyVID", "Billboard", "BillboardTri", "Hybrid2", "MergedMesh", "Splat", "SplatHybrid", "AtlasMesh" };
     {
         int tt = (int)g_app.tech;
-        if (ImGui::Combo("Technique", &tt, techs, IM_ARRAYSIZE(techs), IM_ARRAYSIZE(techs) + 1)) {
+        if (ImGui::Combo("Technique", &tt, techs, IM_ARRAYSIZE(techs), IM_ARRAYSIZE(techs))) {
             g_app.tech = (RenderTech)tt;
         }
     }
@@ -320,6 +322,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
                 std::string merr;
                 g_app.mergedLoaded = LoadMergedMesh("assets/rungholt_merged.msh",
                                                     g_app.pendingMerged, merr);
+                std::string aerr;
+                g_app.atlasLoaded = LoadAtlasMesh("assets/rungholt_atlas.msh",
+                                                  g_app.pendingAtlas, aerr);
             }
             g_app.loadErr = err;
             g_app.loadOk.store(ok);
@@ -360,6 +365,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
                 if (g_app.mergedLoaded) {
                     g_app.renderer.UploadMergedMesh(g_app.pendingMerged);
                     g_app.pendingMerged = MergedMesh{};
+                }
+                if (g_app.atlasLoaded) {
+                    g_app.renderer.UploadAtlasMesh(g_app.pendingAtlas);
+                    g_app.pendingAtlas = AtlasMesh{};
                 }
                 // center camera on aabb
                 float cx = 0.5f * (g_app.pendingScene.aabbMin[0] + g_app.pendingScene.aabbMax[0]);

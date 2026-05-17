@@ -6,6 +6,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <vector>
+#include <unordered_map>
 #include <cstdint>
 #include <wrl/client.h>
 
@@ -43,6 +44,7 @@ enum class RenderTech : int {
     MergedMesh   = 9,   // greedy-meshed single VB/IB
     Splat        = 10,  // points -> color RT (alpha=size); CS sphere reconstruct
     SplatHybrid  = 11,  // polygons up close, splats far (renders into splat RT)
+    AtlasMesh    = 12,  // binary-greedy quads + UV-indexed atlas (compact verts)
 };
 
 enum class PointLighting : int {
@@ -66,6 +68,7 @@ public:
     uint32_t Msaa() const { return msaaSamples_; }
     void UploadScene(const Scene& scene);
     void UploadMergedMesh(const MergedMesh& mesh);
+    void UploadAtlasMesh(const AtlasMesh& mesh);
     void BeginFrame(float clear[4]);
     void DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float hybridThreshold);
     void EndFrame(bool vsync);
@@ -123,6 +126,28 @@ private:
     ComPtr<ID3D11VertexShader>   vsMerged_;
     ComPtr<ID3D11PixelShader>    psMerged_;
     uint32_t                     mergedIndexCount_ = 0;
+
+    // Atlas mesh path (binary-greedy quads + UV texture atlas).
+    ComPtr<ID3D11Buffer>             atlasVb_;
+    ComPtr<ID3D11Buffer>             atlasIb_;
+    ComPtr<ID3D11InputLayout>        atlasInputLayout_;
+    ComPtr<ID3D11VertexShader>       vsAtlas_;
+    ComPtr<ID3D11PixelShader>        psAtlas_;
+    ComPtr<ID3D11Texture2D>          atlasTex_;
+    ComPtr<ID3D11ShaderResourceView> atlasSrv_;
+    uint32_t                         atlasIndexCount_ = 0;
+    float                            atlasOrigin_[3] = { 0, 0, 0 };
+
+    struct GpuAtlasSub {
+        uint16_t cx, cy, cz;
+        float    aabbMin[3];     // world voxel coords (no grid shift)
+        float    aabbMax[3];
+        uint32_t firstIndex;
+        uint32_t indexCount;
+    };
+    std::vector<GpuAtlasSub>         atlasSubs_;
+    // (cx,cy,cz) -> index into atlasSubs_, for SplatHybrid lookup by chunk coord.
+    std::unordered_map<uint64_t,uint32_t> atlasSubByChunk_;
 
     // Splat path.
     ComPtr<ID3D11Texture2D>            splatColorTex_;
