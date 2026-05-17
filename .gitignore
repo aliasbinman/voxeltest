@@ -34,6 +34,9 @@ assets/rungholt_merged.msh
 # Source dataset (Mineways extract — third-party; user downloads separately)
 assets/rungholt/
 
+# ImGui runtime state
+imgui.ini
+
 # OS junk
 Thumbs.db
 .DS_Store
