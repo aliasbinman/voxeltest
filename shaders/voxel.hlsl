@@ -16,7 +16,16 @@ cbuffer cbPerFrame : register(b0)
     float    _pad4;
     float3   gCamForward;
     float    gTanHalfFovY;
+    float3   gFogColor;
+    float    gFogDensity;       // 0 = fog disabled
 };
+
+float3 ApplyFog(float3 color, float dist)
+{
+    if (gFogDensity <= 0.0) return color;
+    float t = exp(-dist * gFogDensity);     // in-scatter (object) weight
+    return lerp(gFogColor, color, t);       // (1-t) of fog mixed in
+}
 
 cbuffer cbPerChunk : register(b1)
 {
@@ -113,21 +122,22 @@ float3 SampleAmbientCubeTriplanar(float3 n)
 float4 psmain_points_simple(VSPointOut i) : SV_Target
 {
     int mode = (int)gMode;
-    if (mode == 1) return float4(i.col, 1.0);
+    float fogDist = length(i.wpos - gCamPos);
+    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
     float3 n = normalize(gCamPos - i.wpos);
-    if (mode == 2) return float4(n * 0.5 + 0.5, 1.0);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(i.col * light, 1.0);
+    return float4(ApplyFog(i.col * light, fogDist), 1.0);
 }
 
 // Complex: per-axis up-to-3 cardinal faces, weighted by projected area.
 float4 psmain_points(VSPointOut i) : SV_Target
 {
     int mode = (int)gMode;
-    if (mode == 1) return float4(i.col, 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, length(i.wpos - gCamPos)), 1.0);
 
     // Choose up to 3 candidate cardinal faces: the ones the camera could see.
     // Per axis: positive face if D.axis >= 0, else negative face.
@@ -165,15 +175,16 @@ float4 psmain_points(VSPointOut i) : SV_Target
         accumW   += w;
     }
 
+    float fogDist = length(i.wpos - gCamPos);
     if (accumW <= 1e-5) {
-        if (mode == 2) return float4(0.5, 0.5, 0.5, 1.0);
-        return float4(i.col, 1.0);
+        if (mode == 2) return float4(ApplyFog(float3(0.5, 0.5, 0.5), fogDist), 1.0);
+        return float4(ApplyFog(i.col, fogDist), 1.0);
     }
 
     if (mode == 2) {
-        return float4(normalize(accumN) * 0.5 + 0.5, 1.0);
+        return float4(ApplyFog(normalize(accumN) * 0.5 + 0.5, fogDist), 1.0);
     }
-    return float4(accumCol / accumW, 1.0);
+    return float4(ApplyFog(accumCol / accumW, fogDist), 1.0);
 }
 
 // ---------------- PointCS compute path ----------------
@@ -277,6 +288,7 @@ struct VSPolyVidOut {
     float4 svpos : SV_Position;
     float3 nrm   : NRM;
     float3 col   : COL;
+    float3 wpos  : WPOS;
 };
 
 VSPolyVidOut vsmain_polyvid(uint vid : SV_VertexID)
@@ -298,6 +310,7 @@ VSPolyVidOut vsmain_polyvid(uint vid : SV_VertexID)
     o.col   = float3((v.col >>  0u) & 0xFFu,
                      (v.col >>  8u) & 0xFFu,
                      (v.col >> 16u) & 0xFFu) / 255.0;
+    o.wpos  = world;
     return o;
 }
 
@@ -308,18 +321,36 @@ float4 psmain_polyvid(VSPolyVidOut i) : SV_Target
     n = n * n;
     n = normalize(i.nrm * n);
     int mode = (int)gMode;
-    if (mode == 2) return float4(n * 0.5 + 0.5, 1.0);
-    if (mode == 1) return float4(i.col, 1.0);
+    float fogDist = length(i.wpos - gCamPos);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(i.col * light, 1.0); 
+    return float4(ApplyFog(i.col * light, fogDist), 1.0);
 }
 
 // ---------------- Splat technique ----------------
-// Points rendered into an RGBA8 RT: rgb = base color, a = splat radius (px) / 16.
-// Then a compute shader does a sphere-reconstruction pass per output pixel.
+// Points rendered into an RGBA8 RT: rgb = base color, a = LOD tag (for CS pass).
+// SPLAT_FANCY_SHADING: 0 = raw base color (cheap, needed for CS filter alpha tag),
+//                     1 = full point shading (triplanar ambient + sun + fog).
+#define SPLAT_FANCY_SHADING 1
+
+#if SPLAT_FANCY_SHADING
+
+VSPointOut vsmain_splat(VSIn i)
+{
+    return vsmain_points(i);
+}
+
+float4 psmain_splat(VSPointOut i) : SV_Target
+{
+    return psmain_points_simple(i);
+}
+
+#else
+
 struct VSSplatOut {
     float4 svpos : SV_Position;
     float4 col   : COL;      // rgb = base color, a = LOD index (0/1/2) as raw byte
@@ -342,6 +373,8 @@ float4 psmain_splat(VSSplatOut i) : SV_Target
 {
     return i.col;
 }
+
+#endif
 
 // CS reconstruction: for each output pixel, search neighbors for the nearest
 // point whose splat sphere covers it; use its color (background if none).
@@ -406,7 +439,9 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
         }
     }
 
-    gSplatFinalUav[pix] = float4(0.10, 0.12, 0.16, 1.0);
+    // No hit in any ring -> fall back to the cleared background color (the
+    // host clears splatColorTex_ RGB to the current scene clear color).
+    gSplatFinalUav[pix] = float4(c0.rgb, 1.0);
 }
 
 // ---------------- MergedMesh technique ----------------
@@ -438,13 +473,14 @@ float4 psmain_merged(VSMergedOut i) : SV_Target
     n = sign(n) * pow(abs(n), 7.0);
     n = normalize(n);
     int mode = (int)gMode;
-    if (mode == 2) return float4(n * 0.5 + 0.5, 1.0);
-    if (mode == 1) return float4(i.col, 1.0);
+    float fogDist = length(i.wpos - gCamPos);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(i.col * light, 1.0);
+    return float4(ApplyFog(i.col * light, fogDist), 1.0);
 }
 
 // ---------------- Billboard technique ----------------
@@ -559,14 +595,15 @@ float4 psmain_billboard(VSBillOut i,
     depthOut = saturate(clipHit.z / max(clipHit.w, 1e-6));
 
     int mode = (int)gMode;
-    if (mode == 2) return float4(n * 0.5 + 0.5, 1.0);
-    if (mode == 1) return float4(i.col, 1.0);
+    float fogDist = length(hit - gCamPos);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
 
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(i.col * light, 1.0);
+    return float4(ApplyFog(i.col * light, fogDist), 1.0);
 }
 
 // ---------------- HexSprite technique ----------------
@@ -631,14 +668,15 @@ float4 psmain_hex(VSHexOut i) : SV_Target
     float3 n   = normalize(cross(dpx, dpy));
 
     int mode = (int)gMode;
-    if (mode == 2) return float4(n * 0.5 + 0.5, 1.0);
-    if (mode == 1) return float4(i.col, 1.0);
+    float fogDist = length(i.wpos - gCamPos);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
 
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(i.col * light, 1.0);
+    return float4(ApplyFog(i.col * light, fogDist), 1.0);
 }
 
 // ---------------- Polygon technique ----------------
@@ -656,12 +694,13 @@ float4 psmain(VSOut i) : SV_Target
     n = normalize(n);
 
     int mode = (int)gMode;
-    if (mode == 2) return float4(n * 0.5 + 0.5, 1.0);
-    if (mode == 1) return float4(i.col.rgb, 1.0);
+    float fogDist = length(i.wpos - gCamPos);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col.rgb, fogDist), 1.0);
 
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);  // axis-aligned n => single bucket
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(i.col.rgb * light, 1.0);
+    return float4(ApplyFog(i.col.rgb * light, fogDist), 1.0);
 }

@@ -42,6 +42,7 @@ enum class RenderTech : int {
     Hybrid2      = 8,   // PolyVID up close, BillboardTri at distance
     MergedMesh   = 9,   // greedy-meshed single VB/IB
     Splat        = 10,  // points -> color RT (alpha=size); CS sphere reconstruct
+    SplatHybrid  = 11,  // polygons up close, splats far (renders into splat RT)
 };
 
 enum class PointLighting : int {
@@ -66,7 +67,7 @@ public:
     void UploadScene(const Scene& scene);
     void UploadMergedMesh(const MergedMesh& mesh);
     void BeginFrame(float clear[4]);
-    void DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter);
+    void DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float hybridThreshold);
     void EndFrame(bool vsync);
 
     ID3D11Device*        Device()  const { return device_.Get(); }
@@ -177,4 +178,5 @@ private:
     uint32_t lastDrawn_ = 0;
     uint64_t lastDrawnTris_ = 0;
     float    sceneSpan_[3] = { 0, 0, 0 };
+    float    lastClear_[4] = { 0, 0, 0, 1 };
 };

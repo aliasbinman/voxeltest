@@ -26,6 +26,8 @@ struct CBPerFrame {
     float _pad4;
     float camForward[3];
     float tanHalfFovY;
+    float fogColor[3];
+    float fogDensity;   // 0 = fog off
 };
 
 struct CBPerChunk {
@@ -667,6 +669,10 @@ void Renderer::UploadMergedMesh(const MergedMesh& mesh) {
 }
 
 void Renderer::BeginFrame(float clear[4]) {
+    lastClear_[0] = clear[0];
+    lastClear_[1] = clear[1];
+    lastClear_[2] = clear[2];
+    lastClear_[3] = clear[3];
     ID3D11RenderTargetView* active = (msaaSamples_ > 1) ? msaaRtv_.Get() : rtv_.Get();
     ID3D11RenderTargetView* rtvs[] = { active };
     ctx_->OMSetRenderTargets(1, rtvs, dsv_.Get());
@@ -681,7 +687,8 @@ void Renderer::BeginFrame(float clear[4]) {
     ctx_->RSSetViewports(1, &vp);
 }
 
-void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter) {
+void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float hybridThreshold) {
+    if (hybridThreshold < 0.01f) hybridThreshold = 0.01f;
     if (pointLodScale < 0.01f) pointLodScale = 0.01f;
     if (gridSize < 1) gridSize = 1;
     if (gridSize > 10) gridSize = 10;
@@ -714,6 +721,8 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         hlslpp::store(cb.camForward, fwd);
         cb._pad3 = cb._pad4 = 0;
         cb.tanHalfFovY = tanf(cam.fovDeg * 3.14159265358979f / 180.0f * 0.5f);
+        cb.fogColor[0] = fogColor[0]; cb.fogColor[1] = fogColor[1]; cb.fogColor[2] = fogColor[2];
+        cb.fogDensity  = fogDensity;
         memcpy(m.pData, &cb, sizeof(cb));
     }
     ctx_->Unmap(cbPerFrame_.Get(), 0);
@@ -839,6 +848,19 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
                     // MergedMesh has its own draw pass; per-chunk jobs unused.
                 } else if (tech == RenderTech::Splat) {
                     pointJobs.push_back(j);   // reuse pointJobs as the splat list
+                } else if (tech == RenderTech::SplatHybrid) {
+                    // Polygons close, splats far. Both consumed by the Splat block.
+                    float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
+                             : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
+                    float dy = camP[1] < aMin[1] ? aMin[1] - camP[1]
+                             : camP[1] > aMax[1] ? camP[1] - aMax[1] : 0.0f;
+                    float dz = camP[2] < aMin[2] ? aMin[2] - camP[2]
+                             : camP[2] > aMax[2] ? camP[2] - aMax[2] : 0.0f;
+                    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+                    if (dist < 1e-3f) dist = 1e-3f;
+                    float ppv = focalPx / dist;
+                    if (ppv >= hybridThreshold) polyJobs.push_back(j);
+                    else                        pointJobs.push_back(j);
                 } else if (tech == RenderTech::Hybrid2) {
                     float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
                              : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
@@ -849,8 +871,8 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
                     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
                     if (dist < 1e-3f) dist = 1e-3f;
                     float ppv = focalPx / dist;
-                    if (ppv >= 1.0f) vidJobs.push_back(j);
-                    else             billTriJobs.push_back(j);
+                    if (ppv >= hybridThreshold) vidJobs.push_back(j);
+                    else                        billTriJobs.push_back(j);
                 } else {
                     // Hybrid: nearest point of chunk AABB to camera.
                     float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
@@ -862,8 +884,8 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
                     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
                     if (dist < 1e-3f) dist = 1e-3f;
                     float pixelsPerVoxel = focalPx / dist;
-                    if (pixelsPerVoxel < 1.0f) pointJobs.push_back(j);
-                    else                       vidJobs.push_back(j);   // Hybrid uses PolyVID
+                    if (pixelsPerVoxel < hybridThreshold) pointJobs.push_back(j);
+                    else                                  vidJobs.push_back(j);   // Hybrid uses PolyVID
                 }
             }
         }
@@ -918,7 +940,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
     }
 
-    if (!polyJobs.empty()) {
+    if (!polyJobs.empty() && tech != RenderTech::SplatHybrid) {
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx_->VSSetShader(vs_.Get(), nullptr, 0);
         ctx_->PSSetShader(ps_.Get(), nullptr, 0);
@@ -934,7 +956,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         }
         if (doPrepass) ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
     }
-    if (!pointJobs.empty() && pointVb_) {
+    if (!pointJobs.empty() && pointVb_ && tech != RenderTech::Splat && tech != RenderTech::SplatHybrid) {
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
         ctx_->VSSetShader(vsPoints_.Get(), nullptr, 0);
         ctx_->PSSetShader(pointLight == PointLighting::Simple
@@ -1117,20 +1139,46 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
-    if (tech == RenderTech::Splat && !pointJobs.empty() && pointVb_
+    if ((tech == RenderTech::Splat || tech == RenderTech::SplatHybrid)
+        && (!pointJobs.empty() || !polyJobs.empty()) && pointVb_
         && splatColorRtv_ && splatFinalUav_) {
-        // Pass 1: render points to splatColorTex_ with reverse-Z depth.
-        float clr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        // Pass 1: always render points to splatColorTex_ + splatDsv_. Identical
+        // raster behavior whether or not CS filter runs. Clear RGB with the
+        // current scene clear color so the backbuffer appearance matches when
+        // CopyResource lands. Keep alpha = 0 so CS reconstruction can
+        // distinguish background (a==0) from lit pixels (PS writes a=1).
+        float clr[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
         ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clr);
         ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
         ID3D11RenderTargetView* rtvs[] = { splatColorRtv_.Get() };
         ctx_->OMSetRenderTargets(1, rtvs, splatDsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
+        // SplatHybrid: polygons up close, into the same splat RT (depth-tested
+        // against splatDsv_ so points can fill gaps behind/beside them).
+        if (tech == RenderTech::SplatHybrid && !polyJobs.empty()) {
+            ctx_->IASetInputLayout(inputLayout_.Get());
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx_->VSSetShader(vs_.Get(), nullptr, 0);
+            ctx_->PSSetShader(ps_.Get(), nullptr, 0);
+            ID3D11Buffer* vbsP[] = { vb_.Get() };
+            ctx_->IASetVertexBuffers(0, 1, vbsP, &stride, &offset);
+            ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
+            for (const auto& j : polyJobs) {
+                issueChunkCb(j);
+                ctx_->DrawIndexed(j.gs->indexCount, j.gs->firstIndex, j.gs->baseVertex);
+                ++lastDrawn_;
+                lastDrawnTris_ += j.gs->indexCount / 3;
+            }
+        }
+
         ctx_->IASetInputLayout(inputLayout_.Get());
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
-        ctx_->VSSetShader(vsSplat_.Get(), nullptr, 0);
-        ctx_->PSSetShader(psSplat_.Get(), nullptr, 0);
+        // Use Points-mode shaders so Splat looks identical to Points tech.
+        ctx_->VSSetShader(vsPoints_.Get(), nullptr, 0);
+        ctx_->PSSetShader(pointLight == PointLighting::Simple
+                              ? psPointsSimple_.Get()
+                              : psPoints_.Get(), nullptr, 0);
         ID3D11Buffer* vbs[] = { pointVb_.Get() };
         UINT vbStride = sizeof(Vertex), vbOff = 0;
         ctx_->IASetVertexBuffers(0, 1, vbs, &vbStride, &vbOff);
@@ -1144,7 +1192,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
             lastDrawnTris_ += count;
         }
 
-        // Pass 2: optional CS reconstruction.
+        // Pass 2: optional CS reconstruction; else copy raw RT to backbuffer.
         ComPtr<ID3D11Texture2D> backBuf;
         swap_->GetBuffer(0, IID_PPV_ARGS(backBuf.GetAddressOf()));
         if (splatFilter) {
@@ -1168,7 +1216,6 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
             ctx_->CSSetShader(nullptr, nullptr, 0);
             if (backBuf) ctx_->CopyResource(backBuf.Get(), splatFinalTex_.Get());
         } else {
-            // No filter: copy raw point RT directly to backbuffer.
             if (backBuf) ctx_->CopyResource(backBuf.Get(), splatColorTex_.Get());
         }
 

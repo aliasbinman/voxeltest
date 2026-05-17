@@ -47,7 +47,11 @@ struct AppState {
     PointLighting pointLight = PointLighting::Complex;
     PointLod pointLod = PointLod::Auto;
     float    pointLodScale = 1.0f;
+    float    hybridThreshold = 1.0f;   // ppv >= this -> polygons, else points
     bool     splatFilter = true;
+    int      fogMode = 0;        // 0 = off, 1 = depth
+    float    fogDensity = 0.0005f;
+    float    fogColor[3] = { 0.55f, 0.60f, 0.70f };
     int      msaa = 1;
     bool     rmbDown = false;
     POINT    lastMouse = { 0, 0 };
@@ -170,8 +174,15 @@ void FrameTopBar() {
     ImGui::PlotLines("FPS", g_app.fpsHist, IM_ARRAYSIZE(g_app.fpsHist),
                      g_app.fpsHistIdx, nullptr, 0.0f, 240.0f, ImVec2(0, 60));
 
+    const char* techs[] = { "PolygonBased", "Points", "Hybrid", "HexSprite", "PointCS", "PolyVID", "Billboard", "BillboardTri", "Hybrid2", "MergedMesh", "Splat", "SplatHybrid" };
+    {
+        int tt = (int)g_app.tech;
+        if (ImGui::Combo("Technique", &tt, techs, IM_ARRAYSIZE(techs), IM_ARRAYSIZE(techs) + 1)) {
+            g_app.tech = (RenderTech)tt;
+        }
+    }
+
     ImGui::Separator();
-    const char* techs[] = { "PolygonBased", "Points", "Hybrid", "HexSprite", "PointCS", "PolyVID", "Billboard", "BillboardTri", "Hybrid2", "MergedMesh", "Splat" };
     {
         const char* sources[] = { "Original", "Culled" };
         int sel = g_app.voxSource;
@@ -180,17 +191,23 @@ void FrameTopBar() {
             g_app.reloadRequested.store(true);
         }
     }
-    int tt = (int)g_app.tech;
-    if (ImGui::Combo("Technique", &tt, techs, IM_ARRAYSIZE(techs))) {
-        g_app.tech = (RenderTech)tt;
-    }
     const char* lods[] = { "L0 (1 per voxel)", "L1 (2x2x2)", "L2 (4x4x4)", "Auto" };
     int lo = (int)g_app.pointLod;
     if (ImGui::Combo("Point LOD", &lo, lods, IM_ARRAYSIZE(lods))) {
         g_app.pointLod = (PointLod)lo;
     }
     ImGui::SliderFloat("LOD distance", &g_app.pointLodScale, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+    ImGui::SliderFloat("Hybrid poly threshold (ppv)", &g_app.hybridThreshold, 0.25f, 16.0f, "%.2f px", ImGuiSliderFlags_Logarithmic);
     ImGui::Checkbox("Splat CS filter", &g_app.splatFilter);
+    if (ImGui::CollapsingHeader("Fog")) {
+        const char* fogModes[] = { "Off", "Depth" };
+        int fm = g_app.fogMode;
+        if (ImGui::Combo("Mode", &fm, fogModes, IM_ARRAYSIZE(fogModes))) {
+            g_app.fogMode = fm;
+        }
+        ImGui::SliderFloat("Density", &g_app.fogDensity, 0.0f, 0.005f, "%.5f", ImGuiSliderFlags_Logarithmic);
+        ImGui::ColorEdit3("Color", g_app.fogColor);
+    }
     const char* pls[] = { "Simple", "Complex" };
     int pli = (int)g_app.pointLight;
     if (ImGui::Combo("Point lighting", &pli, pls, IM_ARRAYSIZE(pls))) {
@@ -373,9 +390,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         FrameTopBar();
         ImGui::Render();
 
-        g_app.renderer.BeginFrame(g_app.bgColor);
+        float clear[4];
+        if (g_app.fogMode != 0) {
+            clear[0] = g_app.fogColor[0];
+            clear[1] = g_app.fogColor[1];
+            clear[2] = g_app.fogColor[2];
+            clear[3] = 1.0f;
+        } else {
+            clear[0] = g_app.bgColor[0];
+            clear[1] = g_app.bgColor[1];
+            clear[2] = g_app.bgColor[2];
+            clear[3] = g_app.bgColor[3];
+        }
+        g_app.renderer.BeginFrame(clear);
         if (g_app.sceneReady && g_app.loadOk.load()) {
-            g_app.renderer.DrawScene(g_app.camera, g_app.mode, g_app.gridSize, g_app.tech, g_app.showChunkBounds, g_app.zPrepass, g_app.pointLight, g_app.pointLod, g_app.pointLodScale, g_app.splatFilter);
+            float effFogDensity = (g_app.fogMode == 0) ? 0.0f : g_app.fogDensity;
+            g_app.renderer.DrawScene(g_app.camera, g_app.mode, g_app.gridSize, g_app.tech, g_app.showChunkBounds, g_app.zPrepass, g_app.pointLight, g_app.pointLod, g_app.pointLodScale, g_app.splatFilter, g_app.fogColor, effFogDensity, g_app.hybridThreshold);
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_app.renderer.EndFrame(g_app.vsync);
