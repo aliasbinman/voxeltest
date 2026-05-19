@@ -178,7 +178,7 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
     }
 
     // Pass 2 + 3: per-LOD aggregates appended contiguously.
-    struct Accum { uint32_t r = 0, g = 0, b = 0, shadow = 0; uint16_t count = 0; uint8_t mask = 0; };
+    struct Accum { uint32_t r = 0, g = 0, b = 0; uint16_t count = 0; uint8_t mask = 0; uint8_t shadowMask = 0; };
     auto lodPass = [&](int step, uint32_t SubMesh::*offsetField, uint32_t SubMesh::*countField) {
         for (uint32_t ci = 0; ci < chunkCount; ++ci) {
             if (!chunkValid[ci]) continue;
@@ -199,7 +199,7 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
                 a.r += (dv.color >>  0) & 0xFF;
                 a.g += (dv.color >>  8) & 0xFF;
                 a.b += (dv.color >> 16) & 0xFF;
-                a.shadow += (dv.color >> 24) & 0xFFu;
+                a.shadowMask |= (uint8_t)((dv.color >> 24) & 0x3Fu);
                 a.count++;
                 a.mask |= dv.visMask;
             }
@@ -214,9 +214,8 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
                 uint32_t r = a.r / a.count;
                 uint32_t g = a.g / a.count;
                 uint32_t b = a.b / a.count;
-                uint8_t sh = (uint8_t)(a.shadow / a.count);
                 out.pointVertices.push_back(
-                    MakeVoxVertex(srx, sry, srz, r | (g << 8) | (b << 16), a.mask, sh));
+                    MakeVoxVertex(srx, sry, srz, r | (g << 8) | (b << 16), a.mask, a.shadowMask));
             }
         }
     };

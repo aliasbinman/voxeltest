@@ -18,7 +18,7 @@ inline Vertex MakeVoxVertex(int sx, int sy, int sz, uint32_t rgba, uint8_t mask,
     v.px = (uint16_t)sx;
     v.py = (uint16_t)sy;
     v.pz = (uint16_t)sz;
-    v.aux = (uint16_t)shadow;       // low byte = sun-shadow factor (0..255)
+    v.aux = (uint16_t)shadow;       // low 6 bits = per-face sun-shadow mask
     v.color = (rgba & 0x00FFFFFFu) | ((uint32_t)mask << 24);
     return v;
 }

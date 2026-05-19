@@ -129,10 +129,12 @@ int main(int argc, char** argv) {
     printf("Voxel AABB: (%d,%d,%d) .. (%d,%d,%d)\n", minX, minY, minZ, maxX, maxY, maxZ);
 
     // ---------------------------------------------------------------------
-    // Sun shadow pass. For each voxel, DDA-march a ray toward the sun until
-    // it exits the AABB or hits another filled voxel. Result packed as a
-    // byte in color alpha (0 = shadowed, 255 = lit). Sun direction stored
-    // in the VXL3 header so the runtime knows where the light came from.
+    // Sun shadow pass. Per face (not per voxel) — DDA from face center along
+    // sun. Voxel-center origin self-occludes against same-wall voxels above,
+    // darkening exposed side faces. Face-center origin starts in the empty
+    // neighbor cell so the DDA only catches actual occluders.
+    // Result: 6-bit mask in color alpha, bit i = face i lit (1) / shadowed (0).
+    // Face order matches kFaceDelta: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
     // ---------------------------------------------------------------------
     float sunDirX = 0.4f, sunDirY = 0.8f, sunDirZ = 0.2f;
     {
@@ -157,7 +159,8 @@ int main(int argc, char** argv) {
             return (filled[i >> 3] >> (i & 7)) & 1u;
         };
 
-        // Amanatides-Woo DDA from voxel center along sun direction.
+        // Amanatides-Woo DDA toward sun. Per-face origin = voxel center +
+        // 0.501 * faceNormal (just past the face into the empty neighbor).
         const float invX = (fabsf(sunDirX) > 1e-6f) ? 1.0f / fabsf(sunDirX) : 1e30f;
         const float invY = (fabsf(sunDirY) > 1e-6f) ? 1.0f / fabsf(sunDirY) : 1e30f;
         const float invZ = (fabsf(sunDirZ) > 1e-6f) ? 1.0f / fabsf(sunDirZ) : 1e30f;
@@ -165,26 +168,45 @@ int main(int argc, char** argv) {
         const int stepY = sunDirY > 0 ? 1 : (sunDirY < 0 ? -1 : 0);
         const int stepZ = sunDirZ > 0 ? 1 : (sunDirZ < 0 ? -1 : 0);
         const int kMaxSteps = (maxX - minX) + (maxY - minY) + (maxZ - minZ) + 16;
-        uint64_t lit = 0, shadowed = 0;
+        uint64_t litFaces = 0, shadowedFaces = 0;
         for (auto& kv : voxels) {
-            int ix = kv.first.x, iy = kv.first.y, iz = kv.first.z;
-            float tMaxX = (stepX != 0) ? (stepX > 0 ? 0.5f : 0.5f) * invX : 1e30f;
-            float tMaxY = (stepY != 0) ? (stepY > 0 ? 0.5f : 0.5f) * invY : 1e30f;
-            float tMaxZ = (stepZ != 0) ? (stepZ > 0 ? 0.5f : 0.5f) * invZ : 1e30f;
-            bool hit = false;
-            for (int s = 0; s < kMaxSteps; ++s) {
-                if (tMaxX < tMaxY && tMaxX < tMaxZ) { ix += stepX; tMaxX += invX; }
-                else if (tMaxY < tMaxZ)             { iy += stepY; tMaxY += invY; }
-                else                                { iz += stepZ; tMaxZ += invZ; }
-                if (ix < minX || ix > maxX || iy < minY || iy > maxY || iz < minZ || iz > maxZ) break;
-                if (isFilledFast(ix, iy, iz)) { hit = true; break; }
+            uint8_t mask = 0;
+            for (int fi = 0; fi < 6; ++fi) {
+                // Faces whose normal points away from sun (n·sun <= 0) never
+                // get direct light. Mark shadowed without tracing.
+                float fnDotSun = kFaceDelta[fi][0] * sunDirX
+                               + kFaceDelta[fi][1] * sunDirY
+                               + kFaceDelta[fi][2] * sunDirZ;
+                if (fnDotSun <= 0.0f) { ++shadowedFaces; continue; }
+
+                float ox = (float)kv.first.x + 0.5f + 0.501f * (float)kFaceDelta[fi][0];
+                float oy = (float)kv.first.y + 0.5f + 0.501f * (float)kFaceDelta[fi][1];
+                float oz = (float)kv.first.z + 0.5f + 0.501f * (float)kFaceDelta[fi][2];
+                int ix = (int)floorf(ox), iy = (int)floorf(oy), iz = (int)floorf(oz);
+                float fx = ox - (float)ix, fy = oy - (float)iy, fz = oz - (float)iz;
+                float tMaxX = (stepX > 0) ? (1.0f - fx) * invX
+                            : (stepX < 0) ? fx * invX : 1e30f;
+                float tMaxY = (stepY > 0) ? (1.0f - fy) * invY
+                            : (stepY < 0) ? fy * invY : 1e30f;
+                float tMaxZ = (stepZ > 0) ? (1.0f - fz) * invZ
+                            : (stepZ < 0) ? fz * invZ : 1e30f;
+                bool hit = false;
+                // Origin cell itself can be filled (concave geometry); skip
+                // initial check, only test cells we step into.
+                for (int s = 0; s < kMaxSteps; ++s) {
+                    if (tMaxX < tMaxY && tMaxX < tMaxZ) { ix += stepX; tMaxX += invX; }
+                    else if (tMaxY < tMaxZ)             { iy += stepY; tMaxY += invY; }
+                    else                                { iz += stepZ; tMaxZ += invZ; }
+                    if (ix < minX || ix > maxX || iy < minY || iy > maxY || iz < minZ || iz > maxZ) break;
+                    if (isFilledFast(ix, iy, iz)) { hit = true; break; }
+                }
+                if (hit) ++shadowedFaces;
+                else { mask |= (uint8_t)(1u << fi); ++litFaces; }
             }
-            uint8_t shadowByte = hit ? 0u : 255u;
-            kv.second = (kv.second & 0x00FFFFFFu) | ((uint32_t)shadowByte << 24);
-            if (hit) ++shadowed; else ++lit;
+            kv.second = (kv.second & 0x00FFFFFFu) | ((uint32_t)mask << 24);
         }
-        printf("Sun shadow: %llu lit, %llu shadowed (sunDir = %.3f, %.3f, %.3f)\n",
-               (unsigned long long)lit, (unsigned long long)shadowed,
+        printf("Sun shadow (per-face): %llu lit, %llu shadowed (sunDir = %.3f, %.3f, %.3f)\n",
+               (unsigned long long)litFaces, (unsigned long long)shadowedFaces,
                sunDirX, sunDirY, sunDirZ);
     }
 
