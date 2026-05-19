@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -7,6 +8,7 @@
 #include "camera.h"
 #include "vox_loader.h"
 #include "mesh_loader.h"
+#include "asset_version.h"
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -34,37 +36,92 @@ void SetCwdToProjectRoot() {
     }
 }
 
+// Check magic + version of a baked asset. Returns false if file is missing,
+// has wrong magic, or has stale version -> caller regenerates.
+bool AssetIsCurrent(const char* path, const char* magic4) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    char m[4];
+    if (fread(m, 1, 4, f) != 4 || memcmp(m, magic4, 4) != 0) { fclose(f); return false; }
+    uint32_t v = 0;
+    bool okv = (fread(&v, sizeof(uint32_t), 1, f) == 1 && v == kAssetVersion);
+    fclose(f);
+    return okv;
+}
+
+bool AllAssetsCurrent() {
+    return AssetIsCurrent("assets/kingslanding.vox",        "VXL3")
+        && AssetIsCurrent("assets/kingslanding_culled.vox", "VXL3")
+        && AssetIsCurrent("assets/kingslanding_merged.msh", "MSH1")
+        && AssetIsCurrent("assets/kingslanding_atlas.msh",  "MSH2");
+}
+
+// Synchronously runs voxelize.exe (which sits next to voxeltest.exe). Returns
+// true on success. Stdout from voxelize is inherited so users see progress.
+bool RunVoxelize() {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    wchar_t* slash = wcsrchr(exePath, L'\\');
+    if (!slash) return false;
+    *(slash + 1) = 0;
+    std::wstring tool = std::wstring(exePath) + L"voxelize.exe";
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    std::wstring cmd = L"\"" + tool + L"\" "
+                       L"\"assets\\KingsLanding2017\\KingsLandingFull.obj\" "
+                       L"\"assets\\kingslanding.vox\"";
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                        0, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return code == 0;
+}
+
 
 struct AppState {
     Renderer renderer;
     Camera   camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech  tech = RenderTech::Hybrid;
+    RenderTech  tech = RenderTech::PolygonBased;
     bool     vsync = false;
-    int      gridSize = 6;
+    int      gridSize = 1;
     bool     showChunkBounds = false;
+    bool     wireframe = false;
+    bool     taa = false;
     bool     zPrepass = false;
     PointLighting pointLight = PointLighting::Complex;
-    PointLod pointLod = PointLod::Auto;
+    PointLod pointLod = PointLod::L0;
     float    pointLodScale = 1.0f;
     float    hybridThreshold = 1.0f;   // ppv >= this -> polygons, else points
     bool     splatFilter = true;
-    int      fogMode = 0;        // 0 = off, 1 = depth
-    float    fogDensity = 0.0005f;
+    int      splatRadius = 3;       // CS dilation half-window in pixels
+    int      fogMode = 1;        // 0 = off, 1 = depth (drives effFogDensity gating)
+    float    fogDensity = 0.0004f;
     float    fogColor[3] = { 0.55f, 0.60f, 0.70f };
+    float    heightFogDensity = 4.5f;        // 0 = off
+    float    heightFogFalloff = 0.05f;       // exp falloff per unit height
+    float    heightFogStart   = -6.5f;        // world Y of fog ground plane
     int      msaa = 1;
     bool     rmbDown = false;
     POINT    lastMouse = { 0, 0 };
     bool     keys[256] = {};
     bool     wantQuit = false;
     bool     sceneReady = false;
-    std::string loadStatus = "Loading rungholt.obj...";
+    std::string loadStatus = "Loading kingslanding.obj...";
     Scene       pendingScene;
     MergedMesh  pendingMerged;
     bool        mergedLoaded = false;
     AtlasMesh   pendingAtlas;
     bool        atlasLoaded = false;
-    int         voxSource = 0;   // 0=original, 1=culled
+    bool        everLoaded = false;
+    DataSet     dataset = DataSet::Reduced;
     std::atomic<bool> reloadRequested{ false };
     std::atomic<bool> loadDone{ false };
     std::atomic<bool> loadOk{ false };
@@ -176,7 +233,18 @@ void FrameTopBar() {
     ImGui::PlotLines("FPS", g_app.fpsHist, IM_ARRAYSIZE(g_app.fpsHist),
                      g_app.fpsHistIdx, nullptr, 0.0f, 240.0f, ImVec2(0, 60));
 
-    const char* techs[] = { "PolygonBased", "Points", "Hybrid", "HexSprite", "PointCS", "PolyVID", "Billboard", "BillboardTri", "Hybrid2", "MergedMesh", "Splat", "SplatHybrid", "AtlasMesh" };
+    const char* datasets[] = { "Full", "Merged", "Reduced" };
+    {
+        int ds = (int)g_app.dataset;
+        if (ImGui::Combo("Dataset", &ds, datasets, IM_ARRAYSIZE(datasets))) {
+            DataSet prev = g_app.dataset;
+            g_app.dataset = (DataSet)ds;
+            // Full+Merged share the Original .vox; Reduced uses the Culled .vox.
+            bool needReload = ((prev == DataSet::Reduced) != (g_app.dataset == DataSet::Reduced));
+            if (needReload) g_app.reloadRequested.store(true);
+        }
+    }
+    const char* techs[] = { "PolygonBased", "Points", "Hybrid", "HexSprite", "PointCS", "PolyVID", "Billboard", "BillboardTri", "Hybrid2", "Splat", "SplatHybrid" };
     {
         int tt = (int)g_app.tech;
         if (ImGui::Combo("Technique", &tt, techs, IM_ARRAYSIZE(techs), IM_ARRAYSIZE(techs))) {
@@ -185,14 +253,6 @@ void FrameTopBar() {
     }
 
     ImGui::Separator();
-    {
-        const char* sources[] = { "Original", "Culled" };
-        int sel = g_app.voxSource;
-        if (ImGui::Combo("Voxel data", &sel, sources, IM_ARRAYSIZE(sources))) {
-            g_app.voxSource = sel;
-            g_app.reloadRequested.store(true);
-        }
-    }
     const char* lods[] = { "L0 (1 per voxel)", "L1 (2x2x2)", "L2 (4x4x4)", "Auto" };
     int lo = (int)g_app.pointLod;
     if (ImGui::Combo("Point LOD", &lo, lods, IM_ARRAYSIZE(lods))) {
@@ -201,6 +261,7 @@ void FrameTopBar() {
     ImGui::SliderFloat("LOD distance", &g_app.pointLodScale, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
     ImGui::SliderFloat("Hybrid poly threshold (ppv)", &g_app.hybridThreshold, 0.25f, 16.0f, "%.2f px", ImGuiSliderFlags_Logarithmic);
     ImGui::Checkbox("Splat CS filter", &g_app.splatFilter);
+    ImGui::SliderInt("Splat radius", &g_app.splatRadius, 1, 16);
     if (ImGui::CollapsingHeader("Fog")) {
         const char* fogModes[] = { "Off", "Depth" };
         int fm = g_app.fogMode;
@@ -208,6 +269,9 @@ void FrameTopBar() {
             g_app.fogMode = fm;
         }
         ImGui::SliderFloat("Density", &g_app.fogDensity, 0.0f, 0.005f, "%.5f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Height density", &g_app.heightFogDensity, 0.0f, 5.0f, "%.3f");
+        ImGui::SliderFloat("Height falloff", &g_app.heightFogFalloff, 0.0f, 0.2f, "%.4f");
+        ImGui::SliderFloat("Height start Y", &g_app.heightFogStart,   -100.0f, 200.0f, "%.1f");
         ImGui::ColorEdit3("Color", g_app.fogColor);
     }
     const char* pls[] = { "Simple", "Complex" };
@@ -223,6 +287,8 @@ void FrameTopBar() {
     ImGui::Checkbox("VSync", &g_app.vsync);
     ImGui::SliderInt("Grid size", &g_app.gridSize, 1, 10);
     ImGui::Checkbox("Show chunk bounds", &g_app.showChunkBounds);
+    ImGui::Checkbox("Wireframe", &g_app.wireframe);
+    ImGui::Checkbox("TAA", &g_app.taa);
     ImGui::Checkbox("Z Prepass", &g_app.zPrepass);
     {
         const char* msaaItems[] = { "Off", "2x", "4x", "8x" };
@@ -313,17 +379,27 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     auto kickLoader = [](bool firstLoad) {
         std::thread([firstLoad] {
             std::string err;
-            const char* voxPath = (g_app.voxSource == 1)
-                ? "assets/rungholt_culled.vox"
-                : "assets/rungholt.vox";
+            // Detect missing/stale baked assets and regen via voxelize.exe.
+            if (!AllAssetsCurrent()) {
+                g_app.loadStatus = "Regenerating baked assets (running voxelize.exe)...";
+                if (!RunVoxelize() || !AllAssetsCurrent()) {
+                    g_app.loadErr = "voxelize.exe failed (missing OBJ?)";
+                    g_app.loadOk.store(false);
+                    g_app.loadDone.store(true);
+                    return;
+                }
+            }
+            const char* voxPath = (g_app.dataset == DataSet::Reduced)
+                ? "assets/kingslanding_culled.vox"
+                : "assets/kingslanding.vox";
             g_app.loadStatus = std::string("Loading ") + voxPath + "...";
             bool ok = LoadVoxScene(voxPath, g_app.pendingScene, err);
             if (ok && firstLoad) {
                 std::string merr;
-                g_app.mergedLoaded = LoadMergedMesh("assets/rungholt_merged.msh",
+                g_app.mergedLoaded = LoadMergedMesh("assets/kingslanding_merged.msh",
                                                     g_app.pendingMerged, merr);
                 std::string aerr;
-                g_app.atlasLoaded = LoadAtlasMesh("assets/rungholt_atlas.msh",
+                g_app.atlasLoaded = LoadAtlasMesh("assets/kingslanding_atlas.msh",
                                                   g_app.pendingAtlas, aerr);
             }
             g_app.loadErr = err;
@@ -361,27 +437,35 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         // upload scene once loader done
         if (g_app.loadDone.load() && !g_app.sceneReady) {
             if (g_app.loadOk.load()) {
+                bool firstUpload = !g_app.everLoaded;
                 g_app.renderer.UploadScene(g_app.pendingScene);
-                if (g_app.mergedLoaded) {
+                // Merged/Atlas are static across reloads; upload only when we
+                // actually loaded fresh data (firstUpload). Re-uploading empties
+                // would reset the GPU buffers to null.
+                if (firstUpload && g_app.mergedLoaded && !g_app.pendingMerged.vertices.empty()) {
                     g_app.renderer.UploadMergedMesh(g_app.pendingMerged);
                     g_app.pendingMerged = MergedMesh{};
                 }
-                if (g_app.atlasLoaded) {
+                if (firstUpload && g_app.atlasLoaded && !g_app.pendingAtlas.vertices.empty()) {
                     g_app.renderer.UploadAtlasMesh(g_app.pendingAtlas);
                     g_app.pendingAtlas = AtlasMesh{};
                 }
-                // center camera on aabb
-                float cx = 0.5f * (g_app.pendingScene.aabbMin[0] + g_app.pendingScene.aabbMax[0]);
-                float cz = 0.5f * (g_app.pendingScene.aabbMin[2] + g_app.pendingScene.aabbMax[2]);
-                float topY = g_app.pendingScene.aabbMax[1];
-                float dx = g_app.pendingScene.aabbMax[0] - g_app.pendingScene.aabbMin[0];
-                float dz = g_app.pendingScene.aabbMax[2] - g_app.pendingScene.aabbMin[2];
-                float ext = (dx > dz ? dx : dz);
-                g_app.camera.position = hlslpp::float3(cx, topY, cz);
-                g_app.camera.yaw = 0.0f;
-                g_app.camera.pitch = 0.0f;
-                g_app.camera.moveSpeed = ext * 0.05f;
-                g_app.camera.farZ = ext * 4.0f + 1000.0f;
+                // Center the camera only on the very first load; keep the
+                // user's view when switching dataset.
+                if (firstUpload) {
+                    float cx = 0.5f * (g_app.pendingScene.aabbMin[0] + g_app.pendingScene.aabbMax[0]);
+                    float cz = 0.5f * (g_app.pendingScene.aabbMin[2] + g_app.pendingScene.aabbMax[2]);
+                    float topY = g_app.pendingScene.aabbMax[1];
+                    float dx = g_app.pendingScene.aabbMax[0] - g_app.pendingScene.aabbMin[0];
+                    float dz = g_app.pendingScene.aabbMax[2] - g_app.pendingScene.aabbMin[2];
+                    float ext = (dx > dz ? dx : dz);
+                    g_app.camera.position = hlslpp::float3(cx, topY, cz);
+                    g_app.camera.yaw = 0.0f;
+                    g_app.camera.pitch = 0.0f;
+                    g_app.camera.moveSpeed = ext * 0.05f;
+                    g_app.camera.farZ = ext * 4.0f + 1000.0f;
+                }
+                g_app.everLoaded = true;
                 g_app.pendingScene = Scene{};
                 g_app.sceneReady = true;
                 g_app.loadStatus = "Loaded.";
@@ -414,7 +498,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         g_app.renderer.BeginFrame(clear);
         if (g_app.sceneReady && g_app.loadOk.load()) {
             float effFogDensity = (g_app.fogMode == 0) ? 0.0f : g_app.fogDensity;
-            g_app.renderer.DrawScene(g_app.camera, g_app.mode, g_app.gridSize, g_app.tech, g_app.showChunkBounds, g_app.zPrepass, g_app.pointLight, g_app.pointLod, g_app.pointLodScale, g_app.splatFilter, g_app.fogColor, effFogDensity, g_app.hybridThreshold);
+            g_app.renderer.DrawScene(g_app.camera, g_app.mode, g_app.gridSize, g_app.tech, g_app.dataset, g_app.showChunkBounds, g_app.zPrepass, g_app.pointLight, g_app.pointLod, g_app.pointLodScale, g_app.splatFilter, g_app.fogColor, effFogDensity, g_app.heightFogDensity, g_app.heightFogFalloff, g_app.heightFogStart, g_app.hybridThreshold, g_app.wireframe, g_app.splatRadius, g_app.taa);
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_app.renderer.EndFrame(g_app.vsync);

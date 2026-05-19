@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "mesh_loader.h"
+#include "asset_version.h"
 
 #include <cstdio>
 #include <cstring>
@@ -11,6 +12,10 @@ bool LoadMergedMesh(const char* path, MergedMesh& out, std::string& err) {
     char magic[4];
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MSH1", 4) != 0) {
         fclose(f); err = "bad magic (need MSH1)"; return false;
+    }
+    uint32_t version = 0;
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1 || version != kAssetVersion) {
+        fclose(f); err = "asset version mismatch"; return false;
     }
     uint32_t vc = 0, ic = 0;
     fread(&vc, sizeof(uint32_t), 1, f);
@@ -42,6 +47,10 @@ bool LoadAtlasMesh(const char* path, AtlasMesh& out, std::string& err) {
     char magic[4];
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MSH2", 4) != 0) {
         fclose(f); err = "bad magic (need MSH2)"; return false;
+    }
+    uint32_t version = 0;
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1 || version != kAssetVersion) {
+        fclose(f); err = "asset version mismatch"; return false;
     }
     uint32_t vc = 0, ic = 0, aw = 0, ah = 0, vbytes = 0;
     int32_t  origin[3] = { 0, 0, 0 };

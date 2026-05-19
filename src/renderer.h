@@ -31,6 +31,7 @@ enum class ShadingMode : int {
     Normals = 2,
 };
 
+// Render path. Independent of which data is bound (that's DataSet).
 enum class RenderTech : int {
     PolygonBased = 0,
     Points       = 1,
@@ -41,10 +42,20 @@ enum class RenderTech : int {
     Billboard    = 6,   // screen-space quad per voxel; PS ray-cube intersects
     BillboardTri = 7,   // billboard but a single bounding triangle per voxel
     Hybrid2      = 8,   // PolyVID up close, BillboardTri at distance
-    MergedMesh   = 9,   // greedy-meshed single VB/IB
-    Splat        = 10,  // points -> color RT (alpha=size); CS sphere reconstruct
-    SplatHybrid  = 11,  // polygons up close, splats far (renders into splat RT)
-    AtlasMesh    = 12,  // binary-greedy quads + UV-indexed atlas (compact verts)
+    Splat        = 9,   // points -> color RT (alpha=size); CS sphere reconstruct
+    SplatHybrid  = 10,  // polygons up close, splats far (renders into splat RT)
+};
+
+// Which baked dataset to draw from. Determines the polygon source (for
+// PolygonBased / Hybrid / SplatHybrid close path) AND the point source (for
+// Points / Splat / PointCS / Hybrid points branch).
+//   Full    -> per-chunk voxel polys + voxel-center L0 points (rungholt.vox)
+//   Merged  -> single MSH1 mesh + voxel-center L0 points       (rungholt.vox)
+//   Reduced -> per-chunk atlas mesh + face-aligned L0 points    (rungholt_culled.vox)
+enum class DataSet : int {
+    Full    = 0,
+    Merged  = 1,
+    Reduced = 2,
 };
 
 enum class PointLighting : int {
@@ -70,7 +81,7 @@ public:
     void UploadMergedMesh(const MergedMesh& mesh);
     void UploadAtlasMesh(const AtlasMesh& mesh);
     void BeginFrame(float clear[4]);
-    void DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float hybridThreshold);
+    void DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, DataSet dataset, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float heightFogDensity, float heightFogFalloff, float heightFogStart, float hybridThreshold, bool wireframe, int splatRadius, bool taa);
     void EndFrame(bool vsync);
 
     ID3D11Device*        Device()  const { return device_.Get(); }
@@ -146,7 +157,6 @@ private:
         uint32_t indexCount;
     };
     std::vector<GpuAtlasSub>         atlasSubs_;
-    // (cx,cy,cz) -> index into atlasSubs_, for SplatHybrid lookup by chunk coord.
     std::unordered_map<uint64_t,uint32_t> atlasSubByChunk_;
 
     // Splat path.
@@ -155,11 +165,11 @@ private:
     ComPtr<ID3D11ShaderResourceView>   splatColorSrv_;
     ComPtr<ID3D11Texture2D>            splatDepthTex_;
     ComPtr<ID3D11DepthStencilView>     splatDsv_;
+    ComPtr<ID3D11ShaderResourceView>   splatDepthSrv_;
     ComPtr<ID3D11Texture2D>            splatFinalTex_;
     ComPtr<ID3D11UnorderedAccessView>  splatFinalUav_;
-    ComPtr<ID3D11VertexShader>         vsSplat_;
-    ComPtr<ID3D11PixelShader>          psSplat_;
     ComPtr<ID3D11ComputeShader>        csSplat_;
+    ComPtr<ID3D11PixelShader>          psSplatAlbedo_;
     ComPtr<ID3D11InputLayout>    inputLayout_;
     ComPtr<ID3D11InputLayout>    inputLayoutHex_;
     ComPtr<ID3D11InputLayout>    inputLayoutBounds_;
@@ -184,6 +194,7 @@ private:
     ComPtr<ID3D11Buffer>         cbPerFrame_;
     ComPtr<ID3D11Buffer>         cbPerChunk_;
     ComPtr<ID3D11RasterizerState> rsSolid_;
+    ComPtr<ID3D11RasterizerState> rsWire_;
     ComPtr<ID3D11DepthStencilState> dsTest_;
     ComPtr<ID3D11DepthStencilState> dsAlways_;
     ComPtr<ID3D11DepthStencilState> dsEqual_;
@@ -203,5 +214,26 @@ private:
     uint32_t lastDrawn_ = 0;
     uint64_t lastDrawnTris_ = 0;
     float    sceneSpan_[3] = { 0, 0, 0 };
+    float    sceneOrigin_[3] = { 0, 0, 0 };
+    ComPtr<ID3D11InputLayout> inputLayoutPoly_;
+
+    // TAA: scene render target, two history targets (ping-pong), depth SRV
+    // (shares depthTex_), composite shaders.
+    ComPtr<ID3D11Texture2D>          taaSceneTex_;
+    ComPtr<ID3D11RenderTargetView>   taaSceneRtv_;
+    ComPtr<ID3D11ShaderResourceView> taaSceneSrv_;
+    ComPtr<ID3D11Texture2D>          taaHistTex_[2];
+    ComPtr<ID3D11RenderTargetView>   taaHistRtv_[2];
+    ComPtr<ID3D11ShaderResourceView> taaHistSrv_[2];
+    ComPtr<ID3D11ShaderResourceView> depthSrv_;
+    ComPtr<ID3D11VertexShader>       vsTaa_;
+    ComPtr<ID3D11PixelShader>        psTaa_;
+    ComPtr<ID3D11PixelShader>        psPost_;
+    ComPtr<ID3D11SamplerState>       linearClampSampler_;
+    uint32_t taaHistIdx_ = 0;
+    uint32_t taaFrame_ = 0;
+    bool     taaHistValid_[2] = { false, false };
+    bool     postWroteBackbuf_ = false;   // set in DrawScene if post wrote backbuf -> skip MSAA resolve
+    float    taaPrevVP_[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
     float    lastClear_[4] = { 0, 0, 0, 1 };
 };

@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "obj_loader.h"
 #include "obj_scene.h"
+#include "../src/asset_version.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -127,6 +128,66 @@ int main(int argc, char** argv) {
     }
     printf("Voxel AABB: (%d,%d,%d) .. (%d,%d,%d)\n", minX, minY, minZ, maxX, maxY, maxZ);
 
+    // ---------------------------------------------------------------------
+    // Sun shadow pass. For each voxel, DDA-march a ray toward the sun until
+    // it exits the AABB or hits another filled voxel. Result packed as a
+    // byte in color alpha (0 = shadowed, 255 = lit). Sun direction stored
+    // in the VXL3 header so the runtime knows where the light came from.
+    // ---------------------------------------------------------------------
+    float sunDirX = 0.4f, sunDirY = 0.8f, sunDirZ = 0.2f;
+    {
+        float len = sqrtf(sunDirX*sunDirX + sunDirY*sunDirY + sunDirZ*sunDirZ);
+        sunDirX /= len; sunDirY /= len; sunDirZ /= len;
+    }
+    {
+        int32_t spX = maxX - minX + 1;
+        int32_t spY = maxY - minY + 1;
+        int32_t spZ = maxZ - minZ + 1;
+        std::vector<uint8_t> filled(((size_t)spX * spY * spZ + 7) / 8, 0);
+        auto bidx = [&](int x, int y, int z) -> size_t {
+            return (size_t)((z - minZ) * spY + (y - minY)) * (size_t)spX + (size_t)(x - minX);
+        };
+        for (auto& kv : voxels) {
+            size_t i = bidx(kv.first.x, kv.first.y, kv.first.z);
+            filled[i >> 3] |= (uint8_t)(1u << (i & 7));
+        }
+        auto isFilledFast = [&](int x, int y, int z) -> bool {
+            if (x < minX || x > maxX || y < minY || y > maxY || z < minZ || z > maxZ) return false;
+            size_t i = bidx(x, y, z);
+            return (filled[i >> 3] >> (i & 7)) & 1u;
+        };
+
+        // Amanatides-Woo DDA from voxel center along sun direction.
+        const float invX = (fabsf(sunDirX) > 1e-6f) ? 1.0f / fabsf(sunDirX) : 1e30f;
+        const float invY = (fabsf(sunDirY) > 1e-6f) ? 1.0f / fabsf(sunDirY) : 1e30f;
+        const float invZ = (fabsf(sunDirZ) > 1e-6f) ? 1.0f / fabsf(sunDirZ) : 1e30f;
+        const int stepX = sunDirX > 0 ? 1 : (sunDirX < 0 ? -1 : 0);
+        const int stepY = sunDirY > 0 ? 1 : (sunDirY < 0 ? -1 : 0);
+        const int stepZ = sunDirZ > 0 ? 1 : (sunDirZ < 0 ? -1 : 0);
+        const int kMaxSteps = (maxX - minX) + (maxY - minY) + (maxZ - minZ) + 16;
+        uint64_t lit = 0, shadowed = 0;
+        for (auto& kv : voxels) {
+            int ix = kv.first.x, iy = kv.first.y, iz = kv.first.z;
+            float tMaxX = (stepX != 0) ? (stepX > 0 ? 0.5f : 0.5f) * invX : 1e30f;
+            float tMaxY = (stepY != 0) ? (stepY > 0 ? 0.5f : 0.5f) * invY : 1e30f;
+            float tMaxZ = (stepZ != 0) ? (stepZ > 0 ? 0.5f : 0.5f) * invZ : 1e30f;
+            bool hit = false;
+            for (int s = 0; s < kMaxSteps; ++s) {
+                if (tMaxX < tMaxY && tMaxX < tMaxZ) { ix += stepX; tMaxX += invX; }
+                else if (tMaxY < tMaxZ)             { iy += stepY; tMaxY += invY; }
+                else                                { iz += stepZ; tMaxZ += invZ; }
+                if (ix < minX || ix > maxX || iy < minY || iy > maxY || iz < minZ || iz > maxZ) break;
+                if (isFilledFast(ix, iy, iz)) { hit = true; break; }
+            }
+            uint8_t shadowByte = hit ? 0u : 255u;
+            kv.second = (kv.second & 0x00FFFFFFu) | ((uint32_t)shadowByte << 24);
+            if (hit) ++shadowed; else ++lit;
+        }
+        printf("Sun shadow: %llu lit, %llu shadowed (sunDir = %.3f, %.3f, %.3f)\n",
+               (unsigned long long)lit, (unsigned long long)shadowed,
+               sunDirX, sunDirY, sunDirZ);
+    }
+
     struct CKey { uint16_t x, y, z; };
     struct CKeyHash {
         size_t operator()(const CKey& k) const noexcept {
@@ -188,6 +249,8 @@ int main(int argc, char** argv) {
 
     const char magic[4] = { 'V','X','L','3' };
     fwrite(magic, 1, 4, f);
+    uint32_t version = kAssetVersion;
+    fwrite(&version, sizeof(uint32_t), 1, f);
     uint32_t cdim = CHUNK_DIM;
     uint32_t ccount = (uint32_t)metas.size();
     fwrite(&cdim,     sizeof(uint32_t), 1, f);
@@ -195,6 +258,8 @@ int main(int argc, char** argv) {
     fwrite(&totalVox, sizeof(uint32_t), 1, f);
     int32_t origin[3] = { minX, minY, minZ };
     fwrite(origin, sizeof(int32_t), 3, f);
+    float sunDir[3] = { sunDirX, sunDirY, sunDirZ };
+    fwrite(sunDir, sizeof(float), 3, f);
 
     fwrite(metas.data(),   sizeof(ChunkMeta), metas.size(),   f);
     fwrite(flatVox.data(), sizeof(DiskVoxel), flatVox.size(), f);
@@ -352,12 +417,14 @@ int main(int argc, char** argv) {
         FILE* cf = fopen(cOut.c_str(), "wb");
         if (!cf) { fprintf(stderr, "open %s failed\n", cOut.c_str()); return 1; }
         fwrite(magic, 1, 4, cf);
+        fwrite(&version, sizeof(uint32_t), 1, cf);
         uint32_t cccount = (uint32_t)cMetas.size();
         uint32_t cTotal  = (uint32_t)cFlatVox.size();
         fwrite(&cdim,    sizeof(uint32_t), 1, cf);
         fwrite(&cccount, sizeof(uint32_t), 1, cf);
         fwrite(&cTotal,  sizeof(uint32_t), 1, cf);
         fwrite(origin,   sizeof(int32_t),  3, cf);
+        fwrite(sunDir,   sizeof(float),    3, cf);
         fwrite(cMetas.data(),   sizeof(ChunkMeta), cMetas.size(),   cf);
         fwrite(cFlatVox.data(), sizeof(DiskVoxel), cFlatVox.size(), cf);
         long cb = ftell(cf);
@@ -478,6 +545,7 @@ int main(int argc, char** argv) {
         if (!mf) { fprintf(stderr, "open %s failed\n", mOut.c_str()); return 1; }
         const char mmagic[4] = { 'M','S','H','1' };
         fwrite(mmagic, 1, 4, mf);
+        fwrite(&version, sizeof(uint32_t), 1, mf);
         uint32_t vc = (uint32_t)mVerts.size();
         uint32_t ic = (uint32_t)mIndices.size();
         fwrite(&vc, sizeof(uint32_t), 1, mf);
@@ -616,7 +684,6 @@ int main(int argc, char** argv) {
                             }
                             AtlasRect r;
                             r.axis = axis; r.sign = sign; r.sliceA = sliceA;
-                            // Store in world voxel coords for uniform emission.
                             r.u0 = uLow + uu;
                             r.v0 = vLow + vv;
                             r.w = w; r.h = h;
@@ -628,7 +695,6 @@ int main(int argc, char** argv) {
                                     r.pixels[(size_t)du + (size_t)dv * w]
                                         = col[(size_t)(uu+du) + (size_t)(vv+dv) * spanU];
 
-                            // Update chunk AABB by the 4 corners of this quad.
                             int aFaceOffset = (r.sign == 0) ? 1 : 0;
                             int corners[4][3];
                             corners[0][axis] = corners[1][axis] = corners[2][axis] = corners[3][axis]
@@ -655,16 +721,115 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (rects.size() == firstRectIdx) continue;   // empty chunk
+        if (rects.size() == firstRectIdx) continue;
 
         AChunkSub sub;
         sub.cx = (uint16_t)cx; sub.cy = (uint16_t)cy; sub.cz = (uint16_t)cz; sub._pad = 0;
         for (int d = 0; d < 3; ++d) { sub.aabbMin[d] = abMin[d]; sub.aabbMax[d] = abMax[d]; }
-        sub.firstIndex = 0;   // patched after global index emit
+        sub.firstIndex = 0;
         sub.indexCount = (uint32_t)((rects.size() - firstRectIdx) * 6);
         aSubs.push_back(sub);
     }
     printf("Atlas rects: %zu  chunks: %zu\n", rects.size(), aSubs.size());
+
+    // -----------------------------------------------------------------
+    // Stats: what fraction is unmerged 1x1 rects (could go to a point/atlas
+    // path) vs genuinely-merged larger quads (worth drawing as triangles)?
+    // -----------------------------------------------------------------
+    {
+        size_t   singletons = 0;
+        size_t   merged = 0;
+        uint64_t areaSingletons = 0;
+        uint64_t areaMerged = 0;
+        for (auto& r : rects) {
+            uint64_t a = (uint64_t)r.w * (uint64_t)r.h;
+            if (r.w == 1 && r.h == 1) {
+                ++singletons;
+                areaSingletons += a;
+            } else {
+                ++merged;
+                areaMerged += a;
+            }
+        }
+        uint64_t totalArea = areaSingletons + areaMerged;
+        printf("[stats] rects: 1x1=%zu (%.1f%% of rects, %.1f%% of face area)\n",
+               singletons,
+               100.0 * (double)singletons / (double)rects.size(),
+               totalArea ? 100.0 * (double)areaSingletons / (double)totalArea : 0.0);
+        printf("[stats] rects: merged=%zu (%.1f%% of rects, %.1f%% of face area, avg %.2fx%.2f)\n",
+               merged,
+               100.0 * (double)merged / (double)rects.size(),
+               totalArea ? 100.0 * (double)areaMerged / (double)totalArea : 0.0,
+               merged ? (double)areaMerged / (double)merged : 0.0,
+               1.0);
+    }
+
+
+    // -----------------------------------------------------------------
+    // Experiment: global (cross-chunk) greedy mesh for comparison only.
+    // Same binary visibility mask but greedy spans the full scene. Counts
+    // rects + tris; does not emit verts/atlas/file.
+    // -----------------------------------------------------------------
+    {
+        size_t globalRects = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            int uAxis = (axis + 1) % 3;
+            int vAxis = (axis + 2) % 3;
+            int aMin = (axis == 0) ? minX : (axis == 1) ? minY : minZ;
+            int aMax = (axis == 0) ? maxX : (axis == 1) ? maxY : maxZ;
+            int uMinL = (uAxis == 0) ? minX : (uAxis == 1) ? minY : minZ;
+            int uMaxL = (uAxis == 0) ? maxX : (uAxis == 1) ? maxY : maxZ;
+            int vMinL = (vAxis == 0) ? minX : (vAxis == 1) ? minY : minZ;
+            int vMaxL = (vAxis == 0) ? maxX : (vAxis == 1) ? maxY : maxZ;
+            int spanU = uMaxL - uMinL + 1;
+            int spanV = vMaxL - vMinL + 1;
+            std::vector<uint8_t> mask((size_t)spanU * spanV);
+            for (int sign = 0; sign < 2; ++sign) {
+                int fi = axis * 2 + sign;
+                for (int sliceA = aMin; sliceA <= aMax; ++sliceA) {
+                    if (fi == 3 && sliceA <= minY + 1) continue;
+                    std::fill(mask.begin(), mask.end(), (uint8_t)0);
+                    for (int vv = 0; vv < spanV; ++vv) {
+                        for (int uu = 0; uu < spanU; ++uu) {
+                            int xyz[3];
+                            xyz[axis]  = sliceA;
+                            xyz[uAxis] = uu + uMinL;
+                            xyz[vAxis] = vv + vMinL;
+                            if (!isFilled(xyz[0], xyz[1], xyz[2])) continue;
+                            if (!faceExposed(xyz[0], xyz[1], xyz[2], fi)) continue;
+                            mask[(size_t)uu + (size_t)vv * spanU] = 1;
+                        }
+                    }
+                    for (int vv = 0; vv < spanV; ++vv) {
+                        for (int uu = 0; uu < spanU; ) {
+                            if (!mask[(size_t)uu + (size_t)vv * spanU]) { ++uu; continue; }
+                            int w = 1;
+                            while (uu + w < spanU && mask[(size_t)(uu+w) + (size_t)vv * spanU]) ++w;
+                            int h = 1;
+                            while (vv + h < spanV) {
+                                bool ok = true;
+                                for (int j = 0; j < w; ++j) {
+                                    if (!mask[(size_t)(uu+j) + (size_t)(vv+h) * spanU]) { ok = false; break; }
+                                }
+                                if (!ok) break;
+                                ++h;
+                            }
+                            ++globalRects;
+                            for (int dv = 0; dv < h; ++dv)
+                                for (int du = 0; du < w; ++du)
+                                    mask[(size_t)(uu+du) + (size_t)(vv+dv) * spanU] = 0;
+                            uu += w;
+                        }
+                    }
+                }
+            }
+        }
+        double perChunkTris = (double)rects.size() * 2.0;
+        double globalTris   = (double)globalRects * 2.0;
+        printf("[experiment] global-greedy atlas: %zu rects, %.0f tris (%.1f%% of per-chunk %.0f)\n",
+               globalRects, globalTris, 100.0 * globalTris / perChunkTris, perChunkTris);
+    }
+
 
     // Pick atlas width so total area packs into ~square. Pad slack ~33%.
     uint64_t totalArea = 0;
@@ -791,6 +956,7 @@ int main(int argc, char** argv) {
         if (!af) { fprintf(stderr, "open %s failed\n", aOut.c_str()); return 1; }
         const char amagic[4] = { 'M','S','H','2' };
         fwrite(amagic, 1, 4, af);
+        fwrite(&version, sizeof(uint32_t), 1, af);
         uint32_t vc = (uint32_t)aVerts.size();
         uint32_t ic = (uint32_t)aIdx.size();
         uint32_t vbytes = (uint32_t)sizeof(AVert);

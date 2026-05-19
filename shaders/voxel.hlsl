@@ -17,14 +17,49 @@ cbuffer cbPerFrame : register(b0)
     float3   gCamForward;
     float    gTanHalfFovY;
     float3   gFogColor;
-    float    gFogDensity;       // 0 = fog disabled
+    float    gFogDensity;       // 0 = depth fog disabled
+    float    gHeightFogDensity; // 0 = height fog disabled
+    float    gHeightFogFalloff; // exponential falloff per world unit of height
+    float    gHeightFogStart;   // world Y of fog "ground plane" (max density)
+    float    _padHF;
+    float3   gSceneOrigin;
+    float    gNearZ;            // reverse-Z infinite-far: viewZ = gNearZ / depth
+    float3   gSceneSpan;
+    float    _pad6;
+    row_major float4x4 gPrevViewProj;     // last frame's VP (for TAA reprojection)
+    float2   gJitter;                     // sub-pixel NDC offset applied to current proj
+    float2   _pad7;
 };
 
-float3 ApplyFog(float3 color, float dist)
+// Combined depth + height fog. Height fog uses Inigo Quilez closed-form:
+//   density(h) = c * exp(-h * b)
+//   ∫ along ray of length D with rd.y != 0 = c * exp(-camY*b) * (1 - exp(-D*rd.y*b)) / rd.y
+// Add depth-fog (constant density) optical depth, then transmittance = exp(-total).
+float3 ApplyFog(float3 color, float3 wpos)
 {
-    if (gFogDensity <= 0.0) return color;
-    float t = exp(-dist * gFogDensity);     // in-scatter (object) weight
-    return lerp(gFogColor, color, t);       // (1-t) of fog mixed in
+    float3 d = wpos - gCamPos;
+    float dist = length(d);
+    float optical = gFogDensity * dist;
+    float3 rd = (dist > 1e-4) ? d / dist : float3(0,0,1);
+    if (gHeightFogDensity > 0.0 && dist > 1e-4) {
+        float b  = gHeightFogFalloff;
+        float c  = gHeightFogDensity;
+        float ey = exp(-(gCamPos.y - gHeightFogStart) * b);
+        float t;
+        if (abs(rd.y) > 1e-4) {
+            t = c * ey * (1.0 - exp(-dist * rd.y * b)) / rd.y;
+        } else {
+            t = c * ey * dist;
+        }
+        optical += max(t, 0.0);
+    }
+    if (optical <= 0.0) return color;
+    // Directional / sun-tinted fog (Quilez "Better fog" bonus): warmer toward sun.
+    float3 sunDir  = normalize(gLightDir);
+    float  sunAmt  = pow(saturate(dot(rd, sunDir)), 8.0);
+    float3 sunTint = float3(1.10, 0.85, 0.55);
+    float3 fogCol  = lerp(gFogColor, sunTint, sunAmt);
+    return lerp(fogCol, color, exp(-optical));
 }
 
 cbuffer cbPerChunk : register(b1)
@@ -33,6 +68,13 @@ cbuffer cbPerChunk : register(b1)
     float  _pad;
     uint   gVoxelBase;       // PolyVID: chunk's first voxel index in pointSb_
     uint3  _pad2;
+};
+
+// Cardinal face normals indexed by faceIdx (0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
+static const float3 kFaceNormals[6] = {
+    float3( 1, 0, 0), float3(-1, 0, 0),
+    float3( 0, 1, 0), float3( 0,-1, 0),
+    float3( 0, 0, 1), float3( 0, 0,-1),
 };
 
 // Ambient cube indexed by faceIdx (0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
@@ -45,41 +87,66 @@ static const float3 kAmbientCube[6] = {
     float3(0.40, 0.45, 0.55),  // -Z
 };
 
+// Unified 12-byte vertex used by both vb_ and pointVb_.
+//   pck = uint4: .xyz = 16-bit scene-relative voxel coord (0..65535), .w unused
+//   col = uint4: R,G,B,A bytes. alpha byte = visMask for point verts.
 struct VSIn  {
-    uint4  pck : POSITION;   // .xyz = local 0..D, .w = faceIdx
-    float4 col : COLOR;
+    uint4 pck : POSITION;
+    uint4 col : COLOR;
 };
+typedef VSIn VSPolyIn;
 struct VSOut {
     float4 svpos : SV_Position;
     float3 wpos  : WPOS;
     float4 col   : COL;
     nointerpolation uint faceIdx : FIDX;
+    nointerpolation float shadow : SHADOW;
 };
+
+float3 UnpackVoxPos(uint4 p)
+{
+    return float3(p.x, p.y, p.z);
+}
+
+// Shadow byte lives in low 8 bits of aux (pck.w for VSIn / (pck.y>>16) for VoxelP).
+float ShadowFromAux(uint aux) { return (float)(aux & 0xFFu) * (1.0 / 255.0); }
+
+// Combined lighting using baked sun-shadow term. shadow=0 darkens both ambient
+// and sun (dramatic AO-like effect); shadow=1 = fully lit. ambFloor keeps a
+// minimum so deep shadow isn't pitch-black.
+float3 ApplyShadowLighting(float3 amb, float3 sunDir, float3 n, float shadow)
+{
+    float ndotl = saturate(dot(n, sunDir));
+    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl * shadow;
+    float  ao   = 0.30 + 0.70 * shadow;
+    return amb * ao + gAmbient * sun;
+}
 
 // Depth-only VS (Z prepass). No PS bound.
 struct VSDepthOut { float4 svpos : SV_Position; };
 // `precise` forces bit-exact identical math in both VS variants so the
 // prepass and main pass produce the same SV_Position -> no z-fighting.
-VSDepthOut vsmain_depth(VSIn i)
+VSDepthOut vsmain_depth(VSPolyIn i)
 {
     VSDepthOut o;
-    precise float3 local = float3(i.pck.x, i.pck.y, i.pck.z);
+    precise float3 local = UnpackVoxPos(i.pck);
     precise float3 world = gChunkBase + local;
     precise float4 clip  = mul(float4(world, 1.0), gViewProj);
     o.svpos = clip;
     return o;
 }
 
-VSOut vsmain(VSIn i)
+VSOut vsmain(VSPolyIn i)
 {
     VSOut o;
-    precise float3 local = float3(i.pck.x, i.pck.y, i.pck.z);
+    precise float3 local = UnpackVoxPos(i.pck);
     precise float3 world = gChunkBase + local;
     precise float4 clip  = mul(float4(world, 1.0), gViewProj);
     o.wpos    = world;
     o.svpos   = clip;
-    o.col     = i.col;
-    o.faceIdx = i.pck.w & 7;
+    o.col     = float4(float3(i.col.rgb) / 255.0, 1.0);
+    o.faceIdx = 0;
+    o.shadow  = ShadowFromAux(i.pck.w);
     return o;
 }
 
@@ -90,18 +157,20 @@ struct VSPointOut {
     float3 col   : COL;
     float3 wpos  : WPOS;
     nointerpolation uint mask : MASK;
+    nointerpolation float shadow : SHADOW;
 };
 
 VSPointOut vsmain_points(VSIn i)
 {
     VSPointOut o;
-    // _pad in cbPerChunk carries half-extent of the LOD voxel (0.5/1.0/2.0).
-    float3 local = float3(i.pck.x, i.pck.y, i.pck.z) + _pad;
+    // _pad carries half-extent of the LOD voxel (0.5/1.0/2.0); scene-rel pos + pad = voxel center.
+    float3 local = UnpackVoxPos(i.pck) + _pad;
     float3 world = gChunkBase + local;
     o.svpos = mul(float4(world, 1.0), gViewProj);
-    o.col   = i.col.rgb;
+    o.col   = float3(i.col.rgb) / 255.0;
     o.wpos  = world;
-    o.mask  = i.pck.w & 0x3Fu;
+    o.mask  = i.col.a & 0x3Fu;       // visMask packed in color alpha
+    o.shadow = ShadowFromAux(i.pck.w);
     return o;
 }
 
@@ -123,21 +192,19 @@ float4 psmain_points_simple(VSPointOut i) : SV_Target
 {
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
-    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     float3 n = normalize(gCamPos - i.wpos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
-    float ndotl = saturate(dot(n, normalize(gLightDir)));
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
-    float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(i.col * light, fogDist), 1.0);
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, i.shadow);
+    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
 }
 
 // Complex: per-axis up-to-3 cardinal faces, weighted by projected area.
 float4 psmain_points(VSPointOut i) : SV_Target
 {
     int mode = (int)gMode;
-    if (mode == 1) return float4(ApplyFog(i.col, length(i.wpos - gCamPos)), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
 
     // Choose up to 3 candidate cardinal faces: the ones the camera could see.
     // Per axis: positive face if D.axis >= 0, else negative face.
@@ -166,10 +233,8 @@ float4 psmain_points(VSPointOut i) : SV_Target
         // Projected-area weight (n always points toward camera here).
         float w = saturate(dot(n, Dn));
 
-        float ndotl = saturate(dot(n, L));
         float3 amb  = kAmbientCube[bitIdx];
-        float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
-        float3 light = amb + gAmbient * sun;
+        float3 light = ApplyShadowLighting(amb, L, n, i.shadow);
         accumCol += i.col * light * w;
         accumN   += n * w;
         accumW   += w;
@@ -177,14 +242,14 @@ float4 psmain_points(VSPointOut i) : SV_Target
 
     float fogDist = length(i.wpos - gCamPos);
     if (accumW <= 1e-5) {
-        if (mode == 2) return float4(ApplyFog(float3(0.5, 0.5, 0.5), fogDist), 1.0);
-        return float4(ApplyFog(i.col, fogDist), 1.0);
+        if (mode == 2) return float4(ApplyFog(float3(0.5, 0.5, 0.5), i.wpos), 1.0);
+        return float4(ApplyFog(i.col, i.wpos), 1.0);
     }
 
     if (mode == 2) {
-        return float4(ApplyFog(normalize(accumN) * 0.5 + 0.5, fogDist), 1.0);
+        return float4(ApplyFog(normalize(accumN) * 0.5 + 0.5, i.wpos), 1.0);
     }
-    return float4(ApplyFog(accumCol / accumW, fogDist), 1.0);
+    return float4(ApplyFog(accumCol / accumW, i.wpos), 1.0);
 }
 
 // ---------------- PointCS compute path ----------------
@@ -203,7 +268,14 @@ cbuffer cbCS : register(b2)
 // Packed voxel from existing point VB (8 bytes per entry):
 // pck = x | (y<<8) | (z<<16) | (faceIdx<<24)
 // col = RGBA8 packed
-struct VoxelP { uint pck; uint col; };
+// 12-byte structured-buffer entry. pck.x = (x | y<<16), pck.y = (z | aux<<16).
+struct VoxelP { uint2 pck; uint col; };
+float3 UnpackVoxPosCS(uint2 p)
+{
+    return float3((float)(p.x & 0xFFFFu),
+                  (float)((p.x >> 16u) & 0xFFFFu),
+                  (float)(p.y & 0xFFFFu));
+}
 
 StructuredBuffer<VoxelP> gVoxels  : register(t0);
 RWTexture2D<uint>        gColorUav : register(u0);
@@ -214,9 +286,7 @@ void csmain_points_cs(uint3 dt : SV_DispatchThreadID)
     uint idx = dt.x;
     if (idx >= gCsVoxelCount) return;
     VoxelP v = gVoxels[gCsVoxelOffset + idx];
-    float3 local = float3((v.pck >> 0u) & 0xFFu,
-                          (v.pck >> 8u) & 0xFFu,
-                          (v.pck >> 16u) & 0xFFu);
+    float3 local = UnpackVoxPosCS(v.pck);
     float3 world = gCsChunkBase + local + gCsLodHalfExtent;
     float4 clip = mul(float4(world, 1.0), gCsViewProj);
     if (clip.w <= 0.0) return;
@@ -268,7 +338,9 @@ struct VSBoundsOut { float4 svpos : SV_Position; };
 VSBoundsOut vsmain_bounds(VSBoundsIn i)
 {
     VSBoundsOut o;
-    float3 world = gChunkBase + i.pos * _pad;   // _pad in cbPerChunk = chunkSize
+    // Tight AABB: chunkBase = world aabbMin; size = (_pad, asfloat(_pad2.xy)).
+    float3 size = float3(_pad, asfloat(_pad2.x), asfloat(_pad2.y));
+    float3 world = gChunkBase + i.pos * size;
     o.svpos = mul(float4(world, 1.0), gViewProj);
     return o;
 }
@@ -289,6 +361,7 @@ struct VSPolyVidOut {
     float3 nrm   : NRM;
     float3 col   : COL;
     float3 wpos  : WPOS;
+    nointerpolation float shadow : SHADOW;
 };
 
 VSPolyVidOut vsmain_polyvid(uint vid : SV_VertexID)
@@ -297,9 +370,8 @@ VSPolyVidOut vsmain_polyvid(uint vid : SV_VertexID)
     uint voxelIdx  = (vid / 8u) + gVoxelBase;
     uint cornerIdx = vid & 7u;
     VoxelP v = gPolyVoxels[voxelIdx];
-    float3 voxLocal  = float3((v.pck >> 0u) & 0xFFu,
-                              (v.pck >> 8u) & 0xFFu,
-                              (v.pck >> 16u) & 0xFFu);
+    // Scene-relative packed: 10|10|10|2.
+    float3 voxLocal  = UnpackVoxPosCS(v.pck);
     float3 voxCenter = gChunkBase + voxLocal + 0.5;
     float3 cornerOff = float3((cornerIdx & 1u) ? 0.5 : -0.5,
                               (cornerIdx & 2u) ? 0.5 : -0.5,
@@ -311,6 +383,7 @@ VSPolyVidOut vsmain_polyvid(uint vid : SV_VertexID)
                      (v.col >>  8u) & 0xFFu,
                      (v.col >> 16u) & 0xFFu) / 255.0;
     o.wpos  = world;
+    o.shadow = ShadowFromAux(v.pck.y >> 16u);
     return o;
 }
 
@@ -322,64 +395,220 @@ float4 psmain_polyvid(VSPolyVidOut i) : SV_Target
     n = normalize(i.nrm * n);
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
-    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
-    float ndotl = saturate(dot(n, normalize(gLightDir)));
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
-    float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(i.col * light, fogDist), 1.0);
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, i.shadow);
+    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
 }
 
-// ---------------- Splat technique ----------------
-// Points rendered into an RGBA8 RT: rgb = base color, a = LOD tag (for CS pass).
-// SPLAT_FANCY_SHADING: 0 = raw base color (cheap, needed for CS filter alpha tag),
-//                     1 = full point shading (triplanar ambient + sun + fog).
-#define SPLAT_FANCY_SHADING 1
+// ---------------- TAA composite ----------------
+// Inputs:
+//   t4 = current frame scene color (post-jitter draw)
+//   t5 = previous frame history (reprojected this frame)
+//   t6 = current frame depth (R32_FLOAT view of D32 depth)
+// Uses gPrevViewProj + gJitter (sub-pixel NDC offset of current proj).
+Texture2D<float4> gTaaScene  : register(t4);
+Texture2D<float4> gTaaHist   : register(t5);
+Texture2D<float>  gTaaDepth  : register(t6);
+SamplerState      gTaaSamp   : register(s0);
 
-#if SPLAT_FANCY_SHADING
+struct VTaaOut { float4 pos : SV_Position; float2 uv : UV; };
 
-VSPointOut vsmain_splat(VSIn i)
+VTaaOut vsmain_taa(uint vid : SV_VertexID)
 {
-    return vsmain_points(i);
-}
-
-float4 psmain_splat(VSPointOut i) : SV_Target
-{
-    return psmain_points_simple(i);
-}
-
-#else
-
-struct VSSplatOut {
-    float4 svpos : SV_Position;
-    float4 col   : COL;      // rgb = base color, a = LOD index (0/1/2) as raw byte
-};
-
-VSSplatOut vsmain_splat(VSIn i)
-{
-    VSSplatOut o;
-    float3 local = float3(i.pck.x, i.pck.y, i.pck.z) + _pad;
-    float3 world = gChunkBase + local;
-    o.svpos = mul(float4(world, 1.0), gViewProj);
-    // _pad = lodHalfExtent (0.5/1.0/2.0) -> lod index 0/1/2.
-    // Store lod+1 in alpha byte so 0 means "empty pixel".
-    uint lod = (_pad < 0.75) ? 0u : (_pad < 1.5) ? 1u : 2u;
-    o.col = float4(i.col.rgb, (float)(lod + 1u) / 255.0);
+    // Fullscreen triangle: (-1,-1), (3,-1), (-1,3) covers screen.
+    float2 p = float2((vid == 1u) ? 3.0 : -1.0,
+                      (vid == 2u) ? 3.0 : -1.0);
+    VTaaOut o;
+    o.pos = float4(p, 0.0, 1.0);
+    o.uv  = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
     return o;
 }
 
-float4 psmain_splat(VSSplatOut i) : SV_Target
+float4 psmain_taa(VTaaOut i) : SV_Target
 {
-    return i.col;
+    int2 pix = (int2)i.pos.xy;
+    int W = (int)gScreenSize.x;
+    int H = (int)gScreenSize.y;
+    // Resample current frame at +jitter UV offset: undoes the projection jitter
+    // so the output pixel represents the world point at the (un-jittered) pixel
+    // center -> consecutive frames produce the same value on static scenes.
+    float2 currUv = (float2(pix) + 0.5) / float2((float)W, (float)H);
+    currUv += float2(gJitter.x * 0.5, -gJitter.y * 0.5);
+    float3 curC = gTaaScene.SampleLevel(gTaaSamp, currUv, 0).rgb;
+    float  d    = gTaaDepth.Load(int3(pix, 0));
+    if (d <= 0.0) {
+        return float4(curC, 1.0);
+    }
+
+    // Reconstruct world position from current depth + camera basis (undo jitter).
+    float viewZ = gNearZ / d;
+    float aspect = (float)W / (float)H;
+    float ndcX = ((float)pix.x + 0.5) / (float)W * 2.0 - 1.0 - gJitter.x;
+    float ndcY = 1.0 - ((float)pix.y + 0.5) / (float)H * 2.0 - gJitter.y;
+    float viewX = ndcX * aspect * gTanHalfFovY * viewZ;
+    float viewY = ndcY *          gTanHalfFovY * viewZ;
+    float3 world = gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
+
+    // Reproject to previous frame.
+    float4 prevClip = mul(float4(world, 1.0), gPrevViewProj);
+    if (prevClip.w <= 0.0) return float4(curC, 1.0);
+    float3 prevNdc = prevClip.xyz / prevClip.w;
+    if (any(abs(prevNdc.xy) > 1.0)) return float4(curC, 1.0);
+    float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
+
+    // Catmull-Rom 5-tap (Karis) - bicubic resample via 5 bilinear fetches.
+    // Sharper than plain bilinear; standard TAA history reconstruction.
+    float2 texSize = float2((float)W, (float)H);
+    float2 sp = prevUv * texSize;
+    float2 tp1 = floor(sp - 0.5) + 0.5;
+    float2 f = sp - tp1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 off12 = w2 / max(w12, 1e-5);
+    float2 tp0  = (tp1 - 1.0) / texSize;
+    float2 tp3  = (tp1 + 2.0) / texSize;
+    float2 tp12 = (tp1 + off12) / texSize;
+
+    float k0 = w12.x * w0.y;
+    float k1 = w0.x  * w12.y;
+    float k2 = w12.x * w12.y;
+    float k3 = w3.x  * w12.y;
+    float k4 = w12.x * w3.y;
+    float kSum = max(k0 + k1 + k2 + k3 + k4, 1e-5);
+    float3 prevC = float3(0, 0, 0);
+    prevC += gTaaHist.SampleLevel(gTaaSamp, float2(tp12.x, tp0.y ), 0).rgb * k0;
+    prevC += gTaaHist.SampleLevel(gTaaSamp, float2(tp0.x,  tp12.y), 0).rgb * k1;
+    prevC += gTaaHist.SampleLevel(gTaaSamp, float2(tp12.x, tp12.y), 0).rgb * k2;
+    prevC += gTaaHist.SampleLevel(gTaaSamp, float2(tp3.x,  tp12.y), 0).rgb * k3;
+    prevC += gTaaHist.SampleLevel(gTaaSamp, float2(tp12.x, tp3.y ), 0).rgb * k4;
+    prevC /= kSum;       // re-normalize (5-tap drops 4 corners)
+
+    float3 outC = lerp(prevC, curC, 0.05);
+    return float4(outC, 1.0);
 }
 
-#endif
+// Post-process: sky for empty pixels + sharpen + tonemap. Reads TAA history
+// (R16) + scene depth (R32_FLOAT view of D32) -> backbuf.
+Texture2D<float>  gPostDepth : register(t6);
+Texture2D<float4> gPostIn    : register(t7);
+
+// Local helper: world-ray dir for a pixel (mirrors splat-CS version which is
+// defined later in the file).
+float3 PostPixelWorldDir(int2 pix, int W, int H)
+{
+    float ndcX = ((float)pix.x + 0.5) / (float)W * 2.0 - 1.0;
+    float ndcY = 1.0 - ((float)pix.y + 0.5) / (float)H * 2.0;
+    float aspect = (float)W / (float)H;
+    float3 v = float3(ndcX * aspect * gTanHalfFovY, ndcY * gTanHalfFovY, 1.0);
+    return normalize(gCamRight * v.x + gCamUp * v.y + gCamForward * v.z);
+}
+
+float3 SkyColor(float3 rd)
+{
+    float3 sunDir = normalize(gLightDir);
+    float  t = saturate(rd.y * 0.5 + 0.5);
+    float3 horizon = float3(0.70, 0.75, 0.85);
+    float3 zenith  = float3(0.20, 0.40, 0.80);
+    float3 ground  = gFogColor;        // lower hemisphere matches fog
+    float3 above = lerp(horizon, zenith, smoothstep(0.5, 1.0, t));
+    float3 sky   = lerp(ground, above, smoothstep(0.48, 0.52, t));
+    float sunDot = max(0.0, dot(rd, sunDir));
+    float disc   = smoothstep(0.9990, 0.9996, sunDot);
+    float glow   = pow(sunDot, 6.0) * 0.6;
+    sky += float3(1.10, 0.95, 0.75) * (disc + glow);
+    return sky;
+}
+
+float3 ACES(float3 x)
+{
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+float3 PhotoTonemap(float3 x)
+{
+    return 1.0 - exp(-x * 0.5 );
+}
+
+float4 psmain_post(VTaaOut i) : SV_Target
+{
+    int2 pix = (int2)i.pos.xy;
+    int W = (int)gScreenSize.x;
+    int H = (int)gScreenSize.y;
+
+    // Sky detection: scene RT is cleared with alpha=0; scene PS writes alpha=1.
+    float4 inC = gPostIn.Load(int3(pix, 0));
+    float3 c;
+    if (inC.a < 0.5) {
+        float3 rd = PostPixelWorldDir(pix, W, H);
+        c = SkyColor(rd);
+    } else {
+        c = inC.rgb;
+        int2 pL = int2(max(pix.x - 1, 0),     pix.y);
+        int2 pR = int2(min(pix.x + 1, W - 1), pix.y);
+        int2 pU = int2(pix.x, max(pix.y - 1, 0));
+        int2 pD = int2(pix.x, min(pix.y + 1, H - 1));
+        float3 avg = (gPostIn.Load(int3(pL, 0)).rgb + gPostIn.Load(int3(pR, 0)).rgb +
+                      gPostIn.Load(int3(pU, 0)).rgb + gPostIn.Load(int3(pD, 0)).rgb) * 0.25;
+        c = c + 0.5 * (c - avg);   // unsharp mask
+    }
+    return float4(c, 1.0);
+}
+
+// ---------------- Splat technique ----------------
+// splatColorTex_ stores ALBEDO in RGB and per-voxel sun-shadow in alpha.
+// Filled-marker check uses gSplatDepth (cleared to 0; reverse-Z so >0 = hit).
+float4 psmain_splat_albedo(VSPointOut i) : SV_Target
+{
+    return float4(i.col, i.shadow);
+}
+float4 psmain_splat_albedo_poly(VSOut i) : SV_Target
+{
+    return float4(i.col.rgb, i.shadow);
+}
 
 // CS reconstruction: for each output pixel, search neighbors for the nearest
 // point whose splat sphere covers it; use its color (background if none).
+Texture2D<float>    gSplatDepth    : register(t1);
 Texture2D<float4>   gSplatColorSrv : register(t2);
 RWTexture2D<float4> gSplatFinalUav : register(u1);
+
+// Reconstruct world ray for pixel center using the camera basis (avoids the
+// numerically-fragile inverse view-proj matrix).
+float3 PixelWorldDir(int2 pix, int W, int H)
+{
+    float2 ndc;
+    ndc.x = ((float)pix.x + 0.5) / (float)W * 2.0 - 1.0;
+    ndc.y = 1.0 - ((float)pix.y + 0.5) / (float)H * 2.0;
+    float aspect = (float)W / (float)H;
+    float3 viewDir = float3(ndc.x * aspect * gTanHalfFovY,
+                            ndc.y           * gTanHalfFovY,
+                            1.0);
+    return normalize(gCamRight   * viewDir.x +
+                     gCamUp      * viewDir.y +
+                     gCamForward * viewDir.z);
+}
+
+// Fast world-space reconstruction from depth (reverse-Z infinite-far).
+//   viewZ = nearZ / depth                 (one recip)
+//   viewX = ndc.x * aspect * tanFov * viewZ
+//   viewY = ndc.y *          tanFov * viewZ
+//   world = camPos + camRight*viewX + camUp*viewY + camForward*viewZ
+float3 ReconstructNeighborWorld(int2 sp, float zN, int W, int H)
+{
+    float viewZ = gNearZ / zN;
+    float aspect = (float)W / (float)H;
+    float ndcX = ((float)sp.x + 0.5) / (float)W * 2.0 - 1.0;
+    float ndcY = 1.0 - ((float)sp.y + 0.5) / (float)H * 2.0;
+    float viewX = ndcX * aspect * gTanHalfFovY * viewZ;
+    float viewY = ndcY *          gTanHalfFovY * viewZ;
+    return gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
+}
 
 [numthreads(8, 8, 1)]
 void csmain_splat(uint3 dt : SV_DispatchThreadID)
@@ -389,59 +618,65 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
     int H = (int)gScreenSize.y;
     if (pix.x >= W || pix.y >= H) return;
 
-    // Expanding rings: return as soon as we find any hits.
-    const float kAlphaEps = 0.5 / 255.0;
+    // Camera ray for the current pixel.
+    float3 ro = gCamPos;
+    float3 rd = PixelWorldDir(pix, W, H);
+    float3 invRd = 1.0 / rd;
 
-    // Ring 0: center pixel.
-    float4 c0 = gSplatColorSrv.Load(int3(pix, 0));
-    if (c0.a >= kAlphaEps) {
+    int R = (int)max(1.0, _pad1.x);
+    float  bestT      = 1e30;
+    float3 bestAlbedo = float3(0, 0, 0);
+    float3 bestN      = float3(0, 0, 1);
+    float  bestShadow = 1.0;
+    bool   anyHit     = false;
+
+    [loop] for (int dy = -R; dy <= R; ++dy) {
+        [loop] for (int dx = -R; dx <= R; ++dx) {
+            int2 sp = pix + int2(dx, dy);
+            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
+            float zN = gSplatDepth.Load(int3(sp, 0));
+            if (zN <= 0.0) continue;       // depth>0 marks filled (alpha = shadow)
+            float4 s = gSplatColorSrv.Load(int3(sp, 0));
+            float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
+            float3 vmin = floor(wp);
+            float3 vmax = vmin + 1.0;
+            float3 t0v = (vmin - ro) * invRd;
+            float3 t1v = (vmax - ro) * invRd;
+            float3 tmn = min(t0v, t1v);
+            float3 tmx = max(t0v, t1v);
+            float tNear = max(max(tmn.x, tmn.y), tmn.z);
+            float tFar  = min(min(tmx.x, tmx.y), tmx.z);
+            if (tFar < 0.0 || tNear > tFar) continue;
+            float tHit = max(tNear, 0.0);
+            if (tHit < bestT) {
+                float3 hit = ro + rd * tHit;
+                float3 center = (vmin + vmax) * 0.5;
+                float3 d = hit - center;
+                float3 absD = abs(d);
+                float maxC = max(max(absD.x, absD.y), absD.z);
+                float3 n = float3(0, 0, 0);
+                if      (absD.x >= maxC - 1e-3) n.x = d.x >= 0 ? 1.0 : -1.0;
+                else if (absD.y >= maxC - 1e-3) n.y = d.y >= 0 ? 1.0 : -1.0;
+                else                            n.z = d.z >= 0 ? 1.0 : -1.0;
+                bestT      = tHit;
+                bestAlbedo = s.rgb;
+                bestN      = n;
+                bestShadow = s.a;
+                anyHit     = true;
+            }
+        }
+    }
+
+    if (anyHit) {
+        float3 hit = ro + rd * bestT;
+        float3 amb = SampleAmbientCubeTriplanar(bestN);
+        float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, bestShadow);
+        float3 lit = bestAlbedo * light;
+        gSplatFinalUav[pix] = float4(ApplyFog(lit, hit), 1.0);
+    } else {
+        float4 c0 = gSplatColorSrv.Load(int3(pix, 0));
         gSplatFinalUav[pix] = float4(c0.rgb, 1.0);
-        return;
     }
-
-    // Ring 1: 3x3 minus center.
-    {
-        float3 accum = 0;
-        uint count = 0;
-        [unroll] for (int dy = -1; dy <= 1; ++dy)
-        [unroll] for (int dx = -1; dx <= 1; ++dx) {
-            if (dx == 0 && dy == 0) continue;
-            int2 sp = pix + int2(dx, dy);
-            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
-            float4 s = gSplatColorSrv.Load(int3(sp, 0));
-            if (s.a < kAlphaEps) continue;
-            accum += s.rgb;
-            ++count;
-        }
-        if (count > 0u) {
-            gSplatFinalUav[pix] = float4(accum / (float)count, 1.0);
-            return;
-        }
-    }
-
-    // Ring 2: 5x5 outer (exclude 3x3 interior).
-    {
-        float3 accum = 0;
-        uint count = 0;
-        [unroll] for (int dy = -2; dy <= 2; ++dy)
-        [unroll] for (int dx = -2; dx <= 2; ++dx) {
-            if (abs(dx) < 2 && abs(dy) < 2) continue;
-            int2 sp = pix + int2(dx, dy);
-            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
-            float4 s = gSplatColorSrv.Load(int3(sp, 0));
-            if (s.a < kAlphaEps) continue;
-            accum += s.rgb;
-            ++count;
-        }
-        if (count > 0u) {
-            gSplatFinalUav[pix] = float4(accum / (float)count, 1.0);
-            return;
-        }
-    }
-
-    // No hit in any ring -> fall back to the cleared background color (the
-    // host clears splatColorTex_ RGB to the current scene clear color).
-    gSplatFinalUav[pix] = float4(c0.rgb, 1.0);
 }
 
 // ---------------- AtlasMesh technique ----------------
@@ -477,24 +712,18 @@ float4 psmain_atlas(VSAtlasOut i) : SV_Target
 {
     int2 tx = int2(i.uv);                            // truncate -> exact texel
     float3 col = gAtlasTex.Load(int3(tx, 0)).rgb;
-
-    static const float3 kFaceNormals[6] = {
-        float3( 1, 0, 0), float3(-1, 0, 0),
-        float3( 0, 1, 0), float3( 0,-1, 0),
-        float3( 0, 0, 1), float3( 0, 0,-1)
-    };
     float3 n = kFaceNormals[i.face & 7];
 
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
-    if (mode == 1) return float4(ApplyFog(col, fogDist), 1.0);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
+    if (mode == 1) return float4(ApplyFog(col, i.wpos), 1.0);
 
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = kAmbientCube[i.face & 7];
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
+    float3 sun  = float3(1.10, 1.00, 0.85) * 1.5  * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(col * light, fogDist), 1.0);
+    return float4(ApplyFog(col * light, i.wpos), 1.0);
 }
 
 // ---------------- MergedMesh technique ----------------
@@ -527,13 +756,13 @@ float4 psmain_merged(VSMergedOut i) : SV_Target
     n = normalize(n);
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
-    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(i.col * light, fogDist), 1.0);
+    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
 }
 
 // ---------------- Billboard technique ----------------
@@ -544,6 +773,7 @@ struct VSBillOut {
     nointerpolation float3 boxMin : BMIN;
     nointerpolation float3 boxMax : BMAX;
     nointerpolation float3 col    : COL;
+    nointerpolation float  shadow : SHADOW;
 };
 
 // Shared code for both billboard variants: emits one vertex of an axis-aligned
@@ -552,9 +782,7 @@ struct VSBillOut {
 VSBillOut BillboardVertex(uint voxelIdx, float2 s)
 {
     VoxelP v = gPolyVoxels[voxelIdx];
-    float3 voxLocal = float3((v.pck >> 0u) & 0xFFu,
-                             (v.pck >> 8u) & 0xFFu,
-                             (v.pck >> 16u) & 0xFFu);
+    float3 voxLocal = UnpackVoxPosCS(v.pck);
     float3 boxMin = gChunkBase + voxLocal;
     float3 boxMax = boxMin + 1.0;
     float3 center = boxMin + 0.5;
@@ -573,6 +801,7 @@ VSBillOut BillboardVertex(uint voxelIdx, float2 s)
     o.col    = float3((v.col >>  0u) & 0xFFu,
                       (v.col >>  8u) & 0xFFu,
                       (v.col >> 16u) & 0xFFu) / 255.0;
+    o.shadow = ShadowFromAux(v.pck.y >> 16u);
     return o;
 }
 
@@ -648,15 +877,12 @@ float4 psmain_billboard(VSBillOut i,
     depthOut = saturate(clipHit.z / max(clipHit.w, 1e-6));
 
     int mode = (int)gMode;
-    float fogDist = length(hit - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
-    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, hit), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, hit), 1.0);
 
-    float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
-    float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(i.col * light, fogDist), 1.0);
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, i.shadow);
+    return float4(ApplyFog(i.col * light, hit), 1.0);
 }
 
 // ---------------- HexSprite technique ----------------
@@ -664,14 +890,15 @@ float4 psmain_billboard(VSBillOut i,
 // Voxel data delivered as per-instance attributes; SV_VertexID 0..17 picks
 // the triangle (0..5) and the role (center, v1, v2).
 struct VSHexIn {
-    uint4  inst_pck : POSITION;
-    float4 inst_col : COLOR;
+    uint4  inst_pck : POSITION;   // scene-relative pos (16-bit per axis)
+    uint4  inst_col : COLOR;
     uint   vid : SV_VertexID;
 };
 struct VSHexOut {
     float4 svpos : SV_Position;
     float3 wpos  : WPOS;
     float3 col   : COL;
+    nointerpolation float shadow : SHADOW;
 };
 
 VSHexOut vsmain_hex(VSHexIn i)
@@ -683,7 +910,7 @@ VSHexOut vsmain_hex(VSHexIn i)
     else if (role == 1) cornerID = 1 + tri;
     else                cornerID = 1 + ((tri + 1) % 6);
 
-    float3 voxLocal  = float3(i.inst_pck.xyz);
+    float3 voxLocal  = UnpackVoxPos(i.inst_pck);
     float3 voxCenter = gChunkBase + voxLocal + 0.5;
     float3 D = gCamPos - voxCenter;
     float3 sgn;
@@ -710,7 +937,8 @@ VSHexOut vsmain_hex(VSHexIn i)
     VSHexOut o;
     o.svpos = mul(float4(world, 1.0), gViewProj);
     o.wpos  = world;
-    o.col   = i.inst_col.rgb;
+    o.col   = float3(i.inst_col.rgb) / 255.0;
+    o.shadow = ShadowFromAux(i.inst_pck.w);
     return o;
 }
 
@@ -722,14 +950,12 @@ float4 psmain_hex(VSHexOut i) : SV_Target
 
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
-    if (mode == 1) return float4(ApplyFog(i.col, fogDist), 1.0);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
 
-    float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
-    float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(i.col * light, fogDist), 1.0);
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, i.shadow);
+    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
 }
 
 // ---------------- Polygon technique ----------------
@@ -748,12 +974,10 @@ float4 psmain(VSOut i) : SV_Target
 
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, fogDist), 1.0);
-    if (mode == 1) return float4(ApplyFog(i.col.rgb, fogDist), 1.0);
+    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
+    if (mode == 1) return float4(ApplyFog(i.col.rgb, i.wpos), 1.0);
 
-    float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);  // axis-aligned n => single bucket
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
-    float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(i.col.rgb * light, fogDist), 1.0);
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, i.shadow);
+    return float4(ApplyFog(i.col.rgb * light, i.wpos), 1.0);
 }

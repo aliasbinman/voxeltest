@@ -39,11 +39,11 @@ struct AtlasMesh {
     std::vector<AtlasVertex>   vertices;
     std::vector<uint32_t>      indices;
     std::vector<AtlasChunkSub> chunks;
-    std::vector<uint32_t>      atlasPixels;     // RGBA8, atlasW * atlasH
+    std::vector<uint32_t>      atlasPixels;
     uint32_t atlasW = 0;
     uint32_t atlasH = 0;
-    int32_t  origin[3] = { 0, 0, 0 };           // world-space offset to add to uint16 pos
-    float    aabbMin[3] = {  1e30f,  1e30f,  1e30f };  // world-space scene AABB
+    int32_t  origin[3] = { 0, 0, 0 };
+    float    aabbMin[3] = {  1e30f,  1e30f,  1e30f };
     float    aabbMax[3] = { -1e30f, -1e30f, -1e30f };
 };
 

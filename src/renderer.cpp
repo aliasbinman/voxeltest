@@ -27,7 +27,18 @@ struct CBPerFrame {
     float camForward[3];
     float tanHalfFovY;
     float fogColor[3];
-    float fogDensity;   // 0 = fog off
+    float fogDensity;            // 0 = depth fog off
+    float heightFogDensity;      // 0 = height fog off
+    float heightFogFalloff;
+    float heightFogStart;
+    float _padHF;
+    float sceneOrigin[3];
+    float nearZ;        // reverse-Z infinite-far: viewZ = nearZ / ndcZ
+    float sceneSpan[3];
+    float _pad6;
+    float prevViewProj[16];
+    float jitter[2];
+    float _pad7[2];
 };
 
 struct CBPerChunk {
@@ -165,10 +176,11 @@ bool Renderer::CreateRenderTargets() {
     td.Height = height_;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D32_FLOAT;
+    // R32_TYPELESS so TAA can sample depth as SRV.
+    td.Format = DXGI_FORMAT_R32_TYPELESS;
     td.SampleDesc = sd;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | (msaaSamples_ > 1 ? 0 : D3D11_BIND_SHADER_RESOURCE);
     hr = device_->CreateTexture2D(&td, nullptr, depthTex_.GetAddressOf());
     if (FAILED(hr)) return false;
     D3D11_DEPTH_STENCIL_VIEW_DESC dsvd = {};
@@ -177,6 +189,43 @@ bool Renderer::CreateRenderTargets() {
                                             : D3D11_DSV_DIMENSION_TEXTURE2D;
     hr = device_->CreateDepthStencilView(depthTex_.Get(), &dsvd, dsv_.GetAddressOf());
     if (FAILED(hr)) return false;
+    depthSrv_.Reset();
+    if (msaaSamples_ == 1) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC dsv = {};
+        dsv.Format = DXGI_FORMAT_R32_FLOAT;
+        dsv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        dsv.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(depthTex_.Get(), &dsv, depthSrv_.GetAddressOf());
+    }
+
+    // TAA RT (scene) + ping-pong history (R8G8B8A8 with RT + SR binding).
+    taaSceneTex_.Reset();  taaSceneRtv_.Reset();  taaSceneSrv_.Reset();
+    for (int i = 0; i < 2; ++i) {
+        taaHistTex_[i].Reset(); taaHistRtv_[i].Reset(); taaHistSrv_[i].Reset();
+        taaHistValid_[i] = false;
+    }
+    {
+        // Scene RT matches backbuffer format (we CopyResource between them).
+        D3D11_TEXTURE2D_DESC ct = {};
+        ct.Width = width_; ct.Height = height_;
+        ct.MipLevels = 1; ct.ArraySize = 1;
+        ct.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        ct.SampleDesc.Count = 1;
+        ct.Usage = D3D11_USAGE_DEFAULT;
+        ct.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        device_->CreateTexture2D(&ct, nullptr, taaSceneTex_.GetAddressOf());
+        device_->CreateRenderTargetView(taaSceneTex_.Get(), nullptr, taaSceneRtv_.GetAddressOf());
+        device_->CreateShaderResourceView(taaSceneTex_.Get(), nullptr, taaSceneSrv_.GetAddressOf());
+
+        // History needs higher precision so repeated lerp doesn't quantize down.
+        D3D11_TEXTURE2D_DESC ht = ct;
+        ht.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        for (int i = 0; i < 2; ++i) {
+            device_->CreateTexture2D(&ht, nullptr, taaHistTex_[i].GetAddressOf());
+            device_->CreateRenderTargetView(taaHistTex_[i].Get(), nullptr, taaHistRtv_[i].GetAddressOf());
+            device_->CreateShaderResourceView(taaHistTex_[i].Get(), nullptr, taaHistSrv_[i].GetAddressOf());
+        }
+    }
 
     // Optional MSAA color target. Backbuffer stays 1x; resolve at EndFrame.
     if (msaaSamples_ > 1) {
@@ -232,21 +281,27 @@ bool Renderer::CreateRenderTargets() {
     if (FAILED(device_->CreateTexture2D(&sd2, nullptr, splatFinalTex_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateUnorderedAccessView(splatFinalTex_.Get(), nullptr, splatFinalUav_.GetAddressOf()))) return false;
 
-    // Dedicated non-MSAA depth for splat pass.
+    // Dedicated non-MSAA depth for splat pass. R32_TYPELESS so the CS can
+    // read the same texture as a SRV alongside the DSV binding.
     D3D11_TEXTURE2D_DESC sdd = {};
     sdd.Width = width_;
     sdd.Height = height_;
     sdd.MipLevels = 1;
     sdd.ArraySize = 1;
-    sdd.Format = DXGI_FORMAT_D32_FLOAT;
+    sdd.Format = DXGI_FORMAT_R32_TYPELESS;
     sdd.SampleDesc.Count = 1;
     sdd.Usage = D3D11_USAGE_DEFAULT;
-    sdd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    sdd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(device_->CreateTexture2D(&sdd, nullptr, splatDepthTex_.GetAddressOf()))) return false;
     D3D11_DEPTH_STENCIL_VIEW_DESC sddv = {};
     sddv.Format = DXGI_FORMAT_D32_FLOAT;
     sddv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
     if (FAILED(device_->CreateDepthStencilView(splatDepthTex_.Get(), &sddv, splatDsv_.GetAddressOf()))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sdsv = {};
+    sdsv.Format = DXGI_FORMAT_R32_FLOAT;
+    sdsv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sdsv.Texture2D.MipLevels = 1;
+    if (FAILED(device_->CreateShaderResourceView(splatDepthTex_.Get(), &sdsv, splatDepthSrv_.GetAddressOf()))) return false;
     return true;
 }
 
@@ -293,10 +348,12 @@ bool Renderer::CreateShaders() {
     ComPtr<ID3DBlob> vsbA, psbA;
     if (!compile("vsmain_atlas", "vs_5_0", vsbA)) return false;
     if (!compile("psmain_atlas", "ps_5_0", psbA)) return false;
-    ComPtr<ID3DBlob> vsbSp, psbSp, csbSp;
-    if (!compile("vsmain_splat",  "vs_5_0", vsbSp)) return false;
-    if (!compile("psmain_splat",  "ps_5_0", psbSp)) return false;
-    if (!compile("csmain_splat",  "cs_5_0", csbSp)) return false;
+    ComPtr<ID3DBlob> csbSp, psbSa, vsbTa, psbTa, psbPo;
+    if (!compile("csmain_splat",        "cs_5_0", csbSp)) return false;
+    if (!compile("psmain_splat_albedo", "ps_5_0", psbSa)) return false;
+    if (!compile("vsmain_taa",          "vs_5_0", vsbTa)) return false;
+    if (!compile("psmain_taa",          "ps_5_0", psbTa)) return false;
+    if (!compile("psmain_post",         "ps_5_0", psbPo)) return false;
     if (!compile("vsmain_bounds", "vs_5_0", vsbb)) return false;
     if (!compile("psmain_bounds", "ps_5_0", psbb)) return false;
     ComPtr<ID3DBlob> vsbd;
@@ -348,12 +405,23 @@ bool Renderer::CreateShaders() {
                                         atlasInputLayout_.GetAddressOf());
         if (FAILED(hr)) return false;
     }
-    hr = device_->CreateVertexShader(vsbSp->GetBufferPointer(), vsbSp->GetBufferSize(), nullptr, vsSplat_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psbSp->GetBufferPointer(), psbSp->GetBufferSize(), nullptr, psSplat_.GetAddressOf());
-    if (FAILED(hr)) return false;
     hr = device_->CreateComputeShader(csbSp->GetBufferPointer(), csbSp->GetBufferSize(), nullptr, csSplat_.GetAddressOf());
     if (FAILED(hr)) return false;
+    hr = device_->CreatePixelShader(psbSa->GetBufferPointer(), psbSa->GetBufferSize(), nullptr, psSplatAlbedo_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    hr = device_->CreateVertexShader(vsbTa->GetBufferPointer(), vsbTa->GetBufferSize(), nullptr, vsTaa_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    hr = device_->CreatePixelShader(psbTa->GetBufferPointer(), psbTa->GetBufferSize(), nullptr, psTaa_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    hr = device_->CreatePixelShader(psbPo->GetBufferPointer(), psbPo->GetBufferSize(), nullptr, psPost_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    {
+        D3D11_SAMPLER_DESC sm = {};
+        sm.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sm.MinLOD = 0; sm.MaxLOD = D3D11_FLOAT32_MAX;
+        device_->CreateSamplerState(&sm, linearClampSampler_.GetAddressOf());
+    }
     D3D11_INPUT_ELEMENT_DESC ilM[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,                            D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UNORM,  0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -375,20 +443,22 @@ bool Renderer::CreateShaders() {
     hr = device_->CreatePixelShader(psbl->GetBufferPointer(), psbl->GetBufferSize(), nullptr, psBlit_.GetAddressOf());
     if (FAILED(hr)) return false;
 
+    // Unified per-vertex layout: 16-bit-per-axis scene-relative position +
+    // RGBA8 color (uint4, alpha byte = visMask for point verts). Stride 12 B.
     D3D11_INPUT_ELEMENT_DESC il[] = {
-        // x,y,z,faceIdx packed as 4 unsigned bytes
-        { "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UINT,  0, 0,                            D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "POSITION", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 0,                            D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UINT,     0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     hr = device_->CreateInputLayout(il, _countof(il),
                                     vsb->GetBufferPointer(), vsb->GetBufferSize(),
                                     inputLayout_.GetAddressOf());
     if (FAILED(hr)) return false;
+    inputLayoutPoly_ = inputLayout_;   // same layout; alias kept for clarity
 
-    // HexSprite: same buffer, per-instance stepping.
+    // HexSprite: same vertex format, per-instance stepping.
     D3D11_INPUT_ELEMENT_DESC ilHex[] = {
-        { "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UINT,  0, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "POSITION", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 0,                            D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UINT,     0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
     };
     hr = device_->CreateInputLayout(ilHex, _countof(ilHex),
                                     vsbh->GetBufferPointer(), vsbh->GetBufferSize(),
@@ -470,6 +540,11 @@ bool Renderer::CreatePipelineState() {
     rdNo.CullMode = D3D11_CULL_NONE;
     if (FAILED(device_->CreateRasterizerState(&rdNo, rsNoCull_.GetAddressOf()))) return false;
 
+    D3D11_RASTERIZER_DESC rdW = rd;
+    rdW.FillMode = D3D11_FILL_WIREFRAME;
+    rdW.CullMode = D3D11_CULL_NONE;     // see thin lines from both sides
+    if (FAILED(device_->CreateRasterizerState(&rdW, rsWire_.GetAddressOf()))) return false;
+
     D3D11_DEPTH_STENCIL_DESC dd = {};
     dd.DepthEnable = TRUE;
     dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
@@ -522,7 +597,7 @@ void Renderer::UploadScene(const Scene& scene) {
     D3D11_SUBRESOURCE_DATA sd = {};
 
     bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    bd.ByteWidth = (UINT)(scene.vertices.size() * sizeof(Vertex));
+    bd.ByteWidth = (UINT)(scene.vertices.size() * sizeof(VoxelPolyVertex));
     sd.pSysMem = scene.vertices.data();
     if (FAILED(device_->CreateBuffer(&bd, &sd, vb_.GetAddressOf()))) return;
 
@@ -605,6 +680,9 @@ void Renderer::UploadScene(const Scene& scene) {
     totalVertices_  = scene.vertices.size();
     totalTriangles_ = 0;
     for (const auto& s : scene.subs) totalTriangles_ += s.indexCount / 3;
+    sceneOrigin_[0] = (float)scene.origin[0];
+    sceneOrigin_[1] = (float)scene.origin[1];
+    sceneOrigin_[2] = (float)scene.origin[2];
     sceneSpan_[0] = scene.aabbMax[0] - scene.aabbMin[0];
     sceneSpan_[1] = scene.aabbMax[1] - scene.aabbMin[1];
     sceneSpan_[2] = scene.aabbMax[2] - scene.aabbMin[2];
@@ -658,7 +736,7 @@ void Renderer::UploadScene(const Scene& scene) {
             device_->CreateBuffer(&ibd2, &isd2, billboardIb_.GetAddressOf());
         }
     }
-    vbBytes_ = scene.vertices.size() * sizeof(Vertex);
+    vbBytes_ = scene.vertices.size() * sizeof(VoxelPolyVertex);
     ibBytes_ = ibCount * sizeof(uint32_t);
 }
 
@@ -770,22 +848,67 @@ void Renderer::BeginFrame(float clear[4]) {
     ctx_->RSSetViewports(1, &vp);
 }
 
-void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float hybridThreshold) {
+void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, DataSet dataset, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float heightFogDensity, float heightFogFalloff, float heightFogStart, float hybridThreshold, bool wireframe, int splatRadius, bool taa) {
     if (hybridThreshold < 0.01f) hybridThreshold = 0.01f;
+
+    // TAA disabled when MSAA on (composite reads non-MSAA depth/color).
+    if (msaaSamples_ > 1) taa = false;
+
+    // Halton(2,3) sub-pixel jitter for this frame.
+    auto halton = [](uint32_t i, uint32_t b) {
+        float f = 1.0f, r = 0.0f;
+        while (i > 0) { f /= (float)b; r += f * (float)(i % b); i /= b; }
+        return r;
+    };
+    float jitterNdcX = 0.0f, jitterNdcY = 0.0f;
+    if (taa) {
+        uint32_t k = (taaFrame_ % 16u) + 1u;
+        jitterNdcX = (halton(k, 2) - 0.5f) * 2.0f / (float)width_;
+        jitterNdcY = (halton(k, 3) - 0.5f) * 2.0f / (float)height_;
+    }
     if (pointLodScale < 0.01f) pointLodScale = 0.01f;
     if (gridSize < 1) gridSize = 1;
     if (gridSize > 10) gridSize = 10;
     hlslpp::float4x4 v  = cam.view();
     hlslpp::float4x4 p  = cam.proj((float)width_ / (float)(height_ ? height_ : 1));
+    if (taa) {
+        // Inject sub-pixel jitter into proj. clip = view*proj, clip.w = view.z;
+        // adding (jitter * view.z) to clip.xy after divide gives NDC offset = jitter.
+        // Row index 2 (view.z multiplier) of row-major proj.
+        float pStore[16];
+        hlslpp::store(pStore, p);
+        pStore[2*4 + 0] = jitterNdcX;
+        pStore[2*4 + 1] = jitterNdcY;
+        p = hlslpp::float4x4(
+            pStore[0],  pStore[1],  pStore[2],  pStore[3],
+            pStore[4],  pStore[5],  pStore[6],  pStore[7],
+            pStore[8],  pStore[9],  pStore[10], pStore[11],
+            pStore[12], pStore[13], pStore[14], pStore[15]);
+    }
     hlslpp::float4x4 vp = hlslpp::mul(v, p);
 
     D3D11_MAPPED_SUBRESOURCE m;
     ctx_->Map(cbPerFrame_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
+    // Post (sky + sharpen + tonemap) reads scene RT after main draws. TAA
+    // composite sits between when enabled. Sky pixels marked by alpha=0.
+    const bool postEnabled = (taaSceneRtv_ && psPost_);
+    const bool useMsaa = (msaaSamples_ > 1);
+    postWroteBackbuf_ = false;
+    if (postEnabled) {
+        float alpha0[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
+        ID3D11RenderTargetView* sceneRtv = useMsaa ? msaaRtv_.Get() : taaSceneRtv_.Get();
+        ctx_->ClearRenderTargetView(sceneRtv, alpha0);
+        ID3D11RenderTargetView* rtvs[] = { sceneRtv };
+        ctx_->OMSetRenderTargets(1, rtvs, dsv_.Get());
+    }
+
     {
         CBPerFrame cb;
         hlslpp::store(cb.viewProj, vp);
         hlslpp::store(cb.camPos, cam.position);
-        cb.mode = (float)(int)mode;
+        // Wireframe forces FlatColor shading so lines aren't black (the lit PS
+        // computes normals via ddx/ddy which degenerates on wireframe edges).
+        cb.mode = (float)(wireframe ? (int)ShadingMode::FlatColor : (int)mode);
         cb.lightDir[0] = 0.4f; cb.lightDir[1] = 0.8f; cb.lightDir[2] = 0.2f;
         cb.ambient = 0.7f;
         hlslpp::float3 fwd = cam.forward();
@@ -796,7 +919,8 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         hlslpp::store(cb.invViewProj, invVp);
         cb.screenW = (float)width_;
         cb.screenH = (float)height_;
-        cb._pad2[0] = cb._pad2[1] = 0;
+        cb._pad2[0] = (float)splatRadius;       // gSplatRadius (CS dilation R)
+        cb._pad2[1] = 0;
         hlslpp::float3 right = cam.right();
         hlslpp::float3 upVec = hlslpp::cross(fwd, right);
         hlslpp::store(cb.camRight,   right);
@@ -806,6 +930,17 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         cb.tanHalfFovY = tanf(cam.fovDeg * 3.14159265358979f / 180.0f * 0.5f);
         cb.fogColor[0] = fogColor[0]; cb.fogColor[1] = fogColor[1]; cb.fogColor[2] = fogColor[2];
         cb.fogDensity  = fogDensity;
+        cb.heightFogDensity = heightFogDensity;
+        cb.heightFogFalloff = heightFogFalloff;
+        cb.heightFogStart   = heightFogStart;
+        cb._padHF = 0;
+        cb.sceneOrigin[0] = sceneOrigin_[0]; cb.sceneOrigin[1] = sceneOrigin_[1]; cb.sceneOrigin[2] = sceneOrigin_[2];
+        cb.nearZ = cam.nearZ;
+        cb.sceneSpan[0] = sceneSpan_[0]; cb.sceneSpan[1] = sceneSpan_[1]; cb.sceneSpan[2] = sceneSpan_[2];
+        cb._pad6 = 0;
+        for (int i = 0; i < 16; ++i) cb.prevViewProj[i] = taaPrevVP_[i];
+        cb.jitter[0] = jitterNdcX; cb.jitter[1] = jitterNdcY;
+        cb._pad7[0] = cb._pad7[1] = 0;
         memcpy(m.pData, &cb, sizeof(cb));
     }
     ctx_->Unmap(cbPerFrame_.Get(), 0);
@@ -813,8 +948,8 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
     ctx_->IASetInputLayout(inputLayout_.Get());
     ID3D11Buffer* cbs[] = { cbPerFrame_.Get(), cbPerChunk_.Get() };
     ctx_->VSSetConstantBuffers(0, 2, cbs);
-    ctx_->PSSetConstantBuffers(0, 1, cbs);
-    ctx_->RSSetState(rsSolid_.Get());
+    ctx_->PSSetConstantBuffers(0, 2, cbs);
+    ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
     ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
     if (!vb_ || !ib_) return;
@@ -875,34 +1010,70 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
     lastDrawnTris_ = 0;
     const float spanX = sceneSpan_[0];
     const float spanZ = sceneSpan_[2];
+
+    // Shared AABB-vs-camera distance: nearest point of [aMin..aMax] to camP.
+    auto chunkDist = [&](const float aMin[3], const float aMax[3]) -> float {
+        float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
+                 : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
+        float dy = camP[1] < aMin[1] ? aMin[1] - camP[1]
+                 : camP[1] > aMax[1] ? camP[1] - aMax[1] : 0.0f;
+        float dz = camP[2] < aMin[2] ? aMin[2] - camP[2]
+                 : camP[2] > aMax[2] ? camP[2] - aMax[2] : 0.0f;
+        float d = sqrtf(dx*dx + dy*dy + dz*dz);
+        return d < 1e-3f ? 1e-3f : d;
+    };
+    // Shared 6-plane frustum cull of AABB.
+    auto cullAabb = [&](const float aMin[3], const float aMax[3]) -> bool {
+        for (int pi = 0; pi < 6; ++pi) {
+            const float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
+            float px = a >= 0 ? aMax[0] : aMin[0];
+            float py = b >= 0 ? aMax[1] : aMin[1];
+            float pz = c >= 0 ? aMax[2] : aMin[2];
+            if (a * px + b * py + c * pz + d < 0.0f) return true;
+        }
+        return false;
+    };
+    // True iff every corner of the AABB is on the inside of every frustum
+    // plane (lets the caller skip per-cluster cull when the whole mesh fits).
+    auto aabbFullyInside = [&](const float aMin[3], const float aMax[3]) -> bool {
+        for (int pi = 0; pi < 6; ++pi) {
+            const float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
+            float nx = a >= 0 ? aMin[0] : aMax[0];
+            float ny = b >= 0 ? aMin[1] : aMax[1];
+            float nz = c >= 0 ? aMin[2] : aMax[2];
+            if (a * nx + b * ny + c * nz + d < 0.0f) return false;
+        }
+        return true;
+    };
     for (int gz = 0; gz < gridSize; ++gz) {
         for (int gx = 0; gx < gridSize; ++gx) {
             float ox = gx * spanX;
             float oz = gz * spanZ;
+
+            // Whole-mesh AABB tests first: skip the cell entirely if outside;
+            // skip per-cluster cull if the entire mesh fits inside the frustum.
+            float wholeMin[3] = {
+                sceneOrigin_[0] + ox,
+                sceneOrigin_[1],
+                sceneOrigin_[2] + oz,
+            };
+            float wholeMax[3] = {
+                wholeMin[0] + sceneSpan_[0],
+                wholeMin[1] + sceneSpan_[1],
+                wholeMin[2] + sceneSpan_[2],
+            };
+            if (cullAabb(wholeMin, wholeMax)) continue;
+            const bool wholeIn = aabbFullyInside(wholeMin, wholeMax);
+
             for (const auto& gs : subs_) {
                 float aMin[3] = { gs.aabbMin[0] + ox, gs.aabbMin[1], gs.aabbMin[2] + oz };
                 float aMax[3] = { gs.aabbMax[0] + ox, gs.aabbMax[1], gs.aabbMax[2] + oz };
-                bool outside = false;
-                for (int pi = 0; pi < 6; ++pi) {
-                    const float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
-                    float px = a >= 0 ? aMax[0] : aMin[0];
-                    float py = b >= 0 ? aMax[1] : aMin[1];
-                    float pz = c >= 0 ? aMax[2] : aMin[2];
-                    if (a * px + b * py + c * pz + d < 0.0f) { outside = true; break; }
-                }
-                if (outside) continue;
+                if (!wholeIn && cullAabb(aMin, aMax)) continue;
 
                 // Resolve LOD (Auto -> per-chunk by projected voxel size).
                 PointLod effLod = pointLod;
                 if (pointLod == PointLod::Auto) {
-                    float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
-                             : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
-                    float dy = camP[1] < aMin[1] ? aMin[1] - camP[1]
-                             : camP[1] > aMax[1] ? camP[1] - aMax[1] : 0.0f;
-                    float dz = camP[2] < aMin[2] ? aMin[2] - camP[2]
-                             : camP[2] > aMax[2] ? camP[2] - aMax[2] : 0.0f;
-                    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-                    if (dist < 1e-3f) dist = 1e-3f;
+                    float dist = chunkDist(aMin, aMax);
                     float ppv = focalPx / dist;
                     // Slider scales thresholds: higher scale pushes LODs farther
                     // (keeps L0 for longer).
@@ -927,50 +1098,23 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
                     billJobs.push_back(j);
                 } else if (tech == RenderTech::BillboardTri) {
                     billTriJobs.push_back(j);
-                } else if (tech == RenderTech::MergedMesh) {
-                    // MergedMesh has its own draw pass; per-chunk jobs unused.
-                } else if (tech == RenderTech::AtlasMesh) {
-                    // AtlasMesh draws the whole scene in one call; no per-chunk jobs.
                 } else if (tech == RenderTech::Splat) {
                     pointJobs.push_back(j);   // reuse pointJobs as the splat list
                 } else if (tech == RenderTech::SplatHybrid) {
                     // Polygons close, splats far. Both consumed by the Splat block.
-                    float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
-                             : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
-                    float dy = camP[1] < aMin[1] ? aMin[1] - camP[1]
-                             : camP[1] > aMax[1] ? camP[1] - aMax[1] : 0.0f;
-                    float dz = camP[2] < aMin[2] ? aMin[2] - camP[2]
-                             : camP[2] > aMax[2] ? camP[2] - aMax[2] : 0.0f;
-                    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-                    if (dist < 1e-3f) dist = 1e-3f;
-                    float ppv = focalPx / dist;
+                    float ppv = focalPx / chunkDist(aMin, aMax);
                     if (ppv >= hybridThreshold) polyJobs.push_back(j);
                     else                        pointJobs.push_back(j);
                 } else if (tech == RenderTech::Hybrid2) {
-                    float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
-                             : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
-                    float dy = camP[1] < aMin[1] ? aMin[1] - camP[1]
-                             : camP[1] > aMax[1] ? camP[1] - aMax[1] : 0.0f;
-                    float dz = camP[2] < aMin[2] ? aMin[2] - camP[2]
-                             : camP[2] > aMax[2] ? camP[2] - aMax[2] : 0.0f;
-                    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-                    if (dist < 1e-3f) dist = 1e-3f;
-                    float ppv = focalPx / dist;
-                    if (ppv >= hybridThreshold) vidJobs.push_back(j);
+                    // Polys close (dataset-driven), BillboardTri far.
+                    float ppv = focalPx / chunkDist(aMin, aMax);
+                    if (ppv >= hybridThreshold) polyJobs.push_back(j);
                     else                        billTriJobs.push_back(j);
                 } else {
-                    // Hybrid: nearest point of chunk AABB to camera.
-                    float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
-                             : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
-                    float dy = camP[1] < aMin[1] ? aMin[1] - camP[1]
-                             : camP[1] > aMax[1] ? camP[1] - aMax[1] : 0.0f;
-                    float dz = camP[2] < aMin[2] ? aMin[2] - camP[2]
-                             : camP[2] > aMax[2] ? camP[2] - aMax[2] : 0.0f;
-                    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-                    if (dist < 1e-3f) dist = 1e-3f;
-                    float pixelsPerVoxel = focalPx / dist;
-                    if (pixelsPerVoxel < hybridThreshold) pointJobs.push_back(j);
-                    else                                  vidJobs.push_back(j);   // Hybrid uses PolyVID
+                    // Hybrid: polys close (dataset-driven), points far.
+                    float ppv = focalPx / chunkDist(aMin, aMax);
+                    if (ppv < hybridThreshold) pointJobs.push_back(j);
+                    else                       polyJobs.push_back(j);
                 }
             }
         }
@@ -980,12 +1124,14 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
     UINT offset = 0;
 
     auto issueChunkCbEx = [&](const Job& j, float padVal, uint32_t voxelBase) {
+        // All vertex positions are scene-relative now; chunkBase = scene origin
+        // + grid offset (same for every chunk in a grid cell).
         D3D11_MAPPED_SUBRESOURCE mm;
         ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
         CBPerChunk cc = {};
-        cc.chunkBase[0] = j.gs->chunkBase[0] + j.ox;
-        cc.chunkBase[1] = j.gs->chunkBase[1];
-        cc.chunkBase[2] = j.gs->chunkBase[2] + j.oz;
+        cc.chunkBase[0] = sceneOrigin_[0] + j.ox;
+        cc.chunkBase[1] = sceneOrigin_[1];
+        cc.chunkBase[2] = sceneOrigin_[2] + j.oz;
         cc._pad = padVal;
         cc.voxelBase = voxelBase;
         memcpy(mm.pData, &cc, sizeof(cc));
@@ -1002,7 +1148,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
     auto pointRangeForJob = [](const Job& j, uint32_t& first, uint32_t& count) {
         if      (j.lod == PointLod::L1) { first = j.gs->pointFirstL1; count = j.gs->pointCountL1; }
         else if (j.lod == PointLod::L2) { first = j.gs->pointFirstL2; count = j.gs->pointCountL2; }
-        else                            { first = j.gs->pointFirst;   count = j.gs->pointCount;   }
+        else                            { first = j.gs->pointFirst;  count = j.gs->pointCount;  }
     };
 
     const bool doPrepass = zPrepass &&
@@ -1025,22 +1171,160 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
     }
 
-    if (!polyJobs.empty() && tech != RenderTech::SplatHybrid) {
-        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx_->VSSetShader(vs_.Get(), nullptr, 0);
-        ctx_->PSSetShader(ps_.Get(), nullptr, 0);
-        ctx_->OMSetDepthStencilState(doPrepass ? dsEqual_.Get() : dsTest_.Get(), 0);
-        ID3D11Buffer* vbs[] = { vb_.Get() };
-        ctx_->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
-        ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
-        for (const auto& j : polyJobs) {
-            issueChunkCb(j);
-            ctx_->DrawIndexed(j.gs->indexCount, j.gs->firstIndex, j.gs->baseVertex);
-            ++lastDrawn_;
-            lastDrawnTris_ += j.gs->indexCount / 3;
+    // Unified poly draw: route polyJobs through the dataset's polygon source.
+    // Used directly by PolygonBased / Hybrid / Hybrid2, and re-invoked inside
+    // the Splat block for SplatHybrid (into the splat RT).
+    // Set gChunkBase to scene-origin + grid offset (shared by all chunks in a
+    // grid cell since their vertices are scene-relative).
+    auto setSceneChunkBase = [&](float ox, float oz) {
+        D3D11_MAPPED_SUBRESOURCE mm;
+        ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+        CBPerChunk cc = {};
+        cc.chunkBase[0] = sceneOrigin_[0] + ox;
+        cc.chunkBase[1] = sceneOrigin_[1];
+        cc.chunkBase[2] = sceneOrigin_[2] + oz;
+        memcpy(mm.pData, &cc, sizeof(cc));
+        ctx_->Unmap(cbPerChunk_.Get(), 0);
+    };
+
+    auto drawPolyJobs = [&](const std::vector<Job>& jobs) {
+        if (jobs.empty()) return;
+        if (dataset == DataSet::Full) {
+            UINT polyStride = sizeof(VoxelPolyVertex);
+            UINT polyOff = 0;
+            ctx_->IASetInputLayout(inputLayoutPoly_.Get());
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx_->VSSetShader(vs_.Get(), nullptr, 0);
+            ctx_->PSSetShader(ps_.Get(), nullptr, 0);
+            ctx_->OMSetDepthStencilState(doPrepass ? dsEqual_.Get() : dsTest_.Get(), 0);
+            ID3D11Buffer* vbs[] = { vb_.Get() };
+            ctx_->IASetVertexBuffers(0, 1, vbs, &polyStride, &polyOff);
+            ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
+
+            // Jobs come in subs_ order, grouped per grid cell. Walk groups; in
+            // each group, merge contiguous-firstIndex jobs into single
+            // DrawIndexed (cluster span batching).
+            size_t i = 0;
+            while (i < jobs.size()) {
+                float ox = jobs[i].ox, oz = jobs[i].oz;
+                setSceneChunkBase(ox, oz);
+                while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz) {
+                    uint32_t spanFirst = jobs[i].gs->firstIndex;
+                    uint32_t spanEnd   = spanFirst + jobs[i].gs->indexCount;
+                    ++i;
+                    while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz
+                           && jobs[i].gs->firstIndex == spanEnd) {
+                        spanEnd += jobs[i].gs->indexCount;
+                        ++i;
+                    }
+                    uint32_t spanCount = spanEnd - spanFirst;
+                    ctx_->DrawIndexed(spanCount, spanFirst, 0);
+                    ++lastDrawn_;
+                    lastDrawnTris_ += spanCount / 3;
+                }
+            }
+            ctx_->IASetInputLayout(inputLayout_.Get());
+            if (doPrepass) ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+        } else if (dataset == DataSet::Merged && mergedVb_ && mergedIb_) {
+            // MSH1 is a single mesh; no per-chunk path. Draw once per grid cell.
+            ctx_->IASetInputLayout(mergedInputLayout_.Get());
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx_->VSSetShader(vsMerged_.Get(), nullptr, 0);
+            ctx_->PSSetShader(psMerged_.Get(), nullptr, 0);
+            ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+            UINT stridM = sizeof(MergedVertex);
+            UINT offsM = 0;
+            ID3D11Buffer* vbsM[] = { mergedVb_.Get() };
+            ctx_->IASetVertexBuffers(0, 1, vbsM, &stridM, &offsM);
+            ctx_->IASetIndexBuffer(mergedIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
+            for (int gz = 0; gz < gridSize; ++gz) {
+                for (int gx = 0; gx < gridSize; ++gx) {
+                    D3D11_MAPPED_SUBRESOURCE mm;
+                    ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+                    CBPerChunk cc = {};
+                    cc.chunkBase[0] = gx * sceneSpan_[0];
+                    cc.chunkBase[1] = 0.0f;
+                    cc.chunkBase[2] = gz * sceneSpan_[2];
+                    memcpy(mm.pData, &cc, sizeof(cc));
+                    ctx_->Unmap(cbPerChunk_.Get(), 0);
+                    ctx_->DrawIndexed(mergedIndexCount_, 0, 0);
+                    ++lastDrawn_;
+                    lastDrawnTris_ += mergedIndexCount_ / 3;
+                }
+            }
+            ctx_->IASetInputLayout(inputLayout_.Get());
+        } else if (dataset == DataSet::Reduced && atlasVb_ && atlasIb_ && atlasSrv_) {
+            // Per-chunk atlas mesh. Look up atlas sub for each polyJob, then
+            // batch contiguous (in atlas IB) visible subs into single DrawIndexed.
+            ctx_->IASetInputLayout(atlasInputLayout_.Get());
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx_->VSSetShader(vsAtlas_.Get(), nullptr, 0);
+            ctx_->PSSetShader(psAtlas_.Get(), nullptr, 0);
+            ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+            UINT stridA = sizeof(AtlasVertex);
+            UINT offsA = 0;
+            ID3D11Buffer* vbsA[] = { atlasVb_.Get() };
+            ctx_->IASetVertexBuffers(0, 1, vbsA, &stridA, &offsA);
+            ctx_->IASetIndexBuffer(atlasIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
+            ID3D11ShaderResourceView* srvs[] = { nullptr, nullptr, nullptr, atlasSrv_.Get() };
+            ctx_->PSSetShaderResources(0, 4, srvs);
+
+            auto subForJob = [&](const Job& j) -> const GpuAtlasSub* {
+                int cx = (int)((j.gs->chunkBase[0] - atlasOrigin_[0]) / (float)chunkDim_);
+                int cy = (int)((j.gs->chunkBase[1] - atlasOrigin_[1]) / (float)chunkDim_);
+                int cz = (int)((j.gs->chunkBase[2] - atlasOrigin_[2]) / (float)chunkDim_);
+                uint64_t key = ((uint64_t)(uint16_t)cx)
+                             | ((uint64_t)(uint16_t)cy << 20)
+                             | ((uint64_t)(uint16_t)cz << 40);
+                auto it = atlasSubByChunk_.find(key);
+                if (it == atlasSubByChunk_.end()) return nullptr;
+                const GpuAtlasSub& s = atlasSubs_[it->second];
+                return s.indexCount ? &s : nullptr;
+            };
+
+            size_t i = 0;
+            while (i < jobs.size()) {
+                float ox = jobs[i].ox, oz = jobs[i].oz;
+                D3D11_MAPPED_SUBRESOURCE mm;
+                ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+                CBPerChunk cc = {};
+                cc.chunkBase[0] = atlasOrigin_[0] + ox;
+                cc.chunkBase[1] = atlasOrigin_[1];
+                cc.chunkBase[2] = atlasOrigin_[2] + oz;
+                memcpy(mm.pData, &cc, sizeof(cc));
+                ctx_->Unmap(cbPerChunk_.Get(), 0);
+
+                while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz) {
+                    const GpuAtlasSub* s0 = subForJob(jobs[i]);
+                    if (!s0) { ++i; continue; }
+                    uint32_t spanFirst = s0->firstIndex;
+                    uint32_t spanEnd   = spanFirst + s0->indexCount;
+                    ++i;
+                    while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz) {
+                        const GpuAtlasSub* sn = subForJob(jobs[i]);
+                        if (!sn || sn->firstIndex != spanEnd) break;
+                        spanEnd += sn->indexCount;
+                        ++i;
+                    }
+                    uint32_t spanCount = spanEnd - spanFirst;
+                    ctx_->DrawIndexed(spanCount, spanFirst, 0);
+                    ++lastDrawn_;
+                    lastDrawnTris_ += spanCount / 3;
+                }
+            }
+            ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr };
+            ctx_->PSSetShaderResources(0, 4, nullSrvs);
+            ctx_->IASetInputLayout(inputLayout_.Get());
         }
-        if (doPrepass) ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+    };
+
+    if (tech != RenderTech::SplatHybrid) {
+        drawPolyJobs(polyJobs);
     }
+    // Point pass: batch contiguous chunks within same (grid cell, LOD) into
+    // single Draw. Possible now that point positions are scene-relative and
+    // L0/L1/L2 are stored in contiguous blocks (so adjacent same-LOD chunks
+    // have adjacent first-vertex offsets).
     if (!pointJobs.empty() && pointVb_ && tech != RenderTech::Splat && tech != RenderTech::SplatHybrid) {
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
         ctx_->VSSetShader(vsPoints_.Get(), nullptr, 0);
@@ -1049,14 +1333,34 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
                               : psPoints_.Get(), nullptr, 0);
         ID3D11Buffer* vbs[] = { pointVb_.Get() };
         ctx_->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
-        for (const auto& j : pointJobs) {
-            uint32_t first, count;
-            pointRangeForJob(j, first, count);
-            if (count == 0) continue;
-            issueChunkCbEx(j, lodToHalfExtent(j.lod), 0u);
-            ctx_->Draw(count, first);
-            ++lastDrawn_;
-            lastDrawnTris_ += count;
+
+        size_t i = 0;
+        while (i < pointJobs.size()) {
+            float ox = pointJobs[i].ox, oz = pointJobs[i].oz;
+            PointLod lod = pointJobs[i].lod;
+            issueChunkCbEx(pointJobs[i], lodToHalfExtent(lod), 0u);
+            while (i < pointJobs.size()
+                   && pointJobs[i].ox == ox && pointJobs[i].oz == oz
+                   && pointJobs[i].lod == lod) {
+                uint32_t spanFirst, count0;
+                pointRangeForJob(pointJobs[i], spanFirst, count0);
+                if (count0 == 0) { ++i; continue; }
+                uint32_t spanEnd = spanFirst + count0;
+                ++i;
+                while (i < pointJobs.size()
+                       && pointJobs[i].ox == ox && pointJobs[i].oz == oz
+                       && pointJobs[i].lod == lod) {
+                    uint32_t f, c;
+                    pointRangeForJob(pointJobs[i], f, c);
+                    if (f != spanEnd) break;
+                    spanEnd += c;
+                    ++i;
+                }
+                uint32_t spanCount = spanEnd - spanFirst;
+                ctx_->Draw(spanCount, spanFirst);
+                ++lastDrawn_;
+                lastDrawnTris_ += spanCount;
+            }
         }
     }
     if (!csJobs.empty() && pointVb_ && pointSrv_ && csColorUav_) {
@@ -1086,9 +1390,9 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
             ctx_->Map(cbCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
             CBPerCS cb;
             hlslpp::store(cb.viewProj, vp);
-            cb.chunkBase[0] = j.gs->chunkBase[0] + j.ox;
-            cb.chunkBase[1] = j.gs->chunkBase[1];
-            cb.chunkBase[2] = j.gs->chunkBase[2] + j.oz;
+            cb.chunkBase[0] = sceneOrigin_[0] + j.ox;
+            cb.chunkBase[1] = sceneOrigin_[1];
+            cb.chunkBase[2] = sceneOrigin_[2] + j.oz;
             cb.voxelOffset = pFirst;
             cb.voxelCount  = pCount;
             cb.w = width_;
@@ -1177,7 +1481,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         }
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 2, nullSrvs);
-        ctx_->RSSetState(rsSolid_.Get());
+        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
@@ -1200,7 +1504,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         }
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 2, nullSrvs);
-        ctx_->RSSetState(rsSolid_.Get());
+        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
@@ -1220,7 +1524,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
             lastDrawnTris_ += j.gs->pointCount * 6;
         }
         // restore default culling for any subsequent draws this frame
-        ctx_->RSSetState(rsSolid_.Get());
+        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
@@ -1239,72 +1543,49 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         ctx_->OMSetRenderTargets(1, rtvs, splatDsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
-        // SplatHybrid: polygons up close, drawn from the per-chunk atlas mesh
-        // into the same splat RT (depth-tested against splatDsv_ so points can
-        // fill gaps behind/beside them).
-        if (tech == RenderTech::SplatHybrid && !polyJobs.empty()
-            && atlasVb_ && atlasIb_ && atlasSrv_) {
-            ctx_->IASetInputLayout(atlasInputLayout_.Get());
-            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx_->VSSetShader(vsAtlas_.Get(), nullptr, 0);
-            ctx_->PSSetShader(psAtlas_.Get(), nullptr, 0);
-            UINT stridA = sizeof(AtlasVertex);
-            UINT offsA = 0;
-            ID3D11Buffer* vbsA[] = { atlasVb_.Get() };
-            ctx_->IASetVertexBuffers(0, 1, vbsA, &stridA, &offsA);
-            ctx_->IASetIndexBuffer(atlasIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
-            ID3D11ShaderResourceView* srvs[] = { nullptr, nullptr, nullptr, atlasSrv_.Get() };
-            ctx_->PSSetShaderResources(0, 4, srvs);
-
-            for (const auto& j : polyJobs) {
-                // (chunkBase - origin) / chunkDim = (cx,cy,cz). Integer-exact.
-                int cx = (int)((j.gs->chunkBase[0] - atlasOrigin_[0]) / (float)chunkDim_);
-                int cy = (int)((j.gs->chunkBase[1] - atlasOrigin_[1]) / (float)chunkDim_);
-                int cz = (int)((j.gs->chunkBase[2] - atlasOrigin_[2]) / (float)chunkDim_);
-                uint64_t key = ((uint64_t)(uint16_t)cx)
-                             | ((uint64_t)(uint16_t)cy << 20)
-                             | ((uint64_t)(uint16_t)cz << 40);
-                auto it = atlasSubByChunk_.find(key);
-                if (it == atlasSubByChunk_.end()) continue;
-                const GpuAtlasSub& s = atlasSubs_[it->second];
-                if (s.indexCount == 0) continue;
-
-                D3D11_MAPPED_SUBRESOURCE mm;
-                ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-                CBPerChunk cc = {};
-                cc.chunkBase[0] = atlasOrigin_[0] + j.ox;
-                cc.chunkBase[1] = atlasOrigin_[1];
-                cc.chunkBase[2] = atlasOrigin_[2] + j.oz;
-                memcpy(mm.pData, &cc, sizeof(cc));
-                ctx_->Unmap(cbPerChunk_.Get(), 0);
-
-                ctx_->DrawIndexed(s.indexCount, s.firstIndex, 0);
-                ++lastDrawn_;
-                lastDrawnTris_ += s.indexCount / 3;
-            }
-            ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr };
-            ctx_->PSSetShaderResources(0, 4, nullSrvs);
-            ctx_->IASetInputLayout(inputLayout_.Get());
+        // SplatHybrid: close polys drawn from the dataset's polygon source into
+        // the same splat RT (depth-tested against splatDsv_ so points fill gaps).
+        if (tech == RenderTech::SplatHybrid) {
+            drawPolyJobs(polyJobs);
         }
 
         ctx_->IASetInputLayout(inputLayout_.Get());
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
-        // Use Points-mode shaders so Splat looks identical to Points tech.
+        // splatColorTex_ holds raw albedo (CS lights per-pixel via ray/AABB).
         ctx_->VSSetShader(vsPoints_.Get(), nullptr, 0);
-        ctx_->PSSetShader(pointLight == PointLighting::Simple
-                              ? psPointsSimple_.Get()
-                              : psPoints_.Get(), nullptr, 0);
+        ctx_->PSSetShader(psSplatAlbedo_.Get(), nullptr, 0);
         ID3D11Buffer* vbs[] = { pointVb_.Get() };
         UINT vbStride = sizeof(Vertex), vbOff = 0;
         ctx_->IASetVertexBuffers(0, 1, vbs, &vbStride, &vbOff);
-        for (const auto& j : pointJobs) {
-            uint32_t first, count;
-            pointRangeForJob(j, first, count);
-            if (count == 0) continue;
-            issueChunkCbEx(j, lodToHalfExtent(j.lod), 0u);
-            ctx_->Draw(count, first);
-            ++lastDrawn_;
-            lastDrawnTris_ += count;
+
+        // Same span batching as the main point pass.
+        size_t i = 0;
+        while (i < pointJobs.size()) {
+            float ox = pointJobs[i].ox, oz = pointJobs[i].oz;
+            PointLod lod = pointJobs[i].lod;
+            issueChunkCbEx(pointJobs[i], lodToHalfExtent(lod), 0u);
+            while (i < pointJobs.size()
+                   && pointJobs[i].ox == ox && pointJobs[i].oz == oz
+                   && pointJobs[i].lod == lod) {
+                uint32_t spanFirst, count0;
+                pointRangeForJob(pointJobs[i], spanFirst, count0);
+                if (count0 == 0) { ++i; continue; }
+                uint32_t spanEnd = spanFirst + count0;
+                ++i;
+                while (i < pointJobs.size()
+                       && pointJobs[i].ox == ox && pointJobs[i].oz == oz
+                       && pointJobs[i].lod == lod) {
+                    uint32_t f, c;
+                    pointRangeForJob(pointJobs[i], f, c);
+                    if (f != spanEnd) break;
+                    spanEnd += c;
+                    ++i;
+                }
+                uint32_t spanCount = spanEnd - spanFirst;
+                ctx_->Draw(spanCount, spanFirst);
+                ++lastDrawn_;
+                lastDrawnTris_ += spanCount;
+            }
         }
 
         // Pass 2: optional CS reconstruction; else copy raw RT to backbuffer.
@@ -1316,7 +1597,7 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
             ctx_->CSSetShader(csSplat_.Get(), nullptr, 0);
             ID3D11Buffer* csCbs[] = { cbPerFrame_.Get() };
             ctx_->CSSetConstantBuffers(0, 1, csCbs);
-            ID3D11ShaderResourceView* csSrvs[] = { nullptr, nullptr, splatColorSrv_.Get() };
+            ID3D11ShaderResourceView* csSrvs[] = { nullptr, splatDepthSrv_.Get(), splatColorSrv_.Get() };
             ctx_->CSSetShaderResources(0, 3, csSrvs);
             ID3D11UnorderedAccessView* csUavs[] = { nullptr, splatFinalUav_.Get() };
             UINT initc[] = { 0, 0 };
@@ -1329,100 +1610,27 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
             ID3D11UnorderedAccessView* nullCsUavs[] = { nullptr, nullptr };
             ctx_->CSSetUnorderedAccessViews(0, 2, nullCsUavs, initc);
             ctx_->CSSetShader(nullptr, nullptr, 0);
-            if (backBuf) ctx_->CopyResource(backBuf.Get(), splatFinalTex_.Get());
+            // Post pipeline feeds taaSceneTex_; else go straight to backbuffer.
+            ID3D11Resource* dst = postEnabled ? (ID3D11Resource*)taaSceneTex_.Get()
+                                              : (ID3D11Resource*)backBuf.Get();
+            if (dst) ctx_->CopyResource(dst, splatFinalTex_.Get());
         } else {
-            if (backBuf) ctx_->CopyResource(backBuf.Get(), splatColorTex_.Get());
+            ID3D11Resource* dst = postEnabled ? (ID3D11Resource*)taaSceneTex_.Get()
+                                              : (ID3D11Resource*)backBuf.Get();
+            if (dst) ctx_->CopyResource(dst, splatColorTex_.Get());
+        }
+        // Splat path drew into splatDepthTex_, not the main dsv. Mirror it into
+        // depthTex_ so the post sky pass + TAA reproject see correct depths.
+        if (postEnabled && splatDepthTex_ && depthTex_) {
+            ctx_->CopyResource(depthTex_.Get(), splatDepthTex_.Get());
         }
 
-        // Restore active RTV/DSV.
-        ID3D11RenderTargetView* active = (msaaSamples_ > 1) ? msaaRtv_.Get() : rtv_.Get();
+        // Restore active RTV/DSV (scene RT when post enabled).
+        ID3D11RenderTargetView* active = postEnabled ? taaSceneRtv_.Get()
+                                             : ((msaaSamples_ > 1) ? msaaRtv_.Get() : rtv_.Get());
         ID3D11RenderTargetView* rrtvs[] = { active };
         ctx_->OMSetRenderTargets(1, rrtvs, dsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-    }
-
-    if (tech == RenderTech::MergedMesh && mergedVb_ && mergedIb_) {
-        ctx_->IASetInputLayout(mergedInputLayout_.Get());
-        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx_->VSSetShader(vsMerged_.Get(), nullptr, 0);
-        ctx_->PSSetShader(psMerged_.Get(), nullptr, 0);
-        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-        UINT stridM = sizeof(MergedVertex);
-        UINT offsM = 0;
-        ID3D11Buffer* vbs[] = { mergedVb_.Get() };
-        ctx_->IASetVertexBuffers(0, 1, vbs, &stridM, &offsM);
-        ctx_->IASetIndexBuffer(mergedIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
-        // VS adds gChunkBase to world-space vertex (already world). Use it as
-        // grid offset to replicate the merged mesh across the grid.
-        for (int gz = 0; gz < gridSize; ++gz) {
-            for (int gx = 0; gx < gridSize; ++gx) {
-                D3D11_MAPPED_SUBRESOURCE mm;
-                ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-                CBPerChunk cc = {};
-                cc.chunkBase[0] = gx * sceneSpan_[0];
-                cc.chunkBase[1] = 0.0f;
-                cc.chunkBase[2] = gz * sceneSpan_[2];
-                memcpy(mm.pData, &cc, sizeof(cc));
-                ctx_->Unmap(cbPerChunk_.Get(), 0);
-                ctx_->DrawIndexed(mergedIndexCount_, 0, 0);
-                ++lastDrawn_;
-                lastDrawnTris_ += mergedIndexCount_ / 3;
-            }
-        }
-        ctx_->IASetInputLayout(inputLayout_.Get());
-    }
-
-    if (tech == RenderTech::AtlasMesh && atlasVb_ && atlasIb_ && atlasSrv_) {
-        ctx_->IASetInputLayout(atlasInputLayout_.Get());
-        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx_->VSSetShader(vsAtlas_.Get(), nullptr, 0);
-        ctx_->PSSetShader(psAtlas_.Get(), nullptr, 0);
-        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-        UINT stridA = sizeof(AtlasVertex);
-        UINT offsA  = 0;
-        ID3D11Buffer* vbs[] = { atlasVb_.Get() };
-        ctx_->IASetVertexBuffers(0, 1, vbs, &stridA, &offsA);
-        ctx_->IASetIndexBuffer(atlasIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
-        ID3D11ShaderResourceView* srvs[] = { nullptr, nullptr, nullptr, atlasSrv_.Get() };
-        ctx_->PSSetShaderResources(0, 4, srvs);
-        for (int gz = 0; gz < gridSize; ++gz) {
-            for (int gx = 0; gx < gridSize; ++gx) {
-                float ox = gx * sceneSpan_[0];
-                float oz = gz * sceneSpan_[2];
-                // Vertex pos is uint16 scene-local (origin already subtracted).
-                // Pass world offset = atlasOrigin + grid shift via gChunkBase.
-                D3D11_MAPPED_SUBRESOURCE mm;
-                ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-                CBPerChunk cc = {};
-                cc.chunkBase[0] = atlasOrigin_[0] + ox;
-                cc.chunkBase[1] = atlasOrigin_[1];
-                cc.chunkBase[2] = atlasOrigin_[2] + oz;
-                memcpy(mm.pData, &cc, sizeof(cc));
-                ctx_->Unmap(cbPerChunk_.Get(), 0);
-
-                for (const auto& s : atlasSubs_) {
-                    if (s.indexCount == 0) continue;
-                    // World AABB of this chunk in this grid copy.
-                    float wMin[3] = { s.aabbMin[0] + ox, s.aabbMin[1], s.aabbMin[2] + oz };
-                    float wMax[3] = { s.aabbMax[0] + ox, s.aabbMax[1], s.aabbMax[2] + oz };
-                    bool outside = false;
-                    for (int pi = 0; pi < 6; ++pi) {
-                        const float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
-                        float px = a >= 0 ? wMax[0] : wMin[0];
-                        float py = b >= 0 ? wMax[1] : wMin[1];
-                        float pz = c >= 0 ? wMax[2] : wMin[2];
-                        if (a * px + b * py + c * pz + d < 0.0f) { outside = true; break; }
-                    }
-                    if (outside) continue;
-                    ctx_->DrawIndexed(s.indexCount, s.firstIndex, 0);
-                    ++lastDrawn_;
-                    lastDrawnTris_ += s.indexCount / 3;
-                }
-            }
-        }
-        ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr };
-        ctx_->PSSetShaderResources(0, 4, nullSrvs);
-        ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
     if (showChunkBounds && boundsVb_ && boundsIb_) {
@@ -1437,16 +1645,21 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         ctx_->IASetVertexBuffers(0, 1, bvbs, &bstride, &boff);
         ctx_->IASetIndexBuffer(boundsIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
 
-        // Union of all visible jobs across passes covers what we actually drew.
+        // Tight per-chunk AABB: chunkBase = world aabbMin, size = aabb extents.
         auto drawJob = [&](const Job& j) {
+            float sizeX = j.gs->aabbMax[0] - j.gs->aabbMin[0];
+            float sizeY = j.gs->aabbMax[1] - j.gs->aabbMin[1];
+            float sizeZ = j.gs->aabbMax[2] - j.gs->aabbMin[2];
             D3D11_MAPPED_SUBRESOURCE mm;
             ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-            CBPerChunk cc;
-            cc.chunkBase[0] = j.gs->chunkBase[0] + j.ox;
-            cc.chunkBase[1] = j.gs->chunkBase[1];
-            cc.chunkBase[2] = j.gs->chunkBase[2] + j.oz;
-            cc._pad = (float)chunkDim_;
+            CBPerChunk cc = {};
+            cc.chunkBase[0] = j.gs->aabbMin[0] + j.ox;
+            cc.chunkBase[1] = j.gs->aabbMin[1];
+            cc.chunkBase[2] = j.gs->aabbMin[2] + j.oz;
+            cc._pad = sizeX;
             cc.voxelBase = 0;
+            memcpy(&cc._pad2[0], &sizeY, sizeof(float));
+            memcpy(&cc._pad2[1], &sizeZ, sizeof(float));
             memcpy(mm.pData, &cc, sizeof(cc));
             ctx_->Unmap(cbPerChunk_.Get(), 0);
             ctx_->DrawIndexed(24, 0, 0);
@@ -1458,10 +1671,77 @@ void Renderer::DrawScene(const Camera& cam, ShadingMode mode, int gridSize, Rend
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
+
+    // ------------------- TAA composite (optional) -> post (always) -------------------
+    ID3D11ShaderResourceView* postInput = nullptr;
+    if (postEnabled) {
+        // MSAA: resolve scene MSAA color into non-MSAA taaSceneTex_ for post.
+        // Splat/SplatHybrid already wrote taaSceneTex_ via CopyResource.
+        const bool splatTech = (tech == RenderTech::Splat || tech == RenderTech::SplatHybrid);
+        if (useMsaa && !splatTech && msaaColorTex_ && taaSceneTex_) {
+            ctx_->ResolveSubresource(taaSceneTex_.Get(), 0, msaaColorTex_.Get(), 0,
+                                     DXGI_FORMAT_R8G8B8A8_UNORM);
+        }
+        ctx_->IASetInputLayout(nullptr);
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11Buffer* nullVb[] = { nullptr }; UINT zero = 0;
+        ctx_->IASetVertexBuffers(0, 1, nullVb, &zero, &zero);
+        ID3D11SamplerState* samps[] = { linearClampSampler_.Get() };
+        ctx_->PSSetSamplers(0, 1, samps);
+        ctx_->OMSetDepthStencilState(dsAlways_.Get(), 0);
+        ctx_->RSSetState(rsNoCull_.Get());
+
+        if (taa && vsTaa_ && psTaa_) {
+            uint32_t curr = taaHistIdx_;
+            uint32_t prev = curr ^ 1u;
+            ID3D11RenderTargetView* hRtv = taaHistRtv_[curr].Get();
+            ctx_->OMSetRenderTargets(1, &hRtv, nullptr);
+            ctx_->VSSetShader(vsTaa_.Get(), nullptr, 0);
+            ctx_->PSSetShader(psTaa_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* taaSrvs[] = {
+                nullptr, nullptr, nullptr, nullptr,
+                taaSceneSrv_.Get(),
+                taaHistValid_[prev] ? taaHistSrv_[prev].Get() : taaSceneSrv_.Get(),
+                depthSrv_.Get()
+            };
+            ctx_->PSSetShaderResources(0, 7, taaSrvs);
+            ctx_->Draw(3, 0);
+            ID3D11ShaderResourceView* nullsForPost[] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+            ctx_->PSSetShaderResources(0, 7, nullsForPost);
+            postInput = taaHistSrv_[curr].Get();
+            taaHistValid_[curr] = true;
+            taaHistIdx_ = prev;
+            ++taaFrame_;
+        } else {
+            postInput = taaSceneSrv_.Get();
+        }
+
+        // Post pass: sky + sharpen + tonemap. Always runs.
+        ID3D11RenderTargetView* bRtv = rtv_.Get();
+        ctx_->OMSetRenderTargets(1, &bRtv, nullptr);
+        ctx_->VSSetShader(vsTaa_.Get(), nullptr, 0);
+        ctx_->PSSetShader(psPost_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* postSrvs[] = { depthSrv_.Get(), postInput };
+        ctx_->PSSetShaderResources(6, 2, postSrvs);
+        ctx_->Draw(3, 0);
+        ctx_->RSSetState(rsSolid_.Get());
+        postWroteBackbuf_ = true;
+
+        ID3D11ShaderResourceView* nulls[] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+        ctx_->PSSetShaderResources(0, 8, nulls);
+
+        // ImGui writes to bound RTV -> already backbuffer.
+        // the backbuffer so the UI lands on screen.
+        ID3D11RenderTargetView* backRtv = rtv_.Get();
+        ctx_->OMSetRenderTargets(1, &backRtv, nullptr);
+    }
+
+    // Remember this frame's view-proj for next frame's reprojection.
+    hlslpp::store(taaPrevVP_, vp);
 }
 
 void Renderer::EndFrame(bool vsync) {
-    if (msaaSamples_ > 1 && msaaColorTex_) {
+    if (msaaSamples_ > 1 && msaaColorTex_ && !postWroteBackbuf_) {
         ComPtr<ID3D11Texture2D> backBuf;
         swap_->GetBuffer(0, IID_PPV_ARGS(backBuf.GetAddressOf()));
         if (backBuf) {
