@@ -27,12 +27,10 @@ build/
 third_party/*/.git/
 
 # Generated voxel assets (regenerate via build/Release/voxelize.exe)
-assets/rungholt.vox
-assets/rungholt_culled.vox
-assets/rungholt_merged.msh
+
 
 # Source dataset (Mineways extract — third-party; user downloads separately)
-assets/rungholt/
+assets/*
 
 # ImGui runtime state
 imgui.ini
