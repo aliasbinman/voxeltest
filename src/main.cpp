@@ -14,17 +14,21 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
+#include "microprofile.h"
+
 #include <chrono>
 #include <cstdio>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 #include <string>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
 
-void SetCwdToProjectRoot() {
+void SetCwdToProjectRoot()
+{
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     wchar_t* slash = wcsrchr(exePath, L'\\');
@@ -38,7 +42,8 @@ void SetCwdToProjectRoot() {
 
 // Check magic + version of a baked asset. Returns false if file is missing,
 // has wrong magic, or has stale version -> caller regenerates.
-bool AssetIsCurrent(const char* path, const char* magic4) {
+bool AssetIsCurrent(const char* path, const char* magic4)
+{
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     char m[4];
@@ -49,7 +54,8 @@ bool AssetIsCurrent(const char* path, const char* magic4) {
     return okv;
 }
 
-bool AllAssetsCurrent() {
+bool AllAssetsCurrent()
+{
     return AssetIsCurrent("assets/kingslanding.vox",        "VXL3")
         && AssetIsCurrent("assets/kingslanding_culled.vox", "VXL3")
         && AssetIsCurrent("assets/kingslanding_merged.msh", "MSH1")
@@ -58,7 +64,8 @@ bool AllAssetsCurrent() {
 
 // Synchronously runs voxelize.exe (which sits next to voxeltest.exe). Returns
 // true on success. Stdout from voxelize is inherited so users see progress.
-bool RunVoxelize() {
+bool RunVoxelize()
+{
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     wchar_t* slash = wcsrchr(exePath, L'\\');
@@ -89,17 +96,24 @@ struct AppState {
     Renderer renderer;
     Camera   camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech  tech = RenderTech::PolygonBased;
+    RenderTech  tech = RenderTech::PolygonBased;     // "Close" tech
+    RenderTech  techFar = RenderTech::None;          // None = use Close for all chunks
+    float    sunPitchDeg = 60.0f;
+    float    sunYawDeg   = 63.0f;
+    float    sunIntensityEV = 0.0f;     // log2 stops; linear = 2^EV
+    float    exposureEV     = 0.0f;     // log2 stops; linear = 2^EV
+    float    roughness      = 0.6f;
+    bool     sunShadows     = false;
+    bool     colorizeClusters = false;
     bool     vsync = false;
     int      gridSize = 1;
     bool     showChunkBounds = false;
     bool     wireframe = false;
-    bool     taa = false;
+    bool     taa = true;
     bool     zPrepass = false;
     PointLighting pointLight = PointLighting::Complex;
-    PointLod pointLod = PointLod::L0;
+    PointLod pointLod = PointLod::Auto;
     float    pointLodScale = 1.0f;
-    float    hybridThreshold = 1.0f;   // ppv >= this -> polygons, else points
     bool     splatFilter = true;
     int      splatRadius = 3;       // CS dilation half-window in pixels
     int      fogMode = 1;        // 0 = off, 1 = depth (drives effFogDensity gating)
@@ -137,7 +151,8 @@ struct AppState {
 
 AppState g_app;
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp))
         return true;
 
@@ -177,8 +192,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         float notches = (float)delta / (float)WHEEL_DELTA;
         // log-scale: each notch multiplies speed by ~1.2
         g_app.camera.moveSpeed *= powf(1.2f, notches);
-        if (g_app.camera.moveSpeed < 0.05f)    g_app.camera.moveSpeed = 0.05f;
-        if (g_app.camera.moveSpeed > 10000.0f) g_app.camera.moveSpeed = 10000.0f;
+        g_app.camera.moveSpeed = std::clamp(g_app.camera.moveSpeed, 0.05f, 10000.0f);
         return 0;
     }
     case WM_MOUSEMOVE:
@@ -189,8 +203,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.camera.yaw   += dx * g_app.camera.lookSens;
             g_app.camera.pitch -= dy * g_app.camera.lookSens;
             const float lim = 1.55334f;
-            if (g_app.camera.pitch >  lim) g_app.camera.pitch =  lim;
-            if (g_app.camera.pitch < -lim) g_app.camera.pitch = -lim;
+            g_app.camera.pitch = std::clamp(g_app.camera.pitch, -lim, lim);
             SetCursorPos(g_app.lastMouse.x, g_app.lastMouse.y);
         }
         return 0;
@@ -198,7 +211,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void UpdateCamera(float dt) {
+void UpdateCamera(float dt)
+{
     if (ImGui::GetIO().WantTextInput) return;
     Camera& c = g_app.camera;
     float speed = c.moveSpeed * dt;
@@ -221,7 +235,8 @@ void UpdateCamera(float dt) {
     }
 }
 
-void FrameTopBar() {
+void FrameTopBar()
+{
     ImGui::Begin("VoxelTest");
 
     // fps stats
@@ -244,11 +259,38 @@ void FrameTopBar() {
             if (needReload) g_app.reloadRequested.store(true);
         }
     }
-    const char* techs[] = { "PolygonBased", "Points", "Hybrid", "HexSprite", "PointCS", "PolyVID", "Billboard", "BillboardTri", "Hybrid2", "Splat", "SplatHybrid" };
+    // Non-hybrid techs only. Close/Far selectors compose hybrids implicitly.
+    struct TechEntry { const char* name; RenderTech val; };
+    static const TechEntry kTechList[] = {
+        { "TriMesh",      RenderTech::PolygonBased },
+        { "Points",       RenderTech::Points       },
+        { "HexSprite",    RenderTech::HexSprite    },
+        { "PointCS",      RenderTech::PointCS      },
+        { "PolyVID",      RenderTech::PolyVID      },
+        { "Billboard",    RenderTech::Billboard    },
+        { "BillboardTri", RenderTech::BillboardTri },
+        { "Splat",        RenderTech::Splat        },
+        { "PolyAxis",     RenderTech::PolyAxis     },
+        { "PolyAxisInst", RenderTech::PolyAxisInstanced },
+    };
+    const int kTechCount = (int)(sizeof(kTechList) / sizeof(kTechList[0]));
+    auto techIdxFrom = [&](RenderTech v) -> int {
+        for (int k = 0; k < kTechCount; ++k) if (kTechList[k].val == v) return k;
+        return 0;
+    };
     {
-        int tt = (int)g_app.tech;
-        if (ImGui::Combo("Technique", &tt, techs, IM_ARRAYSIZE(techs), IM_ARRAYSIZE(techs))) {
-            g_app.tech = (RenderTech)tt;
+        // Close pulldown: required (no None entry).
+        const char* closeNames[16]; for (int k = 0; k < kTechCount; ++k) closeNames[k] = kTechList[k].name;
+        int tt = techIdxFrom(g_app.tech);
+        if (ImGui::Combo("Technique Close", &tt, closeNames, kTechCount, kTechCount)) {
+            g_app.tech = kTechList[tt].val;
+        }
+        // Far pulldown: same list prefixed with "None".
+        const char* farNames[17]; farNames[0] = "None";
+        for (int k = 0; k < kTechCount; ++k) farNames[k + 1] = kTechList[k].name;
+        int tf = (g_app.techFar == RenderTech::None) ? 0 : (techIdxFrom(g_app.techFar) + 1);
+        if (ImGui::Combo("Technique Far", &tf, farNames, kTechCount + 1, kTechCount + 1)) {
+            g_app.techFar = (tf == 0) ? RenderTech::None : kTechList[tf - 1].val;
         }
     }
 
@@ -259,7 +301,6 @@ void FrameTopBar() {
         g_app.pointLod = (PointLod)lo;
     }
     ImGui::SliderFloat("LOD distance", &g_app.pointLodScale, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-    ImGui::SliderFloat("Hybrid poly threshold (ppv)", &g_app.hybridThreshold, 0.25f, 16.0f, "%.2f px", ImGuiSliderFlags_Logarithmic);
     ImGui::Checkbox("Splat CS filter", &g_app.splatFilter);
     ImGui::SliderInt("Splat radius", &g_app.splatRadius, 1, 16);
     if (ImGui::CollapsingHeader("Fog")) {
@@ -279,7 +320,7 @@ void FrameTopBar() {
     if (ImGui::Combo("Point lighting", &pli, pls, IM_ARRAYSIZE(pls))) {
         g_app.pointLight = (PointLighting)pli;
     }
-    const char* modes[] = { "Lit", "Flat Color", "Normals" };
+    const char* modes[] = { "Lit", "Flat Color", "Normals", "AO" };
     int m = (int)g_app.mode;
     if (ImGui::Combo("Shading", &m, modes, IM_ARRAYSIZE(modes))) {
         g_app.mode = (ShadingMode)m;
@@ -290,6 +331,13 @@ void FrameTopBar() {
     ImGui::Checkbox("Wireframe", &g_app.wireframe);
     ImGui::Checkbox("TAA", &g_app.taa);
     ImGui::Checkbox("Z Prepass", &g_app.zPrepass);
+    ImGui::Checkbox("Sun shadows", &g_app.sunShadows);
+    ImGui::Checkbox("Colorize clusters", &g_app.colorizeClusters);
+    ImGui::SliderFloat("Sun pitch",     &g_app.sunPitchDeg, 5.0f, 89.0f, "%.1f deg");
+    ImGui::SliderFloat("Sun yaw",       &g_app.sunYawDeg, -180.0f, 180.0f, "%.1f deg");
+    ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
+    ImGui::SliderFloat("Exposure",      &g_app.exposureEV,     -3.0f, 3.0f, "%.2f EV");
+    ImGui::SliderFloat("Roughness",     &g_app.roughness,       0.05f, 1.0f, "%.2f");
     {
         const char* msaaItems[] = { "Off", "2x", "4x", "8x" };
         const int   msaaVals[]  = { 1, 2, 4, 8 };
@@ -314,6 +362,10 @@ void FrameTopBar() {
     ImGui::Text("  Tris drawn: %llu / %llu",
                 (unsigned long long)g_app.renderer.LastDrawnTris(),
                 (unsigned long long)g_app.renderer.TotalTriangles());
+    ImGui::Text("  Poly:  %llu tris  %llu verts",
+                (unsigned long long)g_app.renderer.LastPolyTris(),
+                (unsigned long long)g_app.renderer.LastPolyVerts());
+    ImGui::Text("  Points: %llu", (unsigned long long)g_app.renderer.LastPointCount());
     ImGui::Text("  Vertices:  %llu", (unsigned long long)g_app.renderer.TotalVertices());
     ImGui::Text("  Triangles: %llu", (unsigned long long)g_app.renderer.TotalTriangles());
     ImGui::Text("  VB: %.1f MB   IB: %.1f MB   (24 B/vert, 4 B/idx)",
@@ -343,7 +395,8 @@ void FrameTopBar() {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
+{
     SetCwdToProjectRoot();
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -367,6 +420,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxA(nullptr, "Renderer init failed", "VoxelTest", MB_ICONERROR);
         return 1;
     }
+
+    MicroProfileOnThreadCreate("Main");
+    MicroProfileSetForceEnable(true);
+    MicroProfileSetEnableAllGroups(true);
+    MicroProfileSetForceMetaCounters(true);
+    MicroProfileGpuInitD3D11(g_app.renderer.Device());
+    MicroProfileWebServerStart();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -423,7 +483,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - last).count();
         last = now;
-        if (dt > 0.1f) dt = 0.1f;
+        dt = std::min(dt, 0.1f);
 
         // Handle data-source reload request.
         if (g_app.reloadRequested.load() && g_app.sceneReady) {
@@ -498,16 +558,61 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         g_app.renderer.BeginFrame(clear);
         if (g_app.sceneReady && g_app.loadOk.load()) {
             float effFogDensity = (g_app.fogMode == 0) ? 0.0f : g_app.fogDensity;
-            g_app.renderer.DrawScene(g_app.camera, g_app.mode, g_app.gridSize, g_app.tech, g_app.dataset, g_app.showChunkBounds, g_app.zPrepass, g_app.pointLight, g_app.pointLod, g_app.pointLodScale, g_app.splatFilter, g_app.fogColor, effFogDensity, g_app.heightFogDensity, g_app.heightFogFalloff, g_app.heightFogStart, g_app.hybridThreshold, g_app.wireframe, g_app.splatRadius, g_app.taa);
+            // Spherical sun direction from pitch/yaw sliders.
+            const float kDeg2Rad = 3.14159265358979f / 180.0f;
+            float pr = g_app.sunPitchDeg * kDeg2Rad;
+            float yr = g_app.sunYawDeg   * kDeg2Rad;
+            float sunDir[3] = {
+                cosf(pr) * sinf(yr),
+                sinf(pr),
+                cosf(pr) * cosf(yr),
+            };
+
+            DrawSceneParams ps;
+            ps.mode             = g_app.mode;
+            ps.gridSize         = g_app.gridSize;
+            ps.techClose        = g_app.tech;
+            ps.techFar          = g_app.techFar;
+            ps.dataset          = g_app.dataset;
+            ps.showChunkBounds  = g_app.showChunkBounds;
+            ps.zPrepass         = g_app.zPrepass;
+            ps.pointLight       = g_app.pointLight;
+            ps.pointLod         = g_app.pointLod;
+            ps.pointLodScale    = g_app.pointLodScale;
+            ps.splatFilter      = g_app.splatFilter;
+            ps.fogColor[0]      = g_app.fogColor[0];
+            ps.fogColor[1]      = g_app.fogColor[1];
+            ps.fogColor[2]      = g_app.fogColor[2];
+            ps.fogDensity       = effFogDensity;
+            ps.heightFogDensity = g_app.heightFogDensity;
+            ps.heightFogFalloff = g_app.heightFogFalloff;
+            ps.heightFogStart   = g_app.heightFogStart;
+            ps.hybridThreshold  = 1.0f;
+            ps.wireframe        = g_app.wireframe;
+            ps.splatRadius      = g_app.splatRadius;
+            ps.taa              = g_app.taa;
+            ps.sunDir[0]        = sunDir[0];
+            ps.sunDir[1]        = sunDir[1];
+            ps.sunDir[2]        = sunDir[2];
+            ps.sunIntensity     = exp2f(g_app.sunIntensityEV);
+            ps.exposure         = exp2f(g_app.exposureEV);
+            ps.roughness        = g_app.roughness;
+            ps.sunShadows       = g_app.sunShadows;
+            ps.colorizeClusters = g_app.colorizeClusters;
+            g_app.renderer.DrawScene(g_app.camera, ps);
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_app.renderer.EndFrame(g_app.vsync);
+
+        MicroProfileFlip();
 
         auto end = std::chrono::high_resolution_clock::now();
         g_app.cpuFrameMs = std::chrono::duration<double, std::milli>(end - now).count();
     }
 
     // Loader threads are detached; nothing to join.
+
+    MicroProfileShutdown();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

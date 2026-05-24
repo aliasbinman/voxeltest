@@ -13,12 +13,13 @@ static_assert(sizeof(Vertex) == 12, "");
 
 using VoxelPolyVertex = Vertex;
 
-inline Vertex MakeVoxVertex(int sx, int sy, int sz, uint32_t rgba, uint8_t mask, uint8_t shadow) {
+inline Vertex MakeVoxVertex(int sx, int sy, int sz, uint32_t rgba, uint8_t mask, uint8_t ao)
+{
     Vertex v;
     v.px = (uint16_t)sx;
     v.py = (uint16_t)sy;
     v.pz = (uint16_t)sz;
-    v.aux = (uint16_t)shadow;       // low 6 bits = per-face sun-shadow mask
+    v.aux = (uint16_t)ao;           // low 8 bits = baked AO (0=occluded, 255=open)
     v.color = (rgba & 0x00FFFFFFu) | ((uint32_t)mask << 24);
     return v;
 }
@@ -43,9 +44,10 @@ struct Scene {
     std::vector<VoxelPolyVertex> vertices;    // poly mesh (vb_)
     std::vector<uint32_t>        indices;     // ABSOLUTE indices into vertices
     std::vector<Vertex>          pointVertices; // 1 per voxel + LOD1 + LOD2 (chunk-local)
+    std::vector<uint32_t>        pointAo6;      // packed face AO (4 bits * 6 faces in low 24); aligned with pointVertices
     std::vector<SubMesh>         subs;
     int32_t  origin[3] = { 0, 0, 0 };         // scene origin; gChunkBase base value
-    float    sunDir[3] = { 0.4f, 0.8f, 0.2f }; // baked sun direction (shadow term)
+    float    sunDir[3] = { 0.4f, 0.8f, 0.2f }; // baked sun direction (runtime lighting)
     float    aabbMin[3] = {  1e30f,  1e30f,  1e30f };
     float    aabbMax[3] = { -1e30f, -1e30f, -1e30f };
     uint64_t totalTriangles = 0;

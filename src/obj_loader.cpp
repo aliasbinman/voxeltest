@@ -158,6 +158,102 @@ bool LoadObjScene(const char* objPath, ObjScene& out, std::string& err) {
             g.kd[0] = mit->second.kd[0];
             g.kd[1] = mit->second.kd[1];
             g.kd[2] = mit->second.kd[2];
+        } else {
+            // No MTL match — use a small Minecraft block palette for common
+            // Mineways material names; otherwise synthesize a desaturated kd
+            // from FNV-1a hash of the name so unknown blocks stay separable
+            // without going clown-color.
+            struct Kd { float r, g, b; };
+            static const std::unordered_map<std::string, Kd> kPalette = {
+                {"Stone",                {0.50f,0.50f,0.50f}},
+                {"Cobblestone",          {0.45f,0.45f,0.45f}},
+                {"Mossy_Cobblestone",    {0.40f,0.50f,0.38f}},
+                {"Stone_Bricks",         {0.48f,0.48f,0.48f}},
+                {"Mossy_Stone_Bricks",   {0.42f,0.50f,0.40f}},
+                {"Cracked_Stone_Bricks", {0.46f,0.46f,0.45f}},
+                {"Chiseled_Stone_Bricks",{0.46f,0.46f,0.46f}},
+                {"Bricks",               {0.62f,0.32f,0.25f}},
+                {"Gravel",               {0.55f,0.52f,0.50f}},
+                {"Dirt",                 {0.50f,0.35f,0.22f}},
+                {"Coarse_Dirt",          {0.45f,0.30f,0.20f}},
+                {"Grass_Block",          {0.45f,0.65f,0.30f}},
+                {"Grass_Path",           {0.55f,0.45f,0.28f}},
+                {"Podzol",               {0.42f,0.30f,0.18f}},
+                {"Sand",                 {0.92f,0.88f,0.60f}},
+                {"Sandstone",            {0.85f,0.80f,0.55f}},
+                {"Smooth_Sandstone",     {0.88f,0.83f,0.58f}},
+                {"Chiseled_Sandstone",   {0.84f,0.78f,0.54f}},
+                {"Red_Sand",             {0.75f,0.40f,0.18f}},
+                {"Water",                {0.25f,0.45f,0.85f}},
+                {"Still_Water",          {0.25f,0.45f,0.85f}},
+                {"Ice",                  {0.78f,0.85f,0.95f}},
+                {"Snow",                 {0.95f,0.95f,0.98f}},
+                {"Snow_Block",           {0.95f,0.95f,0.98f}},
+                {"Glass",                {0.85f,0.95f,1.00f}},
+                {"Glass_Pane",           {0.85f,0.95f,1.00f}},
+                {"Oak_Wood",             {0.50f,0.40f,0.25f}},
+                {"Oak_Wood_Planks",      {0.68f,0.55f,0.35f}},
+                {"Oak_Planks",           {0.68f,0.55f,0.35f}},
+                {"Oak_Leaves",           {0.30f,0.55f,0.20f}},
+                {"Spruce_Wood",          {0.36f,0.26f,0.15f}},
+                {"Spruce_Wood_Planks",   {0.45f,0.32f,0.18f}},
+                {"Spruce_Leaves",        {0.20f,0.45f,0.20f}},
+                {"Birch_Wood",           {0.60f,0.55f,0.40f}},
+                {"Birch_Wood_Planks",    {0.82f,0.75f,0.55f}},
+                {"Birch_Leaves",         {0.40f,0.60f,0.30f}},
+                {"Jungle_Wood",          {0.45f,0.35f,0.22f}},
+                {"Jungle_Wood_Planks",   {0.65f,0.50f,0.35f}},
+                {"Jungle_Leaves",        {0.25f,0.55f,0.15f}},
+                {"Acacia_Wood",          {0.55f,0.30f,0.18f}},
+                {"Acacia_Wood_Planks",   {0.72f,0.42f,0.22f}},
+                {"Acacia_Leaves",        {0.40f,0.55f,0.20f}},
+                {"Dark_Oak_Wood",        {0.25f,0.18f,0.10f}},
+                {"Dark_Oak_Wood_Planks", {0.32f,0.22f,0.12f}},
+                {"Dark_Oak_Leaves",      {0.20f,0.40f,0.15f}},
+                {"Coal_Ore",             {0.35f,0.35f,0.35f}},
+                {"Iron_Ore",             {0.70f,0.62f,0.50f}},
+                {"Gold_Ore",             {0.85f,0.78f,0.40f}},
+                {"Diamond_Ore",          {0.55f,0.85f,0.85f}},
+                {"Redstone_Ore",         {0.65f,0.25f,0.20f}},
+                {"Lapis_Lazuli_Ore",     {0.25f,0.35f,0.65f}},
+                {"Emerald_Ore",          {0.30f,0.70f,0.40f}},
+                {"Obsidian",             {0.10f,0.08f,0.15f}},
+                {"Bedrock",              {0.30f,0.30f,0.30f}},
+                {"Netherrack",           {0.45f,0.18f,0.18f}},
+                {"Glowstone",            {0.95f,0.85f,0.45f}},
+                {"Wool",                 {0.92f,0.92f,0.92f}},
+                {"White_Wool",           {0.95f,0.95f,0.95f}},
+                {"Black_Wool",           {0.12f,0.12f,0.12f}},
+                {"Red_Wool",             {0.65f,0.20f,0.20f}},
+                {"Blue_Wool",            {0.20f,0.30f,0.65f}},
+                {"Green_Wool",           {0.30f,0.55f,0.25f}},
+                {"Yellow_Wool",          {0.90f,0.82f,0.35f}},
+                {"Lava",                 {0.95f,0.40f,0.10f}},
+                {"Still_Lava",           {0.95f,0.40f,0.10f}},
+                {"Hay_Block",            {0.75f,0.60f,0.20f}},
+                {"Wheat",                {0.75f,0.62f,0.35f}},
+                {"Stone_Slab",           {0.50f,0.50f,0.50f}},
+                {"Wooden_Slab",          {0.60f,0.48f,0.30f}},
+                {"Nether_Brick",         {0.30f,0.15f,0.18f}},
+            };
+            auto pit = kPalette.find(name);
+            if (pit != kPalette.end()) {
+                g.kd[0] = pit->second.r;
+                g.kd[1] = pit->second.g;
+                g.kd[2] = pit->second.b;
+            } else {
+                uint64_t h = 1469598103934665603ull;
+                for (char c : name) { h ^= (uint8_t)c; h *= 1099511628211ull; }
+                float r = ((h >>  0) & 0xFFu) / 255.0f;
+                float gr= ((h >>  8) & 0xFFu) / 255.0f;
+                float b = ((h >> 16) & 0xFFu) / 255.0f;
+                // Desaturate toward luma (rec.601) so unknown blocks read as
+                // muted earth tones, not saturated yellow/purple noise.
+                float l = 0.30f * r + 0.59f * gr + 0.11f * b;
+                g.kd[0] = 0.25f * r + 0.75f * l;
+                g.kd[1] = 0.25f * gr + 0.75f * l;
+                g.kd[2] = 0.25f * b + 0.75f * l;
+            }
         }
         tempGroups.push_back(std::move(g));
         curGroupIdx = (int)tempGroups.size() - 1;

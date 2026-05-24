@@ -5,15 +5,16 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 
 namespace {
 
 #pragma pack(push, 1)
-struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint32_t color; };
+struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint32_t color; uint8_t ao[6]; };
 #pragma pack(pop)
-static_assert(sizeof(DiskVoxel) == 8, "");
+static_assert(sizeof(DiskVoxel) == 14, "");
 
 struct ChunkMeta {
     uint16_t cx, cy, cz, _pad;
@@ -42,7 +43,8 @@ static const uint8_t kFaceCornerIdx[6][4] = {
 
 } // namespace
 
-bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
+bool LoadVoxScene(const char* path, Scene& out, std::string& err)
+{
     FILE* f = fopen(path, "rb");
     if (!f) { err = "open failed"; return false; }
 
@@ -88,6 +90,7 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
     out.vertices.reserve((size_t)totalVoxels * 8);
     out.indices.reserve((size_t)totalVoxels * 12);
     out.pointVertices.reserve(totalVoxels);
+    out.pointAo6.reserve(totalVoxels);
     out.origin[0] = origin[0];
     out.origin[1] = origin[1];
     out.origin[2] = origin[2];
@@ -133,38 +136,55 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
             int sry = sceneBaseY + dv.y;
             int srz = sceneBaseZ + dv.z;
 
-            // Shadow byte was packed into the color's alpha by voxelize.
-            uint8_t shadow = (uint8_t)((dv.color >> 24) & 0xFFu);
-            // L0 point (scene-relative pos, visMask in color alpha).
-            out.pointVertices.push_back(MakeVoxVertex(srx, sry, srz, dv.color, dv.visMask, shadow));
-            ++sm.pointCount;
-
-            // Poly: 8 corners + visible-face indices (ABSOLUTE).
-            uint32_t vBaseAbs = (uint32_t)out.vertices.size();
-            for (int c = 0; c < 8; ++c) {
-                int x = srx + kCornerOffset[c][0];
-                int y = sry + kCornerOffset[c][1];
-                int z = srz + kCornerOffset[c][2];
-                out.vertices.push_back(MakeVoxVertex(x, y, z, dv.color, 0xFF, shadow));
-
-                float wx = baseX + (float)kCornerOffset[c][0] + (float)dv.x;
-                float wy = baseY + (float)kCornerOffset[c][1] + (float)dv.y;
-                float wz = baseZ + (float)kCornerOffset[c][2] + (float)dv.z;
-                if (wx < sm.aabbMin[0]) sm.aabbMin[0] = wx;
-                if (wy < sm.aabbMin[1]) sm.aabbMin[1] = wy;
-                if (wz < sm.aabbMin[2]) sm.aabbMin[2] = wz;
-                if (wx > sm.aabbMax[0]) sm.aabbMax[0] = wx;
-                if (wy > sm.aabbMax[1]) sm.aabbMax[1] = wy;
-                if (wz > sm.aabbMax[2]) sm.aabbMax[2] = wz;
-            }
+            // Point vertex AO: brightest visible face (max). Matches the poly
+            // path's per-face AO for top-facing surfaces so splats and polys
+            // line up visually in SplatHybrid mode.
+            uint8_t pointAo = 0;
             for (int fi = 0; fi < 6; ++fi) {
                 if (!((mask >> fi) & 1u)) continue;
-                out.indices.push_back(vBaseAbs + kFaceCornerIdx[fi][0]);
-                out.indices.push_back(vBaseAbs + kFaceCornerIdx[fi][1]);
-                out.indices.push_back(vBaseAbs + kFaceCornerIdx[fi][2]);
-                out.indices.push_back(vBaseAbs + kFaceCornerIdx[fi][0]);
-                out.indices.push_back(vBaseAbs + kFaceCornerIdx[fi][2]);
-                out.indices.push_back(vBaseAbs + kFaceCornerIdx[fi][3]);
+                pointAo = std::max(pointAo, dv.ao[fi]);
+            }
+            out.pointVertices.push_back(MakeVoxVertex(srx, sry, srz, dv.color, dv.visMask, pointAo));
+            // Pack per-face AO: 4 bits per face × 6 faces in low 24 bits. Face
+            // order matches visMask (0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
+            uint32_t ao6 = 0;
+            for (int fi = 0; fi < 6; ++fi) {
+                uint32_t a4 = (uint32_t)(dv.ao[fi] >> 4) & 0xFu;
+                ao6 |= (a4 << (fi * 4));
+            }
+            out.pointAo6.push_back(ao6);
+            ++sm.pointCount;
+
+            // Poly: emit 4 verts per visible face (each carries that face's
+            // AO in vertex aux). Drops the 8-corner sharing — same vert count
+            // overall since each voxel averages ~2 visible faces × 4 = 8.
+            for (int fi = 0; fi < 6; ++fi) {
+                if (!((mask >> fi) & 1u)) continue;
+                uint8_t faceAo = dv.ao[fi];
+                uint32_t vBase = (uint32_t)out.vertices.size();
+                for (int k = 0; k < 4; ++k) {
+                    int c = kFaceCornerIdx[fi][k];
+                    int x = srx + kCornerOffset[c][0];
+                    int y = sry + kCornerOffset[c][1];
+                    int z = srz + kCornerOffset[c][2];
+                    out.vertices.push_back(MakeVoxVertex(x, y, z, dv.color, 0xFF, faceAo));
+
+                    float wx = baseX + (float)kCornerOffset[c][0] + (float)dv.x;
+                    float wy = baseY + (float)kCornerOffset[c][1] + (float)dv.y;
+                    float wz = baseZ + (float)kCornerOffset[c][2] + (float)dv.z;
+                    if (wx < sm.aabbMin[0]) sm.aabbMin[0] = wx;
+                    if (wy < sm.aabbMin[1]) sm.aabbMin[1] = wy;
+                    if (wz < sm.aabbMin[2]) sm.aabbMin[2] = wz;
+                    if (wx > sm.aabbMax[0]) sm.aabbMax[0] = wx;
+                    if (wy > sm.aabbMax[1]) sm.aabbMax[1] = wy;
+                    if (wz > sm.aabbMax[2]) sm.aabbMax[2] = wz;
+                }
+                out.indices.push_back(vBase + 0);
+                out.indices.push_back(vBase + 1);
+                out.indices.push_back(vBase + 2);
+                out.indices.push_back(vBase + 0);
+                out.indices.push_back(vBase + 2);
+                out.indices.push_back(vBase + 3);
             }
         }
         sm.indexCount = (uint32_t)out.indices.size() - sm.firstIndex;
@@ -178,7 +198,7 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
     }
 
     // Pass 2 + 3: per-LOD aggregates appended contiguously.
-    struct Accum { uint32_t r = 0, g = 0, b = 0; uint16_t count = 0; uint8_t mask = 0; uint8_t shadowMask = 0; };
+    struct Accum { uint32_t r = 0, g = 0, b = 0, ao = 0; uint16_t count = 0; uint8_t mask = 0; };
     auto lodPass = [&](int step, uint32_t SubMesh::*offsetField, uint32_t SubMesh::*countField) {
         for (uint32_t ci = 0; ci < chunkCount; ++ci) {
             if (!chunkValid[ci]) continue;
@@ -199,7 +219,15 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
                 a.r += (dv.color >>  0) & 0xFF;
                 a.g += (dv.color >>  8) & 0xFF;
                 a.b += (dv.color >> 16) & 0xFF;
-                a.shadowMask |= (uint8_t)((dv.color >> 24) & 0x3Fu);
+                // Per-voxel AO = brightest visible face (max), then averaged
+                // across the LOD bin. Keeps points/splats bright on open-top
+                // surfaces like the poly path.
+                uint32_t voxAoMax = 0;
+                for (int fi = 0; fi < 6; ++fi) {
+                    if (!((dv.visMask >> fi) & 1u)) continue;
+                    voxAoMax = std::max(voxAoMax, (uint32_t)dv.ao[fi]);
+                }
+                a.ao += voxAoMax;
                 a.count++;
                 a.mask |= dv.visMask;
             }
@@ -214,8 +242,16 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err) {
                 uint32_t r = a.r / a.count;
                 uint32_t g = a.g / a.count;
                 uint32_t b = a.b / a.count;
+                uint8_t  ao = (uint8_t)(a.ao / a.count);
                 out.pointVertices.push_back(
-                    MakeVoxVertex(srx, sry, srz, r | (g << 8) | (b << 16), a.mask, a.shadowMask));
+                    MakeVoxVertex(srx, sry, srz, r | (g << 8) | (b << 16), a.mask, ao));
+                // L1/L2 use the same averaged AO on all faces so the SB stays
+                // aligned with pointVertices. PolyAxis only consumes L0 in
+                // practice; this keeps indexing safe.
+                uint32_t a4 = (uint32_t)(ao >> 4) & 0xFu;
+                uint32_t ao6 = 0;
+                for (int fi = 0; fi < 6; ++fi) ao6 |= (a4 << (fi * 4));
+                out.pointAo6.push_back(ao6);
             }
         }
     };

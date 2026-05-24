@@ -29,10 +29,12 @@ enum class ShadingMode : int {
     Lit = 0,
     FlatColor = 1,
     Normals = 2,
+    Ao = 3,
 };
 
 // Render path. Independent of which data is bound (that's DataSet).
 enum class RenderTech : int {
+    None         = -1,  // sentinel for "no Far tech => use Close everywhere"
     PolygonBased = 0,
     Points       = 1,
     Hybrid       = 2,   // points when voxel projects to <1 px, polygons otherwise
@@ -44,6 +46,8 @@ enum class RenderTech : int {
     Hybrid2      = 8,   // PolyVID up close, BillboardTri at distance
     Splat        = 9,   // points -> color RT (alpha=size); CS sphere reconstruct
     SplatHybrid  = 10,  // polygons up close, splats far (renders into splat RT)
+    PolyAxis          = 11,  // pure-math instanced cube; VS picks the 3 camera-facing axis faces
+    PolyAxisInstanced = 12,  // same math as PolyAxis but via DrawInstanced(18, count)
 };
 
 // Which baked dataset to draw from. Determines the polygon source (for
@@ -70,6 +74,35 @@ enum class PointLod : int {
     Auto = 3,           // pick per-chunk by distance
 };
 
+struct DrawSceneParams {
+    ShadingMode    mode             = ShadingMode::Lit;
+    int            gridSize         = 1;
+    RenderTech     techClose        = RenderTech::PolygonBased;
+    RenderTech     techFar          = RenderTech::None;
+    DataSet        dataset          = DataSet::Reduced;
+    bool           showChunkBounds  = false;
+    bool           zPrepass         = false;
+    PointLighting  pointLight       = PointLighting::Complex;
+    PointLod       pointLod         = PointLod::Auto;
+    float          pointLodScale    = 1.0f;
+    bool           splatFilter      = true;
+    float          fogColor[3]      = { 0.55f, 0.60f, 0.70f };
+    float          fogDensity       = 0.0f;
+    float          heightFogDensity = 0.0f;
+    float          heightFogFalloff = 0.05f;
+    float          heightFogStart   = 0.0f;
+    float          hybridThreshold  = 1.0f;
+    bool           wireframe        = false;
+    int            splatRadius      = 3;
+    bool           taa              = true;
+    float          sunDir[3]        = { 0.4f, 0.8f, 0.2f };
+    float          sunIntensity     = 1.0f;          // linear (2^EV)
+    float          exposure         = 1.0f;          // linear (2^EV)
+    float          roughness        = 0.6f;
+    bool           sunShadows       = false;
+    bool           colorizeClusters = false;
+};
+
 class Renderer {
 public:
     bool Init(HWND hwnd);
@@ -81,7 +114,7 @@ public:
     void UploadMergedMesh(const MergedMesh& mesh);
     void UploadAtlasMesh(const AtlasMesh& mesh);
     void BeginFrame(float clear[4]);
-    void DrawScene(const Camera& cam, ShadingMode mode, int gridSize, RenderTech tech, DataSet dataset, bool showChunkBounds, bool zPrepass, PointLighting pointLight, PointLod pointLod, float pointLodScale, bool splatFilter, const float fogColor[3], float fogDensity, float heightFogDensity, float heightFogFalloff, float heightFogStart, float hybridThreshold, bool wireframe, int splatRadius, bool taa);
+    void DrawScene(const Camera& cam, const DrawSceneParams& args);
     void EndFrame(bool vsync);
 
     ID3D11Device*        Device()  const { return device_.Get(); }
@@ -96,6 +129,9 @@ public:
     size_t   DrawCount()      const { return subs_.size(); }
     uint32_t LastDrawnCount() const { return lastDrawn_; }
     uint64_t LastDrawnTris()  const { return lastDrawnTris_; }
+    uint64_t LastPolyTris()   const { return lastPolyTris_; }
+    uint64_t LastPolyVerts()  const { return lastPolyVerts_; }
+    uint64_t LastPointCount() const { return lastPointCount_; }
 
 private:
     bool CreateDeviceAndSwap(HWND hwnd);
@@ -122,6 +158,8 @@ private:
     ComPtr<ID3D11VertexShader>   vsHex_;
     ComPtr<ID3D11PixelShader>    psHex_;
     ComPtr<ID3D11VertexShader>   vsPolyVid_;
+    ComPtr<ID3D11VertexShader>   vsPolyAxis_;
+    ComPtr<ID3D11VertexShader>   vsPolyAxisInstanced_;
     ComPtr<ID3D11PixelShader>    psPolyVid_;
     ComPtr<ID3D11InputLayout>    inputLayoutPolyVid_;
     ComPtr<ID3D11Buffer>         polyVidIb_;
@@ -166,10 +204,28 @@ private:
     ComPtr<ID3D11Texture2D>            splatDepthTex_;
     ComPtr<ID3D11DepthStencilView>     splatDsv_;
     ComPtr<ID3D11ShaderResourceView>   splatDepthSrv_;
+    ComPtr<ID3D11ShaderResourceView>   splatStencilSrv_;
+    ComPtr<ID3D11DepthStencilState>    dsSplatPoly_;       // poly draws: depth GT, write 1
+    ComPtr<ID3D11DepthStencilState>    dsSplatPoint_;      // splat draws: depth GT, keep stencil
+    ComPtr<ID3D11DepthStencilState>    dsAlwaysWrite_;     // depth ALWAYS pass, write ON (SV_Depth lands)
+    ComPtr<ID3D11PixelShader>          psSplatRecon_;
+    ComPtr<ID3D11PixelShader>          psSplatAlbedoPoly_;
+    ComPtr<ID3D11PixelShader>          psPolyVidAlpha0_;
     ComPtr<ID3D11Texture2D>            splatFinalTex_;
     ComPtr<ID3D11UnorderedAccessView>  splatFinalUav_;
+    ComPtr<ID3D11ShaderResourceView>   splatFinalSrv_;
+    ComPtr<ID3D11PixelShader>          psSplatComposite_;
     ComPtr<ID3D11ComputeShader>        csSplat_;
     ComPtr<ID3D11PixelShader>          psSplatAlbedo_;
+    // Sun shadow map.
+    ComPtr<ID3D11Texture2D>            shadowTex_;
+    ComPtr<ID3D11DepthStencilView>     shadowDsv_;
+    ComPtr<ID3D11ShaderResourceView>   shadowSrv_;
+    ComPtr<ID3D11SamplerState>         shadowSamp_;
+    ComPtr<ID3D11VertexShader>         vsShadow_;
+    ComPtr<ID3D11RasterizerState>      rsShadow_;
+    uint32_t                           shadowSize_ = 2048;
+
     ComPtr<ID3D11InputLayout>    inputLayout_;
     ComPtr<ID3D11InputLayout>    inputLayoutHex_;
     ComPtr<ID3D11InputLayout>    inputLayoutBounds_;
@@ -189,6 +245,8 @@ private:
     ComPtr<ID3D11UnorderedAccessView> csDepthUav_;
     ComPtr<ID3D11ShaderResourceView>  csColorSrv_;
     ComPtr<ID3D11ShaderResourceView>  pointSrv_;
+    ComPtr<ID3D11Buffer>              pointAo6Sb_;
+    ComPtr<ID3D11ShaderResourceView>  pointAo6Srv_;
     ComPtr<ID3D11Buffer>         cbCS_;
     uint32_t chunkDim_ = 64;
     ComPtr<ID3D11Buffer>         cbPerFrame_;
@@ -213,6 +271,9 @@ private:
     uint64_t ibBytes_ = 0;
     uint32_t lastDrawn_ = 0;
     uint64_t lastDrawnTris_ = 0;
+    uint64_t lastPolyTris_ = 0;
+    uint64_t lastPolyVerts_ = 0;
+    uint64_t lastPointCount_ = 0;
     float    sceneSpan_[3] = { 0, 0, 0 };
     float    sceneOrigin_[3] = { 0, 0, 0 };
     ComPtr<ID3D11InputLayout> inputLayoutPoly_;

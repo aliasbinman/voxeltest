@@ -5,7 +5,8 @@
 #include <cstdio>
 #include <cstring>
 
-bool LoadMergedMesh(const char* path, MergedMesh& out, std::string& err) {
+bool LoadMergedMesh(const char* path, MergedMesh& out, std::string& err)
+{
     FILE* f = fopen(path, "rb");
     if (!f) { err = "open failed"; return false; }
 
@@ -40,7 +41,8 @@ bool LoadMergedMesh(const char* path, MergedMesh& out, std::string& err) {
     return true;
 }
 
-bool LoadAtlasMesh(const char* path, AtlasMesh& out, std::string& err) {
+bool LoadAtlasMesh(const char* path, AtlasMesh& out, std::string& err)
+{
     FILE* f = fopen(path, "rb");
     if (!f) { err = "open failed"; return false; }
 

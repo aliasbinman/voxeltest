@@ -29,6 +29,15 @@ cbuffer cbPerFrame : register(b0)
     row_major float4x4 gPrevViewProj;     // last frame's VP (for TAA reprojection)
     float2   gJitter;                     // sub-pixel NDC offset applied to current proj
     float2   _pad7;
+    row_major float4x4 gSunViewProj;      // sun ortho VP for shadow map
+    float    gShadowBias;
+    float    gShadowMapSize;
+    float    gShadowEnable;
+    float    gSunIntensity;
+    float    gExposure;
+    float    gRoughness;
+    float    gColorizeClusters;   // 0/1 toggle
+    float    _padExp;
 };
 
 // Combined depth + height fog. Height fog uses Inigo Quilez closed-form:
@@ -67,7 +76,9 @@ cbuffer cbPerChunk : register(b1)
     float3 gChunkBase;
     float  _pad;
     uint   gVoxelBase;       // PolyVID: chunk's first voxel index in pointSb_
-    uint3  _pad2;
+    uint   gChunkLodIdx;     // 0..3 splat LOD index (used by splat encoding)
+    uint   gChunkTint;       // colorize-clusters tint: 1 green, 2 red, 3 orange, 4 yellow, 0 off
+    uint2  _pad2;
 };
 
 // Cardinal face normals indexed by faceIdx (0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
@@ -101,6 +112,7 @@ struct VSOut {
     float4 col   : COL;
     nointerpolation uint faceIdx : FIDX;
     nointerpolation uint shadowMask : SHADOW;
+    nointerpolation float ao : AO;
 };
 
 float3 UnpackVoxPos(uint4 p)
@@ -112,6 +124,12 @@ float3 UnpackVoxPos(uint4 p)
 // VoxelP). Bit i: 1 = face i directly lit, 0 = shadowed. Face order matches
 // kFaceNormals (0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
 uint ShadowMaskFromAux(uint aux) { return aux & 0x3Fu; }
+
+// Per-voxel baked AO. Stored in the LOW 8 bits of aux (the same uint16 word
+// also carries the 6-bit shadow mask in its low 6 bits — these are separate
+// bit ranges of the 16-bit aux; see vox_loader.cpp). 0 = fully occluded,
+// 1 = fully open.
+float AoFromAux(uint aux) { return (float)(aux & 0xFFu) * (1.0 / 255.0); }
 
 // Pick cardinal face index from a (possibly noisy) normal — dominant axis wins.
 uint FaceFromNormal(float3 n)
@@ -125,14 +143,61 @@ uint FaceFromNormal(float3 n)
 float ShadowBit(uint mask, uint fi)         { return (float)((mask >> fi) & 1u); }
 float ShadowBitN(uint mask, float3 n)       { return ShadowBit(mask, FaceFromNormal(n)); }
 
+// Sun shadow map: D32 depth, reverse-Z ortho, sampled with comparison.
+Texture2D<float>          gShadowMap : register(t10);
+SamplerComparisonState    gShadowSamp : register(s2);
+
+// Project wpos into sun NDC and PCF-sample (3x3 box). Returns 1 lit, 0 shadowed.
+float SampleShadow(float3 wpos)
+{
+    if (gShadowEnable < 0.5) return 1.0;
+    float4 sclip = mul(float4(wpos, 1.0), gSunViewProj);
+    if (sclip.w <= 0.0) return 1.0;
+    float3 sn = sclip.xyz / sclip.w;
+    float2 uv = float2(sn.x * 0.5 + 0.5, -sn.y * 0.5 + 0.5);
+    if (any(uv < 0.0) || any(uv > 1.0)) return 1.0;
+    float ref = sn.z + gShadowBias;     // reverse-Z: lit when depth >= ref
+    float sum = 0.0;
+    float ts = 1.0 / gShadowMapSize;
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    [unroll] for (int dx = -1; dx <= 1; ++dx)
+        sum += gShadowMap.SampleCmpLevelZero(gShadowSamp, uv + float2(dx, dy) * ts, ref);
+    return sum * (1.0 / 9.0);
+}
+
 // Combined lighting using baked sun-shadow term. shadow=0 kills sun but keeps
 // full ambient so shadowed faces stay readable; shadow=1 = fully lit.
 float3 ApplyShadowLighting(float3 amb, float3 sunDir, float3 n, float shadow)
 {
     float ndotl = saturate(dot(n, sunDir));
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl * shadow;
+    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl * shadow * gSunIntensity;
     return amb + gAmbient * sun;
 }
+
+// Debug cluster tint: 1=green close, 2=red L0, 3=orange L1, 4=yellow L2.
+float3 ClusterTint(uint t)
+{
+    if (t == 1u) return float3(0.4, 1.0, 0.4);
+    if (t == 2u) return float3(1.0, 0.4, 0.4);
+    if (t == 3u) return float3(1.0, 0.65, 0.2);
+    if (t == 4u) return float3(1.0, 1.0, 0.3);
+    return float3(1.0, 1.0, 1.0);
+}
+float3 ApplyClusterTint(float3 c)
+{
+    return (gColorizeClusters > 0.5) ? c * ClusterTint(gChunkTint) : c;
+}
+
+// ACES filmic tonemap with exposure pre-multiply.
+float3 Tonemap(float3 x)
+{
+    x = x * gExposure;
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+// Per-chunk tint pre-tonemap. Lit PS paths read gChunkTint from per-chunk CB.
+float3 TonemapTinted(float3 x) { return Tonemap(ApplyClusterTint(x)); }
 
 // Depth-only VS (Z prepass). No PS bound.
 struct VSDepthOut { float4 svpos : SV_Position; };
@@ -148,6 +213,17 @@ VSDepthOut vsmain_depth(VSPolyIn i)
     return o;
 }
 
+// Shadow map VS: uses gSunViewProj instead of camera VP. No PS bound.
+VSDepthOut vsmain_shadow(VSPolyIn i)
+{
+    VSDepthOut o;
+    precise float3 local = UnpackVoxPos(i.pck);
+    precise float3 world = gChunkBase + local;
+    precise float4 clip  = mul(float4(world, 1.0), gSunViewProj);
+    o.svpos = clip;
+    return o;
+}
+
 VSOut vsmain(VSPolyIn i)
 {
     VSOut o;
@@ -158,7 +234,8 @@ VSOut vsmain(VSPolyIn i)
     o.svpos   = clip;
     o.col     = float4(float3(i.col.rgb) / 255.0, 1.0);
     o.faceIdx = 0;
-    o.shadowMask = ShadowMaskFromAux(i.pck.w);
+    o.shadowMask = 0xFFu;                   // shadow bake removed -> always lit
+    o.ao         = AoFromAux(i.pck.w);
     return o;
 }
 
@@ -170,6 +247,7 @@ struct VSPointOut {
     float3 wpos  : WPOS;
     nointerpolation uint mask : MASK;
     nointerpolation uint shadowMask : SHADOW;
+    nointerpolation float ao : AO;
 };
 
 VSPointOut vsmain_points(VSIn i)
@@ -182,7 +260,8 @@ VSPointOut vsmain_points(VSIn i)
     o.col   = float3(i.col.rgb) / 255.0;
     o.wpos  = world;
     o.mask  = i.col.a & 0x3Fu;       // visMask packed in color alpha
-    o.shadowMask = ShadowMaskFromAux(i.pck.w);
+    o.shadowMask = 0xFFu;
+    o.ao         = AoFromAux(i.pck.w);
     return o;
 }
 
@@ -205,11 +284,12 @@ float4 psmain_points_simple(VSPointOut i) : SV_Target
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
+    if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
     float3 n = normalize(gCamPos - i.wpos);
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
-    float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n));
-    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
+    float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
+    return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
 }
 
 // Complex: per-axis up-to-3 cardinal faces, weighted by projected area.
@@ -217,6 +297,7 @@ float4 psmain_points(VSPointOut i) : SV_Target
 {
     int mode = (int)gMode;
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
+    if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
 
     // Choose up to 3 candidate cardinal faces: the ones the camera could see.
     // Per axis: positive face if D.axis >= 0, else negative face.
@@ -245,8 +326,8 @@ float4 psmain_points(VSPointOut i) : SV_Target
         // Projected-area weight (n always points toward camera here).
         float w = saturate(dot(n, Dn));
 
-        float3 amb  = kAmbientCube[bitIdx];
-        float3 light = ApplyShadowLighting(amb, L, n, ShadowBit(i.shadowMask, bitIdx));
+        float3 amb  = kAmbientCube[bitIdx] * i.ao;
+        float3 light = ApplyShadowLighting(amb, L, n, ShadowBit(i.shadowMask, bitIdx) * SampleShadow(i.wpos));
         accumCol += i.col * light * w;
         accumN   += n * w;
         accumW   += w;
@@ -261,7 +342,7 @@ float4 psmain_points(VSPointOut i) : SV_Target
     if (mode == 2) {
         return float4(ApplyFog(normalize(accumN) * 0.5 + 0.5, i.wpos), 1.0);
     }
-    return float4(ApplyFog(accumCol / accumW, i.wpos), 1.0);
+    return float4(TonemapTinted(ApplyFog(accumCol / accumW, i.wpos)), 1.0);
 }
 
 // ---------------- PointCS compute path ----------------
@@ -350,7 +431,8 @@ struct VSBoundsOut { float4 svpos : SV_Position; };
 VSBoundsOut vsmain_bounds(VSBoundsIn i)
 {
     VSBoundsOut o;
-    // Tight AABB: chunkBase = world aabbMin; size = (_pad, asfloat(_pad2.xy)).
+    // Tight AABB: chunkBase = world aabbMin; size.x = _pad, size.yz = asfloat(_pad2).
+    // chunkLodIdx is between voxelBase and _pad2 so bounds keeps its own slots.
     float3 size = float3(_pad, asfloat(_pad2.x), asfloat(_pad2.y));
     float3 world = gChunkBase + i.pos * size;
     o.svpos = mul(float4(world, 1.0), gViewProj);
@@ -367,6 +449,9 @@ float4 psmain_bounds(VSBoundsOut i) : SV_Target
 // baseVertex = chunkVoxelBase*8 so SV_VertexID = (chunkVoxelBase + i)*8 + corner.
 // VS pulls voxel data from a StructuredBuffer; no VB needed.
 StructuredBuffer<VoxelP> gPolyVoxels : register(t1);
+// Per-voxel packed face AO (4 bits per face × 6 faces in low 24 bits). PolyAxis
+// only — bound at VS slot t2.
+StructuredBuffer<uint>   gPolyAo6    : register(t2);
 
 struct VSPolyVidOut {
     float4 svpos : SV_Position;
@@ -374,6 +459,7 @@ struct VSPolyVidOut {
     float3 col   : COL;
     float3 wpos  : WPOS;
     nointerpolation uint shadowMask : SHADOW;
+    nointerpolation float ao : AO;
 };
 
 VSPolyVidOut vsmain_polyvid(uint vid : SV_VertexID)
@@ -399,6 +485,161 @@ VSPolyVidOut vsmain_polyvid(uint vid : SV_VertexID)
     return o;
 }
 
+// ---------------- PolyAxis technique ----------------
+// Single point in => up to 3 camera-facing axis faces (6 tris / 18 verts).
+// No VB / no IB. DrawInstanced(18, voxelCount). VS picks +/- sign per axis
+// from `sign(camPos - voxelCenter)`, kills the face when visMask says it's
+// occluded, and flips one in-plane axis so winding stays outward.
+VSPolyVidOut vsmain_polyaxis(uint vid : SV_VertexID)
+{
+    VSPolyVidOut o;
+    // 18 verts per voxel, single non-instanced Draw(18*count). vid decomposes
+    // into: voxel index, axis-face (0..2), and which of the 6 verts in that
+    // face. No VB, no IB.
+    uint voxelIdx = (vid / 18u) + gVoxelBase;
+    uint inVox    = vid - (vid / 18u) * 18u;   // 0..17
+    VoxelP v = gPolyVoxels[voxelIdx];
+    float3 voxLocal  = UnpackVoxPosCS(v.pck);
+    float3 voxCenter = gChunkBase + voxLocal + 0.5;
+
+    uint faceAxis = inVox / 6u;             // 0=X 1=Y 2=Z
+    uint inFace   = inVox - faceAxis * 6u;  // 0..5 within the face
+    // Two tris as 6 verts: (0,1,2)(0,2,3) over quad corners 0..3.
+    uint qcLut[6] = { 0u, 1u, 2u, 0u, 2u, 3u };
+    uint qc = qcLut[inFace];
+    float2 uv = float2((qc == 1u || qc == 2u) ? 1.0 : 0.0,
+                       (qc == 2u || qc == 3u) ? 1.0 : 0.0);
+
+    // Pick face sign from camera position along the face axis.
+    float3 toCam = gCamPos - voxCenter;
+    float axDist = (faceAxis == 0u) ? toCam.x
+                 : (faceAxis == 1u) ? toCam.y : toCam.z;
+    float sgn = (axDist >= 0.0) ? 1.0 : -1.0;
+
+    // visMask bit order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Stored in point col.a.
+    uint visMask = (v.col >> 24u) & 0x3Fu;
+    uint visBit  = faceAxis * 2u + ((sgn >= 0.0) ? 0u : 1u);
+    bool visible = ((visMask >> visBit) & 1u) != 0u;
+
+    // Build the corner offset: face axis = sgn*0.5; the two in-plane axes
+    // get (uv - 0.5). Flip U sign on negative faces so winding stays outward.
+    uint uAx = (faceAxis + 1u) % 3u;
+    uint vAx = (faceAxis + 2u) % 3u;
+    float uOff = uv.x - 0.5;
+    float vOff = uv.y - 0.5;
+    if (sgn < 0.0) uOff = -uOff;
+
+    float3 offset = float3(0.0, 0.0, 0.0);
+    if (faceAxis == 0u) offset.x = sgn * 0.5;
+    if (faceAxis == 1u) offset.y = sgn * 0.5;
+    if (faceAxis == 2u) offset.z = sgn * 0.5;
+    if (uAx == 0u) offset.x += uOff;
+    else if (uAx == 1u) offset.y += uOff;
+    else                offset.z += uOff;
+    if (vAx == 0u) offset.x += vOff;
+    else if (vAx == 1u) offset.y += vOff;
+    else                offset.z += vOff;
+
+    float3 world = voxCenter + offset;
+
+    if (!visible) {
+        // Push vertex off-screen so the triangle is clipped without rasterization.
+        o.svpos = float4(2.0, 2.0, 2.0, 1.0);
+        o.nrm   = float3(0, 1, 0);
+        o.col   = float3(0, 0, 0);
+        o.wpos  = world;
+        o.shadowMask = 0;
+        o.ao = 0;
+        return o;
+    }
+
+    o.svpos = mul(float4(world, 1.0), gViewProj);
+    float3 n = float3(0, 0, 0);
+    if (faceAxis == 0u) n.x = sgn;
+    else if (faceAxis == 1u) n.y = sgn;
+    else                     n.z = sgn;
+    o.nrm   = n;
+    o.col   = float3((v.col >>  0u) & 0xFFu,
+                     (v.col >>  8u) & 0xFFu,
+                     (v.col >> 16u) & 0xFFu) / 255.0;
+    o.wpos  = world;
+    o.shadowMask = 0xFFu;
+    // Per-face AO from gPolyAo6: 4-bit nibble per face indexed by visBit
+    // (visBit = faceAxis*2 + (sgn<0)). 15 = fully lit, 0 = fully shadowed.
+    uint ao6   = gPolyAo6[voxelIdx];
+    uint nib   = (ao6 >> (visBit * 4u)) & 0xFu;
+    o.ao       = (float)nib / 15.0;
+    return o;
+}
+
+// Instanced variant of PolyAxis: DrawInstanced(18, count). SV_InstanceID picks
+// voxel, SV_VertexID is 0..17 within the cube. Identical math.
+VSPolyVidOut vsmain_polyaxis_instanced(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+{
+    VSPolyVidOut o;
+    uint voxelIdx = iid + gVoxelBase;
+    uint inVox    = vid;                          // 0..17
+    VoxelP v = gPolyVoxels[voxelIdx];
+    float3 voxLocal  = UnpackVoxPosCS(v.pck);
+    float3 voxCenter = gChunkBase + voxLocal + 0.5;
+
+    uint faceAxis = inVox / 6u;
+    uint inFace   = inVox - faceAxis * 6u;
+    uint qcLut[6] = { 0u, 1u, 2u, 0u, 2u, 3u };
+    uint qc = qcLut[inFace];
+    float2 uv = float2((qc == 1u || qc == 2u) ? 1.0 : 0.0,
+                       (qc == 2u || qc == 3u) ? 1.0 : 0.0);
+
+    float3 toCam = gCamPos - voxCenter;
+    float axDist = (faceAxis == 0u) ? toCam.x
+                 : (faceAxis == 1u) ? toCam.y : toCam.z;
+    float sgn = (axDist >= 0.0) ? 1.0 : -1.0;
+
+    uint visMask = (v.col >> 24u) & 0x3Fu;
+    uint visBit  = faceAxis * 2u + ((sgn >= 0.0) ? 0u : 1u);
+    bool visible = ((visMask >> visBit) & 1u) != 0u;
+
+    uint uAx = (faceAxis + 1u) % 3u;
+    uint vAx = (faceAxis + 2u) % 3u;
+    float uOff = uv.x - 0.5;
+    float vOff = uv.y - 0.5;
+    if (sgn < 0.0) uOff = -uOff;
+
+    float3 offset = float3(0.0, 0.0, 0.0);
+    if (faceAxis == 0u) offset.x = sgn * 0.5;
+    if (faceAxis == 1u) offset.y = sgn * 0.5;
+    if (faceAxis == 2u) offset.z = sgn * 0.5;
+    if (uAx == 0u) offset.x += uOff;
+    else if (uAx == 1u) offset.y += uOff;
+    else                offset.z += uOff;
+    if (vAx == 0u) offset.x += vOff;
+    else if (vAx == 1u) offset.y += vOff;
+    else                offset.z += vOff;
+
+    float3 world = voxCenter + offset;
+    if (!visible) {
+        o.svpos = float4(2.0, 2.0, 2.0, 1.0);
+        o.nrm = float3(0, 1, 0); o.col = float3(0, 0, 0); o.wpos = world;
+        o.shadowMask = 0; o.ao = 0;
+        return o;
+    }
+    o.svpos = mul(float4(world, 1.0), gViewProj);
+    float3 n = float3(0, 0, 0);
+    if (faceAxis == 0u) n.x = sgn;
+    else if (faceAxis == 1u) n.y = sgn;
+    else                     n.z = sgn;
+    o.nrm = n;
+    o.col = float3((v.col >>  0u) & 0xFFu,
+                   (v.col >>  8u) & 0xFFu,
+                   (v.col >> 16u) & 0xFFu) / 255.0;
+    o.wpos = world;
+    o.shadowMask = 0xFFu;
+    uint ao6 = gPolyAo6[voxelIdx];
+    uint nib = (ao6 >> (visBit * 4u)) & 0xFu;
+    o.ao = (float)nib / 15.0;
+    return o;
+}
+
 float4 psmain_polyvid(VSPolyVidOut i) : SV_Target
 {
     float3 n = i.nrm * i.nrm;
@@ -409,9 +650,24 @@ float4 psmain_polyvid(VSPolyVidOut i) : SV_Target
     float fogDist = length(i.wpos - gCamPos);
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
-    float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n));
-    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
+    if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
+    float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
+    return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
+}
+
+// Same lighting as psmain_polyvid but alpha=0 — used when PolyAxis / PolyVID
+// draws into the splat RT (stencil=1 marks poly pixels, alpha=0 tells the
+// reconstruction PS to skip these during the neighbor splat search).
+float4 psmain_polyvid_alpha0(VSPolyVidOut i) : SV_Target
+{
+    float3 n = i.nrm * i.nrm;
+    n = n * n;
+    n = n * n;
+    n = normalize(i.nrm * n);
+    float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
+    return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 0.0);
 }
 
 // ---------------- TAA composite ----------------
@@ -449,16 +705,24 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     float2 currUv = (float2(pix) + 0.5) / float2((float)W, (float)H);
     currUv += float2(gJitter.x * 0.5, -gJitter.y * 0.5);
     float3 curC = gTaaScene.SampleLevel(gTaaSamp, currUv, 0).rgb;
-    float  d    = gTaaDepth.Load(int3(pix, 0));
+    // Read depth at the SAME pixel as color (the jittered sample), not at
+    // integer pix. Otherwise depth + color describe two different world
+    // points and reprojection wobbles at depth discontinuities (= ghosting).
+    int2 jPix = clamp(int2(currUv * float2((float)W, (float)H)),
+                      int2(0, 0), int2(W - 1, H - 1));
+    float  d  = gTaaDepth.Load(int3(jPix, 0));
     if (d <= 0.0) {
         return float4(curC, 1.0);
     }
 
-    // Reconstruct world position from current depth + camera basis (undo jitter).
+    // World pos must reconstruct from the SAME UV that depth+color were read
+    // at (currUv = pix center + jitter). Using un-jittered pix NDC here was
+    // the ghosting source: the world point reprojected into prev frame missed
+    // the actual surface by ~half a pixel each frame.
     float viewZ = gNearZ / d;
     float aspect = (float)W / (float)H;
-    float ndcX = ((float)pix.x + 0.5) / (float)W * 2.0 - 1.0 - gJitter.x;
-    float ndcY = 1.0 - ((float)pix.y + 0.5) / (float)H * 2.0 - gJitter.y;
+    float ndcX = currUv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - currUv.y * 2.0;
     float viewX = ndcX * aspect * gTanHalfFovY * viewZ;
     float viewY = ndcY *          gTanHalfFovY * viewZ;
     float3 world = gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
@@ -500,7 +764,36 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     prevC += gTaaHist.SampleLevel(gTaaSamp, float2(tp12.x, tp3.y ), 0).rgb * k4;
     prevC /= kSum;       // re-normalize (5-tap drops 4 corners)
 
-    float3 outC = lerp(prevC, curC, 0.05);
+    // Neighborhood color clamp: history outside the 3x3 current-frame AABB is
+    // a disocclusion / moving edge -> ghost. Compute min/max around currUv,
+    // expand slightly via variance for stability, then clip prevC to that box.
+    float2 px = 1.0 / float2((float)W, (float)H);
+    float3 nMin = curC;
+    float3 nMax = curC;
+    float3 nMean = curC;
+    float3 nMean2 = curC * curC;
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    [unroll] for (int dx = -1; dx <= 1; ++dx) {
+        if (dx == 0 && dy == 0) continue;
+        float3 s = gTaaScene.SampleLevel(gTaaSamp, currUv + float2(dx, dy) * px, 0).rgb;
+        nMin = min(nMin, s);
+        nMax = max(nMax, s);
+        nMean  += s;
+        nMean2 += s * s;
+    }
+    nMean  /= 9.0;
+    nMean2 /= 9.0;
+    float3 sigma = sqrt(max(nMean2 - nMean * nMean, 0.0));
+    // Blend pure min/max with mean +/- gamma*sigma; gamma controls strictness.
+    const float gamma = 1.25;
+    float3 vMin = max(nMin, nMean - gamma * sigma);
+    float3 vMax = min(nMax, nMean + gamma * sigma);
+    float3 clipped = clamp(prevC, vMin, vMax);
+
+    // Adaptive blend: more current when clip moved the history a lot (disocclusion).
+    float dist = length(clipped - prevC) / max(length(nMax - nMin), 1e-4);
+    float alpha = lerp(0.1, 0.5, saturate(dist));
+    float3 outC = lerp(clipped, curC, alpha);
     return float4(outC, 1.0);
 }
 
@@ -573,16 +866,29 @@ float4 psmain_post(VTaaOut i) : SV_Target
 }
 
 // ---------------- Splat technique ----------------
-// splatColorTex_ stores ALBEDO in RGB and per-voxel sun-shadow in alpha.
-// Filled-marker check uses gSplatDepth (cleared to 0; reverse-Z so >0 = hit).
-// Encode 6-bit shadow mask into alpha byte (UNORM round-trip via *255 in CS).
+// Unified splat RT stores ALBEDO.RGB plus alpha encoding the pixel kind:
+//   alpha == 0           -> poly pixel (close cluster, drawn first) OR untouched bg
+//   alpha != 0 (splat)   -> bits [7:6] = lodIdx+1 (1..3), [5:0] = AO quantized
+// Stencil distinguishes poly (1) from bg (0) when alpha == 0.
+float SplatEncodeAlpha(float ao01, uint lodIdx)
+{
+    uint ao6 = (uint)(saturate(ao01) * 63.0 + 0.5);
+    uint a8  = ((lodIdx + 1u) << 6) | (ao6 & 0x3Fu);
+    return (float)a8 / 255.0;
+}
 float4 psmain_splat_albedo(VSPointOut i) : SV_Target
 {
-    return float4(i.col, (float)i.shadowMask / 255.0);
+    return float4(i.col, SplatEncodeAlpha(i.ao, gChunkLodIdx));
 }
+// Poly into the shared splat buffer: alpha = 0 marks "poly pixel" so the
+// reconstruction PS skips it during neighbor search.
 float4 psmain_splat_albedo_poly(VSOut i) : SV_Target
 {
-    return float4(i.col.rgb, (float)i.shadowMask / 255.0);
+    float3 n   = normalize(cross(ddx(i.wpos), ddy(i.wpos)));
+    float3 amb = SampleAmbientCubeTriplanar(n) * i.ao;
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
+    float3 lit = i.col.rgb * light;
+    return float4(Tonemap(ApplyFog(ApplyClusterTint(lit), i.wpos)), 0.0);
 }
 
 // CS reconstruction: for each output pixel, search neighbors for the nearest
@@ -623,6 +929,110 @@ float3 ReconstructNeighborWorld(int2 sp, float zN, int W, int H)
     return gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
 }
 
+// Fullscreen reconstruction PS (replaces csmain_splat). Reads splatColorSrv
+// (t2), splatDepthSrv (t1), splatStencilSrv (t9). Stencil==1 -> poly pixel,
+// output passthrough. Stencil==0 -> search neighbor splat markers in alpha.
+Texture2D<uint2> gSplatStencil : register(t9);
+
+struct ReconOut { float4 color : SV_Target; float depth : SV_Depth; };
+ReconOut psmain_splat_reconstruct(VBlitOut vIn)
+{
+    ReconOut o;
+    int2 pix = int2(vIn.pos.xy);
+    int W = (int)gScreenSize.x;
+    int H = (int)gScreenSize.y;
+
+    // Propagate splat-pipeline depth into the main depth buffer so TAA's
+    // reprojection + post-pass sky have the right Z everywhere.
+    o.depth = gSplatDepth.Load(int3(pix, 0));
+
+    // Poly pixel: pass through.
+    uint stencil = gSplatStencil.Load(int3(pix, 0)).g;
+    if (stencil == 1u) {
+        o.color = float4(gSplatColorSrv.Load(int3(pix, 0)).rgb, 1.0);
+        return o;
+    }
+
+    float3 ro = gCamPos;
+    float3 rd = PixelWorldDir(pix, W, H);
+    float3 invRd = 1.0 / rd;
+
+    int R = (int)max(1.0, _pad1.x);
+    float  bestT = 1e30;
+    float3 bestAlbedo = float3(0, 0, 0);
+    float3 bestN = float3(0, 0, 1);
+    float  bestAo = 1.0;
+    uint   bestLodIdx = 0u;
+    bool   anyHit = false;
+
+    [loop] for (int dy = -R; dy <= R; ++dy) {
+        [loop] for (int dx = -R; dx <= R; ++dx) {
+            int2 sp = pix + int2(dx, dy);
+            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
+            float4 s = gSplatColorSrv.Load(int3(sp, 0));
+            uint a8 = (uint)(s.a * 255.0 + 0.5);
+            if (a8 == 0u) continue;            // poly (stencil=1) or pure bg
+            uint lodp1 = (a8 >> 6) & 3u;
+            if (lodp1 == 0u) continue;
+            uint lodIdx = lodp1 - 1u;
+            uint ao6 = a8 & 0x3Fu;
+            float aoN = (float)ao6 / 63.0;
+            float halfExt = (lodIdx == 0u) ? 0.5
+                          : (lodIdx == 1u) ? 1.0
+                          : (lodIdx == 2u) ? 2.0
+                          :                  4.0;
+            float zN = gSplatDepth.Load(int3(sp, 0));
+            if (zN <= 0.0) continue;
+            float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
+            float S = 2.0 * halfExt;
+            float3 vmin = floor(wp / S) * S;
+            float3 vmax = vmin + S;
+            float3 t0v = (vmin - ro) * invRd;
+            float3 t1v = (vmax - ro) * invRd;
+            float3 tmn = min(t0v, t1v);
+            float3 tmx = max(t0v, t1v);
+            float tNear = max(max(tmn.x, tmn.y), tmn.z);
+            float tFar  = min(min(tmx.x, tmx.y), tmx.z);
+            if (tFar < 0.0 || tNear > tFar) continue;
+            float tHit = max(tNear, 0.0);
+            if (tHit < bestT) {
+                float3 hit = ro + rd * tHit;
+                float3 center = (vmin + vmax) * 0.5;
+                float3 d = hit - center;
+                float3 absD = abs(d);
+                float maxC = max(max(absD.x, absD.y), absD.z);
+                float3 n = float3(0, 0, 0);
+                if      (absD.x >= maxC - 1e-3) n.x = d.x >= 0 ? 1.0 : -1.0;
+                else if (absD.y >= maxC - 1e-3) n.y = d.y >= 0 ? 1.0 : -1.0;
+                else                            n.z = d.z >= 0 ? 1.0 : -1.0;
+                bestT = tHit;
+                bestAlbedo = s.rgb;
+                bestN = n;
+                bestAo = aoN;
+                bestLodIdx = lodIdx;
+                anyHit = true;
+            }
+        }
+    }
+
+    if (anyHit) {
+        float3 hit = ro + rd * bestT;
+        float3 amb = SampleAmbientCubeTriplanar(bestN) * bestAo;
+        float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, SampleShadow(hit));
+        float3 lit = bestAlbedo * light;
+        float3 splatTint = (gColorizeClusters > 0.5) ? ClusterTint(2u + bestLodIdx) : float3(1.0, 1.0, 1.0);
+        o.color = float4(Tonemap(ApplyFog(lit * splatTint, hit)), 1.0);
+        // Use reprojected hit depth (more accurate than the neighbor pixel's
+        // splat depth, which is one of the source markers).
+        float4 clipHit = mul(float4(hit, 1.0), gViewProj);
+        o.depth = saturate(clipHit.z / max(clipHit.w, 1e-6));
+        return o;
+    }
+    // Pure background: signal alpha=0 so the post pass / sky takes over.
+    o.color = float4(0.0, 0.0, 0.0, 0.0);
+    return o;
+}
+
 [numthreads(8, 8, 1)]
 void csmain_splat(uint3 dt : SV_DispatchThreadID)
 {
@@ -643,16 +1053,34 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
     uint   bestMask   = 0x3Fu;
     bool   anyHit     = false;
 
+    float bestAo = 1.0;
+    uint  bestLodIdx = 0u;
     [loop] for (int dy = -R; dy <= R; ++dy) {
         [loop] for (int dx = -R; dx <= R; ++dx) {
             int2 sp = pix + int2(dx, dy);
             if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
-            float zN = gSplatDepth.Load(int3(sp, 0));
-            if (zN <= 0.0) continue;       // depth>0 marks filled (alpha = shadow)
             float4 s = gSplatColorSrv.Load(int3(sp, 0));
+            uint a8 = (uint)(s.a * 255.0 + 0.5);
+            if (a8 == 0u) continue;                // poly pixel or untouched bg
+            uint lodp1 = (a8 >> 6) & 3u;
+            if (lodp1 == 0u) continue;
+            uint lodIdx = lodp1 - 1u;
+            uint ao6    = a8 & 0x3Fu;
+            float aoN   = (float)ao6 / 63.0;
+            float halfExt = (lodIdx == 0u) ? 0.5
+                          : (lodIdx == 1u) ? 1.0
+                          : (lodIdx == 2u) ? 2.0
+                          :                  4.0;
+            float zN = gSplatDepth.Load(int3(sp, 0));
+            if (zN <= 0.0) continue;
             float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
-            float3 vmin = floor(wp);
-            float3 vmax = vmin + 1.0;
+            // Snap to LOD-aligned voxel grid so adjacent splats from the same
+            // cluster collapse to the same AABB. Without this, neighbor pixels
+            // produce offset overlapping cubes -> visible cube-edge seams on
+            // flat surfaces.
+            float S = 2.0 * halfExt;
+            float3 vmin = floor(wp / S) * S;
+            float3 vmax = vmin + S;
             float3 t0v = (vmin - ro) * invRd;
             float3 t1v = (vmax - ro) * invRd;
             float3 tmn = min(t0v, t1v);
@@ -674,7 +1102,9 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                 bestT      = tHit;
                 bestAlbedo = s.rgb;
                 bestN      = n;
-                bestMask   = (uint)(s.a * 255.0 + 0.5);
+                bestMask   = 0x3Fu;                // no per-face shadow mask now
+                bestAo     = aoN;
+                bestLodIdx = lodIdx;
                 anyHit     = true;
             }
         }
@@ -682,14 +1112,41 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
 
     if (anyHit) {
         float3 hit = ro + rd * bestT;
-        float3 amb = SampleAmbientCubeTriplanar(bestN);
-        float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, ShadowBitN(bestMask, bestN));
+        float3 amb = SampleAmbientCubeTriplanar(bestN) * bestAo;
+        float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, SampleShadow(hit));
         float3 lit = bestAlbedo * light;
-        gSplatFinalUav[pix] = float4(ApplyFog(lit, hit), 1.0);
+        // Splat CS: tint per pixel using the winning splat's LOD (gChunkTint
+        // cbuffer is per-chunk, meaningless for compute over the whole screen).
+        float3 splatTint = (gColorizeClusters > 0.5) ? ClusterTint(2u + bestLodIdx) : float3(1.0, 1.0, 1.0);
+        gSplatFinalUav[pix] = float4(Tonemap(ApplyFog(lit * splatTint, hit)), 1.0);
     } else {
+        // Fallback: read the un-reconstructed pixel and light it with a flat
+        // up-facing normal so far/empty regions stay coherent with the rest of
+        // the scene instead of going purple.
         float4 c0 = gSplatColorSrv.Load(int3(pix, 0));
-        gSplatFinalUav[pix] = float4(c0.rgb, 1.0);
+        uint a8 = (uint)(c0.a * 255.0 + 0.5);
+        if (a8 != 0u && ((a8 >> 6) & 3u) != 0u) {
+            float3 n = float3(0, 1, 0);
+            float3 amb = SampleAmbientCubeTriplanar(n);
+            float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, 1.0);
+            float3 wp = ReconstructNeighborWorld(pix, max(gSplatDepth.Load(int3(pix, 0)), 1e-6), W, H);
+            gSplatFinalUav[pix] = float4(Tonemap(ApplyFog(c0.rgb * light, wp)), 1.0);
+        } else {
+            // Pure background pixel: alpha = 0 lets the composite PS discard
+            // (preserves whatever main RT had — e.g. close PolyAxis draws).
+            gSplatFinalUav[pix] = float4(c0.rgb, 0.0);
+        }
     }
+}
+
+// Composite splat output over the main RT. Discards background pixels.
+Texture2D<float4> gSplatComposite : register(t8);
+float4 psmain_splat_composite(VBlitOut i) : SV_Target
+{
+    int2 pix = int2(i.pos.xy);
+    float4 c = gSplatComposite.Load(int3(pix, 0));
+    if (c.a < 0.5) discard;
+    return float4(c.rgb, 1.0);
 }
 
 // ---------------- AtlasMesh technique ----------------
@@ -724,19 +1181,22 @@ VSAtlasOut vsmain_atlas(VSAtlasIn i)
 float4 psmain_atlas(VSAtlasOut i) : SV_Target
 {
     int2 tx = int2(i.uv);                            // truncate -> exact texel
-    float3 col = gAtlasTex.Load(int3(tx, 0)).rgb;
+    float4 texel = gAtlasTex.Load(int3(tx, 0));
+    float3 col = texel.rgb;
+    float  ao  = texel.a;                            // alpha = baked AO
     float3 n = kFaceNormals[i.face & 7];
 
     int mode = (int)gMode;
     float fogDist = length(i.wpos - gCamPos);
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     if (mode == 1) return float4(ApplyFog(col, i.wpos), 1.0);
+    if (mode == 3) return float4(ApplyFog(ao.xxx, i.wpos), 1.0);
 
     float ndotl = saturate(dot(n, normalize(gLightDir)));
-    float3 amb  = kAmbientCube[i.face & 7];
+    float3 amb  = kAmbientCube[i.face & 7] * ao;
     float3 sun  = float3(1.10, 1.00, 0.85) * 1.5  * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(col * light, i.wpos), 1.0);
+    return float4(TonemapTinted(ApplyFog(col * light, i.wpos)), 1.0);
 }
 
 // ---------------- MergedMesh technique ----------------
@@ -771,11 +1231,12 @@ float4 psmain_merged(VSMergedOut i) : SV_Target
     float fogDist = length(i.wpos - gCamPos);
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
+    if (mode == 3) return float4(ApplyFog(float3(0.5, 0.5, 0.5), i.wpos), 1.0); // merged: no AO
     float ndotl = saturate(dot(n, normalize(gLightDir)));
     float3 amb  = SampleAmbientCubeTriplanar(n);
     float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
     float3 light = amb + gAmbient * sun;
-    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
+    return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
 }
 
 // ---------------- Billboard technique ----------------
@@ -787,6 +1248,7 @@ struct VSBillOut {
     nointerpolation float3 boxMax : BMAX;
     nointerpolation float3 col    : COL;
     nointerpolation uint shadowMask : SHADOW;
+    nointerpolation float ao : AO;
 };
 
 // Shared code for both billboard variants: emits one vertex of an axis-aligned
@@ -814,7 +1276,8 @@ VSBillOut BillboardVertex(uint voxelIdx, float2 s)
     o.col    = float3((v.col >>  0u) & 0xFFu,
                       (v.col >>  8u) & 0xFFu,
                       (v.col >> 16u) & 0xFFu) / 255.0;
-    o.shadowMask = ShadowMaskFromAux(v.pck.y >> 16u);
+    o.shadowMask = 0xFFu;
+    o.ao         = AoFromAux(v.pck.y >> 16u);
     return o;
 }
 
@@ -892,10 +1355,11 @@ float4 psmain_billboard(VSBillOut i,
     int mode = (int)gMode;
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, hit), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col, hit), 1.0);
+    if (mode == 3) return float4(ApplyFog(i.ao.xxx, hit), 1.0);
 
-    float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n));
-    return float4(ApplyFog(i.col * light, hit), 1.0);
+    float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(hit));
+    return float4(TonemapTinted(ApplyFog(i.col * light, hit)), 1.0);
 }
 
 // ---------------- HexSprite technique ----------------
@@ -912,6 +1376,7 @@ struct VSHexOut {
     float3 wpos  : WPOS;
     float3 col   : COL;
     nointerpolation uint shadowMask : SHADOW;
+    nointerpolation float ao : AO;
 };
 
 VSHexOut vsmain_hex(VSHexIn i)
@@ -951,7 +1416,8 @@ VSHexOut vsmain_hex(VSHexIn i)
     o.svpos = mul(float4(world, 1.0), gViewProj);
     o.wpos  = world;
     o.col   = float3(i.inst_col.rgb) / 255.0;
-    o.shadowMask = ShadowMaskFromAux(i.inst_pck.w);
+    o.shadowMask = 0xFFu;
+    o.ao         = AoFromAux(i.inst_pck.w);
     return o;
 }
 
@@ -965,10 +1431,11 @@ float4 psmain_hex(VSHexOut i) : SV_Target
     float fogDist = length(i.wpos - gCamPos);
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
+    if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
 
-    float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n));
-    return float4(ApplyFog(i.col * light, i.wpos), 1.0);
+    float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
+    return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
 }
 
 // ---------------- Polygon technique ----------------
@@ -989,8 +1456,9 @@ float4 psmain(VSOut i) : SV_Target
     float fogDist = length(i.wpos - gCamPos);
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col.rgb, i.wpos), 1.0);
+    if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
 
-    float3 amb  = SampleAmbientCubeTriplanar(n);  // axis-aligned n => single bucket
-    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n));
-    return float4(ApplyFog(i.col.rgb * light, i.wpos), 1.0);
+    float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
+    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
+    return float4(TonemapTinted(ApplyFog(i.col.rgb * light, i.wpos)), 1.0);
 }

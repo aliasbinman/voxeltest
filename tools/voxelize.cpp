@@ -10,7 +10,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <array>
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <intrin.h>
 
@@ -50,9 +52,13 @@ struct VKeyHash {
 };
 
 #pragma pack(push, 1)
-struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint32_t color; };
+struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint32_t color; uint8_t ao[6]; };
 #pragma pack(pop)
-static_assert(sizeof(DiskVoxel) == 8, "");
+static_assert(sizeof(DiskVoxel) == 14, "");
+
+// In-memory voxel record. Color RGB + per-face AO (one byte per cardinal
+// face, indexed by kFaceDelta order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
+struct VoxData { uint32_t color; uint8_t ao[6]; };
 
 // Face order must match vox_loader.cpp:
 // 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
@@ -71,13 +77,14 @@ static_assert(sizeof(ChunkMeta) == 16, "");
 
 static inline uint32_t PackRGBA(float r, float g, float b) {
     auto q = [](float v) -> uint32_t {
-        if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+        v = std::clamp(v, 0.0f, 1.0f);
         return (uint32_t)(v * 255.0f + 0.5f);
     };
     return q(r) | (q(g) << 8) | (q(b) << 16) | (255u << 24);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     const char* in  = argc > 1 ? argv[1] : "assets/rungholt/rungholt.obj";
     const char* out = argc > 2 ? argv[2] : "assets/rungholt.vox";
 
@@ -91,7 +98,7 @@ int main(int argc, char** argv) {
     printf("OBJ tris=%llu  subs=%zu\n",
            (unsigned long long)scene.totalTriangles, scene.subs.size());
 
-    std::unordered_map<VKey, uint32_t, VKeyHash> voxels;
+    std::unordered_map<VKey, VoxData, VKeyHash> voxels;
     voxels.reserve(4u << 20);
 
     for (const auto& s : scene.subs) {
@@ -110,7 +117,8 @@ int main(int argc, char** argv) {
             float vy = cy - 0.5f * a.ny;
             float vz = cz - 0.5f * a.nz;
             VKey k{ (int32_t)floorf(vx), (int32_t)floorf(vy), (int32_t)floorf(vz) };
-            voxels.emplace(k, a.color);
+            VoxData vd{ a.color, { 0, 0, 0, 0, 0, 0 } };
+            voxels.emplace(k, vd);
         }
     }
     printf("Unique voxels: %zu\n", voxels.size());
@@ -119,95 +127,237 @@ int main(int argc, char** argv) {
     int32_t minX = INT32_MAX, minY = INT32_MAX, minZ = INT32_MAX;
     int32_t maxX = INT32_MIN, maxY = INT32_MIN, maxZ = INT32_MIN;
     for (auto& kv : voxels) {
-        if (kv.first.x < minX) minX = kv.first.x;
-        if (kv.first.y < minY) minY = kv.first.y;
-        if (kv.first.z < minZ) minZ = kv.first.z;
-        if (kv.first.x > maxX) maxX = kv.first.x;
-        if (kv.first.y > maxY) maxY = kv.first.y;
-        if (kv.first.z > maxZ) maxZ = kv.first.z;
+        minX = std::min(minX, kv.first.x);
+        minY = std::min(minY, kv.first.y);
+        minZ = std::min(minZ, kv.first.z);
+        maxX = std::max(maxX, kv.first.x);
+        maxY = std::max(maxY, kv.first.y);
+        maxZ = std::max(maxZ, kv.first.z);
     }
     printf("Voxel AABB: (%d,%d,%d) .. (%d,%d,%d)\n", minX, minY, minZ, maxX, maxY, maxZ);
 
-    // ---------------------------------------------------------------------
-    // Sun shadow pass. Per face (not per voxel) — DDA from face center along
-    // sun. Voxel-center origin self-occludes against same-wall voxels above,
-    // darkening exposed side faces. Face-center origin starts in the empty
-    // neighbor cell so the DDA only catches actual occluders.
-    // Result: 6-bit mask in color alpha, bit i = face i lit (1) / shadowed (0).
-    // Face order matches kFaceDelta: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
-    // ---------------------------------------------------------------------
+    // Sun direction is written to the file for runtime lighting (no longer
+    // pre-baked into per-face shadow; runtime does sun shading).
     float sunDirX = 0.4f, sunDirY = 0.8f, sunDirZ = 0.2f;
     {
         float len = sqrtf(sunDirX*sunDirX + sunDirY*sunDirY + sunDirZ*sunDirZ);
         sunDirX /= len; sunDirY /= len; sunDirZ /= len;
     }
+
+    // ---------------------------------------------------------------------
+    // AO bake (per voxel, hemisphere raycast).
+    // For each exposed face, cast N cosine-weighted rays into the outer
+    // hemisphere; count hits within kAoMaxSteps cells. Voxel AO = average
+    // (1 - hitFraction) across exposed faces. Stored in color alpha (0..255,
+    // 0 = fully occluded, 255 = fully open).
+    // ---------------------------------------------------------------------
+    int32_t spanX0 = maxX - minX + 1;
+    int32_t spanY0 = maxY - minY + 1;
+    int32_t spanZ0 = maxZ - minZ + 1;
+    std::vector<uint8_t> filledBitmap(((size_t)spanX0 * spanY0 * spanZ0 + 7) / 8, 0);
+    auto bIdx0 = [&](int x, int y, int z) -> size_t {
+        return (size_t)((z - minZ) * spanY0 + (y - minY)) * (size_t)spanX0 + (size_t)(x - minX);
+    };
+    for (auto& kv : voxels) {
+        size_t i = bIdx0(kv.first.x, kv.first.y, kv.first.z);
+        filledBitmap[i >> 3] |= (uint8_t)(1u << (i & 7));
+    }
+    auto isFilledBM = [&](int x, int y, int z) -> bool {
+        if (x < minX || x > maxX || y < minY || y > maxY || z < minZ || z > maxZ) return false;
+        size_t i = bIdx0(x, y, z);
+        return (filledBitmap[i >> 3] >> (i & 7)) & 1u;
+    };
     {
-        int32_t spX = maxX - minX + 1;
-        int32_t spY = maxY - minY + 1;
-        int32_t spZ = maxZ - minZ + 1;
-        std::vector<uint8_t> filled(((size_t)spX * spY * spZ + 7) / 8, 0);
-        auto bidx = [&](int x, int y, int z) -> size_t {
-            return (size_t)((z - minZ) * spY + (y - minY)) * (size_t)spX + (size_t)(x - minX);
-        };
-        for (auto& kv : voxels) {
-            size_t i = bidx(kv.first.x, kv.first.y, kv.first.z);
-            filled[i >> 3] |= (uint8_t)(1u << (i & 7));
-        }
-        auto isFilledFast = [&](int x, int y, int z) -> bool {
-            if (x < minX || x > maxX || y < minY || y > maxY || z < minZ || z > maxZ) return false;
-            size_t i = bidx(x, y, z);
-            return (filled[i >> 3] >> (i & 7)) & 1u;
+        const int kAoSamples = 48;
+        const int kAoMaxSteps = 14;
+        const float kTwoPi = 6.2831853071795864f;
+
+        // Hammersley (van der Corput) for sample i in [0,N).
+        auto Hammersley = [&](int i, float& u, float& v) {
+            u = (float)i / (float)kAoSamples;
+            uint32_t b = (uint32_t)i;
+            b = ((b & 0x55555555u) << 1) | ((b & 0xAAAAAAAAu) >> 1);
+            b = ((b & 0x33333333u) << 2) | ((b & 0xCCCCCCCCu) >> 2);
+            b = ((b & 0x0F0F0F0Fu) << 4) | ((b & 0xF0F0F0F0u) >> 4);
+            b = ((b & 0x00FF00FFu) << 8) | ((b & 0xFF00FF00u) >> 8);
+            b = (b << 16) | (b >> 16);
+            v = (float)b * 2.3283064365386963e-10f;
         };
 
-        // Amanatides-Woo DDA toward sun. Per-face origin = voxel center +
-        // 0.501 * faceNormal (just past the face into the empty neighbor).
-        const float invX = (fabsf(sunDirX) > 1e-6f) ? 1.0f / fabsf(sunDirX) : 1e30f;
-        const float invY = (fabsf(sunDirY) > 1e-6f) ? 1.0f / fabsf(sunDirY) : 1e30f;
-        const float invZ = (fabsf(sunDirZ) > 1e-6f) ? 1.0f / fabsf(sunDirZ) : 1e30f;
-        const int stepX = sunDirX > 0 ? 1 : (sunDirX < 0 ? -1 : 0);
-        const int stepY = sunDirY > 0 ? 1 : (sunDirY < 0 ? -1 : 0);
-        const int stepZ = sunDirZ > 0 ? 1 : (sunDirZ < 0 ? -1 : 0);
-        const int kMaxSteps = (maxX - minX) + (maxY - minY) + (maxZ - minZ) + 16;
-        uint64_t litFaces = 0, shadowedFaces = 0;
-        for (auto& kv : voxels) {
-            uint8_t mask = 0;
+        // Snapshot map entries into a vector so OpenMP can parallelize by index.
+        // Pointers into the unordered_map's values stay valid while we no
+        // longer insert/erase from `voxels`.
+        std::vector<std::pair<VKey, VoxData*>> voxList;
+        voxList.reserve(voxels.size());
+        for (auto& kv : voxels) voxList.emplace_back(kv.first, &kv.second);
+
+        uint64_t totalRays = 0, totalHits = 0;
+        double aoSumAll = 0.0; uint64_t aoVoxels = 0; uint64_t aoFaces = 0;
+        const int64_t voxTot = (int64_t)voxList.size();
+        printf("AO bake start: %lld voxels, samples=%d, maxSteps=%d\n",
+               (long long)voxTot, kAoSamples, kAoMaxSteps);
+        fflush(stdout);
+
+        std::atomic<int64_t> progress{0};
+        const int64_t reportStride = voxTot / 10;
+        #pragma omp parallel for schedule(dynamic, 256) \
+                    reduction(+:totalRays) reduction(+:totalHits) \
+                    reduction(+:aoSumAll)  reduction(+:aoVoxels) reduction(+:aoFaces)
+        for (int64_t li = 0; li < voxTot; ++li) {
+            const VKey  k  = voxList[(size_t)li].first;
+            VoxData*    vd = voxList[(size_t)li].second;
+            int vx = k.x, vy = k.y, vz = k.z;
+            // Per-voxel Cranley-Patterson rotation: shifts the Hammersley
+            // sequence by a hash of voxel coords so adjacent voxels don't
+            // share identical sample directions (kills banding on flat
+            // surfaces sitting next to occluders).
+            uint32_t h = (uint32_t)vx * 0x9E3779B1u
+                       ^ (uint32_t)vy * 0x85EBCA77u
+                       ^ (uint32_t)vz * 0xC2B2AE3Du;
+            h ^= h >> 16; h *= 0x7FEB352Du;
+            h ^= h >> 15; h *= 0x846CA68Bu;
+            h ^= h >> 16;
+            float jitU = (float)(h & 0xFFFFu)         * (1.0f / 65536.0f);
+            float jitV = (float)((h >> 16) & 0xFFFFu) * (1.0f / 65536.0f);
+            // Per-face AO; interior face stays 0 (won't be rendered).
+            for (int fi = 0; fi < 6; ++fi) { vd->ao[fi] = 0; }
+            bool anyExposed = false;
             for (int fi = 0; fi < 6; ++fi) {
-                // Faces whose normal points away from sun (n·sun <= 0) never
-                // get direct light. Mark shadowed without tracing.
-                float fnDotSun = kFaceDelta[fi][0] * sunDirX
-                               + kFaceDelta[fi][1] * sunDirY
-                               + kFaceDelta[fi][2] * sunDirZ;
-                if (fnDotSun <= 0.0f) { ++shadowedFaces; continue; }
+                int nxF = vx + kFaceDelta[fi][0];
+                int nyF = vy + kFaceDelta[fi][1];
+                int nzF = vz + kFaceDelta[fi][2];
+                if (isFilledBM(nxF, nyF, nzF)) continue;     // interior face
+                anyExposed = true;
 
-                float ox = (float)kv.first.x + 0.5f + 0.501f * (float)kFaceDelta[fi][0];
-                float oy = (float)kv.first.y + 0.5f + 0.501f * (float)kFaceDelta[fi][1];
-                float oz = (float)kv.first.z + 0.5f + 0.501f * (float)kFaceDelta[fi][2];
-                int ix = (int)floorf(ox), iy = (int)floorf(oy), iz = (int)floorf(oz);
-                float fx = ox - (float)ix, fy = oy - (float)iy, fz = oz - (float)iz;
-                float tMaxX = (stepX > 0) ? (1.0f - fx) * invX
-                            : (stepX < 0) ? fx * invX : 1e30f;
-                float tMaxY = (stepY > 0) ? (1.0f - fy) * invY
-                            : (stepY < 0) ? fy * invY : 1e30f;
-                float tMaxZ = (stepZ > 0) ? (1.0f - fz) * invZ
-                            : (stepZ < 0) ? fz * invZ : 1e30f;
-                bool hit = false;
-                // Origin cell itself can be filled (concave geometry); skip
-                // initial check, only test cells we step into.
-                for (int s = 0; s < kMaxSteps; ++s) {
-                    if (tMaxX < tMaxY && tMaxX < tMaxZ) { ix += stepX; tMaxX += invX; }
-                    else if (tMaxY < tMaxZ)             { iy += stepY; tMaxY += invY; }
-                    else                                { iz += stepZ; tMaxZ += invZ; }
-                    if (ix < minX || ix > maxX || iy < minY || iy > maxY || iz < minZ || iz > maxZ) break;
-                    if (isFilledFast(ix, iy, iz)) { hit = true; break; }
+                float Nx = (float)kFaceDelta[fi][0];
+                float Ny = (float)kFaceDelta[fi][1];
+                float Nz = (float)kFaceDelta[fi][2];
+                // Axis-aligned tangent frame.
+                float Tx, Ty, Tz, Bx, By, Bz;
+                if (fi < 2)      { Tx = 0; Ty = 1; Tz = 0; Bx = 0; By = 0; Bz = 1; }
+                else if (fi < 4) { Tx = 1; Ty = 0; Tz = 0; Bx = 0; By = 0; Bz = 1; }
+                else             { Tx = 1; Ty = 0; Tz = 0; Bx = 0; By = 1; Bz = 0; }
+
+                int hits = 0;
+                for (int s = 0; s < kAoSamples; ++s) {
+                    float u, v;
+                    Hammersley(s, u, v);
+                    u += jitU; u -= floorf(u);
+                    v += jitV; v -= floorf(v);
+                    float r = sqrtf(u);
+                    float theta = kTwoPi * v;
+                    float a = r * cosf(theta);
+                    float b = r * sinf(theta);
+                    float c = sqrtf(fmaxf(0.0f, 1.0f - u));
+                    float dx = a * Tx + b * Bx + c * Nx;
+                    float dy = a * Ty + b * By + c * Ny;
+                    float dz = a * Tz + b * Bz + c * Nz;
+
+                    float ox = (float)vx + 0.5f + 0.501f * Nx;
+                    float oy = (float)vy + 0.5f + 0.501f * Ny;
+                    float oz = (float)vz + 0.5f + 0.501f * Nz;
+                    int ix = (int)floorf(ox), iy = (int)floorf(oy), iz = (int)floorf(oz);
+                    float fx = ox - (float)ix, fy = oy - (float)iy, fz = oz - (float)iz;
+                    int sx = dx > 0.0f ? 1 : (dx < 0.0f ? -1 : 0);
+                    int sy = dy > 0.0f ? 1 : (dy < 0.0f ? -1 : 0);
+                    int sz = dz > 0.0f ? 1 : (dz < 0.0f ? -1 : 0);
+                    float invDx = (fabsf(dx) > 1e-6f) ? 1.0f / fabsf(dx) : 1e30f;
+                    float invDy = (fabsf(dy) > 1e-6f) ? 1.0f / fabsf(dy) : 1e30f;
+                    float invDz = (fabsf(dz) > 1e-6f) ? 1.0f / fabsf(dz) : 1e30f;
+                    float tmx = sx > 0 ? (1.0f - fx) * invDx : sx < 0 ? fx * invDx : 1e30f;
+                    float tmy = sy > 0 ? (1.0f - fy) * invDy : sy < 0 ? fy * invDy : 1e30f;
+                    float tmz = sz > 0 ? (1.0f - fz) * invDz : sz < 0 ? fz * invDz : 1e30f;
+                    bool hit = false;
+                    for (int step = 0; step < kAoMaxSteps; ++step) {
+                        if (tmx < tmy && tmx < tmz)      { ix += sx; tmx += invDx; }
+                        else if (tmy < tmz)              { iy += sy; tmy += invDy; }
+                        else                             { iz += sz; tmz += invDz; }
+                        if (isFilledBM(ix, iy, iz)) { hit = true; break; }
+                    }
+                    if (hit) ++hits;
+                    ++totalRays;
                 }
-                if (hit) ++shadowedFaces;
-                else { mask |= (uint8_t)(1u << fi); ++litFaces; }
+                totalHits += hits;
+                float faceAo = 1.0f - (float)hits / (float)kAoSamples;
+                uint32_t aoByte = (uint32_t)(faceAo * 255.0f + 0.5f);
+                aoByte = std::clamp(aoByte, 1u, 255u);   // reserve 0 as "no data"
+                vd->ao[fi] = (uint8_t)aoByte;
+                aoSumAll += faceAo; ++aoFaces;
             }
-            kv.second = (kv.second & 0x00FFFFFFu) | ((uint32_t)mask << 24);
+            if (anyExposed) ++aoVoxels;
+
+            // Lock-free progress report.
+            if (reportStride > 0) {
+                int64_t done = progress.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (done % reportStride == 0) {
+                    int pct = (int)((done * 100) / voxTot);
+                    printf("  AO bake %d%%\n", pct);
+                    fflush(stdout);
+                }
+            }
         }
-        printf("Sun shadow (per-face): %llu lit, %llu shadowed (sunDir = %.3f, %.3f, %.3f)\n",
-               (unsigned long long)litFaces, (unsigned long long)shadowedFaces,
-               sunDirX, sunDirY, sunDirZ);
+        printf("AO bake: %llu rays, %.1f%% hit, avg face AO %.3f (samples=%d, maxSteps=%d)\n",
+               (unsigned long long)totalRays,
+               totalRays ? 100.0 * (double)totalHits / (double)totalRays : 0.0,
+               aoFaces ? aoSumAll / (double)aoFaces : 0.0,
+               kAoSamples, kAoMaxSteps);
+
+        // Per-face smoothing, parallelized. aoArr[i][fi] mirrors voxList[i]'s
+        // current AO; threads read aoArr concurrently and write to a fresh
+        // `next` vector, no races. keyIdx maps VKey -> voxList index for
+        // tangent-neighbor lookups.
+        std::vector<std::array<uint8_t,6>> aoArr(voxList.size());
+        std::unordered_map<VKey, uint32_t, VKeyHash> keyIdx;
+        keyIdx.reserve(voxList.size());
+        for (size_t i = 0; i < voxList.size(); ++i) {
+            keyIdx[voxList[i].first] = (uint32_t)i;
+            for (int fi = 0; fi < 6; ++fi) aoArr[i][fi] = voxList[i].second->ao[fi];
+        }
+        const int kTan[6][4][3] = {
+            {{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}},
+            {{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}},
+            {{1,0,0},{-1,0,0},{0,0,1},{0,0,-1}},
+            {{1,0,0},{-1,0,0},{0,0,1},{0,0,-1}},
+            {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0}},
+            {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0}},
+        };
+        const int kSmoothIters = 2;
+        std::vector<std::array<uint8_t,6>> next(voxList.size());
+        for (int iter = 0; iter < kSmoothIters; ++iter) {
+            printf("  AO smooth iter %d/%d\n", iter + 1, kSmoothIters);
+            fflush(stdout);
+            #pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < (int64_t)voxList.size(); ++i) {
+                const VKey k = voxList[(size_t)i].first;
+                std::array<uint8_t,6> nv{};
+                const std::array<uint8_t,6>& self = aoArr[(size_t)i];
+                for (int fi = 0; fi < 6; ++fi) {
+                    if (self[fi] == 0) { nv[fi] = 0; continue; }
+                    uint32_t sum = self[fi];
+                    int cnt = 1;
+                    for (int t = 0; t < 4; ++t) {
+                        VKey nk{ k.x + kTan[fi][t][0],
+                                 k.y + kTan[fi][t][1],
+                                 k.z + kTan[fi][t][2] };
+                        auto it = keyIdx.find(nk);
+                        if (it == keyIdx.end()) continue;
+                        uint8_t na = aoArr[it->second][fi];
+                        if (na == 0) continue;
+                        sum += na;
+                        ++cnt;
+                    }
+                    uint8_t a = (uint8_t)(sum / (uint32_t)cnt);
+                    a = std::max(a, (uint8_t)1);
+                    nv[fi] = a;
+                }
+                next[(size_t)i] = nv;
+            }
+            aoArr.swap(next);
+        }
+        for (size_t i = 0; i < voxList.size(); ++i) {
+            for (int fi = 0; fi < 6; ++fi) voxList[i].second->ao[fi] = aoArr[i][fi];
+        }
+        printf("AO smoothing: %d iters of 4-tangent-neighbor average (per face)\n", kSmoothIters);
     }
 
     struct CKey { uint16_t x, y, z; };
@@ -218,9 +368,40 @@ int main(int argc, char** argv) {
     };
     struct CKeyEq { bool operator()(const CKey& a, const CKey& b) const { return a.x == b.x && a.y == b.y && a.z == b.z; } };
 
+    // Pre-pass: for each (x, z) column, find the highest y. Used to keep
+    // only the top voxel on the four extreme XZ walls (min/max X, min/max Z).
+    // Bottom layer (y == minY) is dropped entirely.
+    struct ColKey { int32_t x, z; };
+    struct ColHash { size_t operator()(const ColKey& k) const noexcept {
+        return ((size_t)(uint32_t)k.x * 73856093u) ^ ((size_t)(uint32_t)k.z * 83492791u);
+    }};
+    struct ColEq { bool operator()(const ColKey& a, const ColKey& b) const { return a.x == b.x && a.z == b.z; } };
+    std::unordered_map<ColKey, int32_t, ColHash, ColEq> colTopY;
+    colTopY.reserve(voxels.size());
+    for (auto& kv : voxels) {
+        ColKey c{ kv.first.x, kv.first.z };
+        auto it = colTopY.find(c);
+        if (it == colTopY.end()) colTopY.emplace(c, kv.first.y);
+        else if (kv.first.y > it->second) it->second = kv.first.y;
+    }
+    uint64_t droppedBottom = 0, droppedEdge = 0;
+
     std::unordered_map<CKey, std::vector<DiskVoxel>, CKeyHash, CKeyEq> chunks;
     uint64_t visibleFaces = 0;
     for (auto& kv : voxels) {
+        // Drop entire bottom layer.
+        if (kv.first.y == minY) { ++droppedBottom; continue; }
+        // Extreme XZ edges: keep only the topmost voxel in that column.
+        const bool onEdgeXZ = (kv.first.x == minX || kv.first.x == maxX
+                            || kv.first.z == minZ || kv.first.z == maxZ);
+        if (onEdgeXZ) {
+            ColKey c{ kv.first.x, kv.first.z };
+            auto it = colTopY.find(c);
+            if (it != colTopY.end() && kv.first.y != it->second) {
+                ++droppedEdge;
+                continue;
+            }
+        }
         int32_t rx = kv.first.x - minX;
         int32_t ry = kv.first.y - minY;
         int32_t rz = kv.first.z - minZ;
@@ -233,6 +414,10 @@ int main(int argc, char** argv) {
                     kv.first.z + kFaceDelta[fi][2] };
             if (voxels.find(n) == voxels.end()) mask |= (uint8_t)(1u << fi);
         }
+        // Drop the -Y (downward) face: never seen from above. Voxels whose
+        // ONLY visible face was -Y get culled entirely.
+        mask &= (uint8_t)~0x08u;
+        if (mask == 0) continue;
         visibleFaces += __popcnt(mask);
 
         DiskVoxel v;
@@ -240,7 +425,8 @@ int main(int argc, char** argv) {
         v.y = (uint8_t)(ry % CHUNK_DIM);
         v.z = (uint8_t)(rz % CHUNK_DIM);
         v.visMask = mask;
-        v.color = kv.second;
+        v.color = kv.second.color;
+        for (int fi = 0; fi < 6; ++fi) v.ao[fi] = kv.second.ao[fi];
         chunks[ck].push_back(v);
     }
     printf("Visible faces (after neighbor cull): %llu (avg %.2f/voxel)\n",
@@ -314,7 +500,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint32_t> colorGrid((size_t)spanX * spanY * spanZ, 0);
     for (auto& kv : voxels) {
-        colorGrid[bitIdx(kv.first.x, kv.first.y, kv.first.z)] = kv.second;
+        colorGrid[bitIdx(kv.first.x, kv.first.y, kv.first.z)] = kv.second.color;
     }
 
     // ---------------------------------------------------------------------
@@ -398,12 +584,23 @@ int main(int argc, char** argv) {
         uint64_t culledFaces = 0;
         uint32_t droppedVoxels = 0;
         for (auto& kv : voxels) {
+            // Bottom-layer + edge-walls cull (matches uncculled pass).
+            if (kv.first.y == minY) { ++droppedVoxels; continue; }
+            const bool onEdgeXZ2 = (kv.first.x == minX || kv.first.x == maxX
+                                 || kv.first.z == minZ || kv.first.z == maxZ);
+            if (onEdgeXZ2) {
+                ColKey c{ kv.first.x, kv.first.z };
+                auto it = colTopY.find(c);
+                if (it != colTopY.end() && kv.first.y != it->second) { ++droppedVoxels; continue; }
+            }
             uint8_t mask = 0;
             for (int fi = 0; fi < 6; ++fi) {
                 if (faceExposed(kv.first.x, kv.first.y, kv.first.z, fi)) {
                     mask |= (uint8_t)(1u << fi);
                 }
             }
+            // Drop -Y (downward) face — never seen from above.
+            mask &= (uint8_t)~0x08u;
             if (mask == 0) { ++droppedVoxels; continue; }
             culledFaces += __popcnt(mask);
             int32_t rx = kv.first.x - minX;
@@ -415,7 +612,8 @@ int main(int argc, char** argv) {
             dv.y = (uint8_t)(ry % CHUNK_DIM);
             dv.z = (uint8_t)(rz % CHUNK_DIM);
             dv.visMask = mask;
-            dv.color = kv.second;
+            dv.color = kv.second.color;
+            for (int fi = 0; fi < 6; ++fi) dv.ao[fi] = kv.second.ao[fi];
             cChunks[ck].push_back(dv);
         }
         for (auto& kv : cChunks) {
@@ -500,10 +698,12 @@ int main(int argc, char** argv) {
                         int ny = xyz[1] + kFaceDelta[fi][1];
                         int nz = xyz[2] + kFaceDelta[fi][2];
                         if (isFilled(nx, ny, nz)) continue;
+                        // Strip alpha (per-voxel baked AO) so greedy merge keys
+                        // on RGB only — otherwise voxels with identical color
+                        // but different AO split into many 1x1 quads. MSH1
+                        // doesn't carry AO (no per-vertex storage).
                         uint32_t color = colorGrid[bitIdx(xyz[0], xyz[1], xyz[2])];
-                        // Avoid zero colour collision: encode "present" via low bit
-                        // of alpha. Our packed color always has A=255 so col!=0.
-                        mask2D[(size_t)uu + (size_t)vv * spanUu] = color;
+                        mask2D[(size_t)uu + (size_t)vv * spanUu] = (color & 0x00FFFFFFu) | 0xFF000000u;
                     }
                 }
 
@@ -646,9 +846,9 @@ int main(int argc, char** argv) {
         int chunkMinX = minX + cx * CD;
         int chunkMinY = minY + cy * CD;
         int chunkMinZ = minZ + cz * CD;
-        int chunkMaxX = chunkMinX + CD - 1; if (chunkMaxX > maxX) chunkMaxX = maxX;
-        int chunkMaxY = chunkMinY + CD - 1; if (chunkMaxY > maxY) chunkMaxY = maxY;
-        int chunkMaxZ = chunkMinZ + CD - 1; if (chunkMaxZ > maxZ) chunkMaxZ = maxZ;
+        int chunkMaxX = std::min(chunkMinX + CD - 1, maxX);
+        int chunkMaxY = std::min(chunkMinY + CD - 1, maxY);
+        int chunkMaxZ = std::min(chunkMinZ + CD - 1, maxZ);
 
         size_t firstRectIdx = rects.size();
         int    abMin[3] = { INT32_MAX, INT32_MAX, INT32_MAX };
@@ -686,7 +886,15 @@ int main(int argc, char** argv) {
                             if (!faceExposed(xyz[0], xyz[1], xyz[2], fi)) continue;
                             size_t idx = (size_t)uu + (size_t)vv * spanU;
                             mask[idx] = 1;
-                            col[idx]  = colorGrid[bitIdx(xyz[0], xyz[1], xyz[2])];
+                            // Atlas pixel: RGB = voxel color, alpha = this
+                            // face's baked AO (looked up per voxel; greedy
+                            // merge keys on visibility mask, not color, so
+                            // per-pixel AO doesn't hurt merge ratio).
+                            uint32_t rgb = colorGrid[bitIdx(xyz[0], xyz[1], xyz[2])] & 0x00FFFFFFu;
+                            VKey vk{ xyz[0], xyz[1], xyz[2] };
+                            auto it = voxels.find(vk);
+                            uint32_t aoByte = (it != voxels.end()) ? (uint32_t)it->second.ao[fi] : 0u;
+                            col[idx] = rgb | (aoByte << 24);
                         }
                     }
 
@@ -858,7 +1066,7 @@ int main(int argc, char** argv) {
     for (auto& r : rects) totalArea += (uint64_t)r.w * r.h;
     uint32_t atlasW = 64;
     while ((uint64_t)atlasW * atlasW < totalArea * 4 / 3) atlasW *= 2;
-    if (atlasW > 16384) atlasW = 16384;
+    atlasW = std::min(atlasW, 16384u);
 
     // Shelf pack, tallest first.
     std::vector<size_t> order(rects.size());
@@ -884,7 +1092,7 @@ int main(int argc, char** argv) {
     }
     uint32_t atlasH = shelfY + shelfH;
     atlasH = (atlasH + 3u) & ~3u;
-    if (atlasH < 4) atlasH = 4;
+    atlasH = std::max(atlasH, 4u);
 
     double atlasMB = (double)atlasW * atlasH * 4.0 / (1024.0 * 1024.0);
     printf("Atlas: %u x %u (%.2f MB, fill %.1f%%)\n",
