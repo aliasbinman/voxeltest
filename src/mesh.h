@@ -35,6 +35,8 @@ struct SubMesh {
     uint32_t pointCountL1 = 0;
     uint32_t pointFirstL2 = 0;
     uint32_t pointCountL2 = 0;
+    uint32_t pointFirstL3 = 0;
+    uint32_t pointCountL3 = 0;
     float    aabbMin[3]   = { 0, 0, 0 };
     float    aabbMax[3]   = { 0, 0, 0 };
     float    chunkBase[3] = { 0, 0, 0 };  // world-space offset added to local xyz

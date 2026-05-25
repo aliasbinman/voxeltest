@@ -20,6 +20,7 @@ struct GpuSubMesh {
     uint32_t pointCount;
     uint32_t pointFirstL1, pointCountL1;
     uint32_t pointFirstL2, pointCountL2;
+    uint32_t pointFirstL3, pointCountL3;
     float    aabbMin[3];
     float    aabbMax[3];
     float    chunkBase[3];
@@ -71,7 +72,8 @@ enum class PointLod : int {
     L0   = 0,           // 1 point per voxel
     L1   = 1,           // 1 point per 2x2x2 (avg color)
     L2   = 2,           // 1 point per 4x4x4 (avg color)
-    Auto = 3,           // pick per-chunk by distance
+    L3   = 3,           // 1 point per 8x8x8 (avg color)
+    Auto = 4,           // pick per-chunk by distance
 };
 
 struct DrawSceneParams {
@@ -101,6 +103,8 @@ struct DrawSceneParams {
     float          roughness        = 0.6f;
     bool           sunShadows       = false;
     bool           colorizeClusters = false;
+    bool           closeEnabled     = true;
+    bool           farEnabled       = true;
 };
 
 class Renderer {
@@ -225,6 +229,8 @@ private:
     ComPtr<ID3D11VertexShader>         vsShadow_;
     ComPtr<ID3D11RasterizerState>      rsShadow_;
     uint32_t                           shadowSize_ = 2048;
+    float                              shadowLastSunDir_[3] = { 0.0f, 0.0f, 0.0f };
+    bool                               shadowValid_ = false;
 
     ComPtr<ID3D11InputLayout>    inputLayout_;
     ComPtr<ID3D11InputLayout>    inputLayoutHex_;
@@ -276,6 +282,8 @@ private:
     uint64_t lastPointCount_ = 0;
     float    sceneSpan_[3] = { 0, 0, 0 };
     float    sceneOrigin_[3] = { 0, 0, 0 };
+    uint64_t shaderMtime_ = 0;
+    void TryHotReloadShaders();
     ComPtr<ID3D11InputLayout> inputLayoutPoly_;
 
     // TAA: scene render target, two history targets (ping-pong), depth SRV

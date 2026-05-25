@@ -139,6 +139,9 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
             // Point vertex AO: brightest visible face (max). Matches the poly
             // path's per-face AO for top-facing surfaces so splats and polys
             // line up visually in SplatHybrid mode.
+            // Max-of-visible-faces AO. Matches the L1/L2/L3 cluster aggregation
+            // (which sums voxAoMax then averages over the bin), so AO debug
+            // view stays consistent across LODs.
             uint8_t pointAo = 0;
             for (int fi = 0; fi < 6; ++fi) {
                 if (!((mask >> fi) & 1u)) continue;
@@ -257,6 +260,7 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
     };
     lodPass(2, &SubMesh::pointFirstL1, &SubMesh::pointCountL1);
     lodPass(4, &SubMesh::pointFirstL2, &SubMesh::pointCountL2);
+    lodPass(8, &SubMesh::pointFirstL3, &SubMesh::pointCountL3);
 
     // Commit valid subs in chunk order (matches subs_ order in renderer).
     for (uint32_t ci = 0; ci < chunkCount; ++ci) {

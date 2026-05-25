@@ -97,7 +97,9 @@ struct AppState {
     Camera   camera;
     ShadingMode mode = ShadingMode::Lit;
     RenderTech  tech = RenderTech::PolygonBased;     // "Close" tech
-    RenderTech  techFar = RenderTech::None;          // None = use Close for all chunks
+    RenderTech  techFar = RenderTech::Splat;
+    bool        closeEnabled = true;
+    bool        farEnabled   = true;
     float    sunPitchDeg = 60.0f;
     float    sunYawDeg   = 63.0f;
     float    sunIntensityEV = 0.0f;     // log2 stops; linear = 2^EV
@@ -282,20 +284,28 @@ void FrameTopBar()
         // Close pulldown: required (no None entry).
         const char* closeNames[16]; for (int k = 0; k < kTechCount; ++k) closeNames[k] = kTechList[k].name;
         int tt = techIdxFrom(g_app.tech);
-        if (ImGui::Combo("Technique Close", &tt, closeNames, kTechCount, kTechCount)) {
+        ImGui::PushItemWidth(180.0f);
+        if (ImGui::Combo("##Technique Close", &tt, closeNames, kTechCount, kTechCount)) {
             g_app.tech = kTechList[tt].val;
         }
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        ImGui::Checkbox("Close", &g_app.closeEnabled);
         // Far pulldown: same list prefixed with "None".
         const char* farNames[17]; farNames[0] = "None";
         for (int k = 0; k < kTechCount; ++k) farNames[k + 1] = kTechList[k].name;
         int tf = (g_app.techFar == RenderTech::None) ? 0 : (techIdxFrom(g_app.techFar) + 1);
-        if (ImGui::Combo("Technique Far", &tf, farNames, kTechCount + 1, kTechCount + 1)) {
+        ImGui::PushItemWidth(180.0f);
+        if (ImGui::Combo("##Technique Far", &tf, farNames, kTechCount + 1, kTechCount + 1)) {
             g_app.techFar = (tf == 0) ? RenderTech::None : kTechList[tf - 1].val;
         }
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        ImGui::Checkbox("Far", &g_app.farEnabled);
     }
 
     ImGui::Separator();
-    const char* lods[] = { "L0 (1 per voxel)", "L1 (2x2x2)", "L2 (4x4x4)", "Auto" };
+    const char* lods[] = { "L0 (1 per voxel)", "L1 (2x2x2)", "L2 (4x4x4)", "L3 (8x8x8)", "Auto" };
     int lo = (int)g_app.pointLod;
     if (ImGui::Combo("Point LOD", &lo, lods, IM_ARRAYSIZE(lods))) {
         g_app.pointLod = (PointLod)lo;
@@ -599,6 +609,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.roughness        = g_app.roughness;
             ps.sunShadows       = g_app.sunShadows;
             ps.colorizeClusters = g_app.colorizeClusters;
+            ps.closeEnabled     = g_app.closeEnabled;
+            ps.farEnabled       = g_app.farEnabled;
             g_app.renderer.DrawScene(g_app.camera, ps);
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

@@ -37,7 +37,7 @@ cbuffer cbPerFrame : register(b0)
     float    gExposure;
     float    gRoughness;
     float    gColorizeClusters;   // 0/1 toggle
-    float    _padExp;
+    float    gGridSize;           // scene grid size (>1 = replicated, wrap shadow)
 };
 
 // Combined depth + height fog. Height fog uses Inigo Quilez closed-form:
@@ -148,10 +148,22 @@ Texture2D<float>          gShadowMap : register(t10);
 SamplerComparisonState    gShadowSamp : register(s2);
 
 // Project wpos into sun NDC and PCF-sample (3x3 box). Returns 1 lit, 0 shadowed.
+// When gGridSize > 1 the scene tiles in XZ, so wrap wpos.xz back to the base
+// cell so one shadow map serves every replica. With grid=1 (single cell) we
+// must NOT wrap — otherwise voxels outside the cell get spurious shadow.
 float SampleShadow(float3 wpos)
 {
     if (gShadowEnable < 0.5) return 1.0;
-    float4 sclip = mul(float4(wpos, 1.0), gSunViewProj);
+    float3 wpLocal = wpos;
+    if (gGridSize > 1.5) {
+        float2 relXZ = float2(wpos.x - gSceneOrigin.x, wpos.z - gSceneOrigin.z);
+        relXZ.x -= floor(relXZ.x / gSceneSpan.x) * gSceneSpan.x;
+        relXZ.y -= floor(relXZ.y / gSceneSpan.z) * gSceneSpan.z;
+        wpLocal.x = gSceneOrigin.x + relXZ.x;
+        wpLocal.z = gSceneOrigin.z + relXZ.y;
+    }
+
+    float4 sclip = mul(float4(wpLocal, 1.0), gSunViewProj);
     if (sclip.w <= 0.0) return 1.0;
     float3 sn = sclip.xyz / sclip.w;
     float2 uv = float2(sn.x * 0.5 + 0.5, -sn.y * 0.5 + 0.5);
@@ -174,13 +186,14 @@ float3 ApplyShadowLighting(float3 amb, float3 sunDir, float3 n, float shadow)
     return amb + gAmbient * sun;
 }
 
-// Debug cluster tint: 1=green close, 2=red L0, 3=orange L1, 4=yellow L2.
+// Debug cluster tint: 1=green close, 2=red L0, 3=orange L1, 4=yellow L2, 5=cyan L3.
 float3 ClusterTint(uint t)
 {
     if (t == 1u) return float3(0.4, 1.0, 0.4);
     if (t == 2u) return float3(1.0, 0.4, 0.4);
     if (t == 3u) return float3(1.0, 0.65, 0.2);
     if (t == 4u) return float3(1.0, 1.0, 0.3);
+    if (t == 5u) return float3(0.3, 0.9, 1.0);
     return float3(1.0, 1.0, 1.0);
 }
 float3 ApplyClusterTint(float3 c)
@@ -239,6 +252,10 @@ VSOut vsmain(VSPolyIn i)
     return o;
 }
 
+// Per-voxel packed face AO (4 bits per face × 6 faces, low 24 bits). Indexed
+// by global vertex ID for point paths; by voxelIdx for PolyVID/PolyAxis.
+StructuredBuffer<uint> gPolyAo6 : register(t2);
+
 // ---------------- Points technique ----------------
 // faceIdx field carries visMask (6 bits, one per cube face direction).
 struct VSPointOut {
@@ -250,7 +267,7 @@ struct VSPointOut {
     nointerpolation float ao : AO;
 };
 
-VSPointOut vsmain_points(VSIn i)
+VSPointOut vsmain_points(VSIn i, uint vid : SV_VertexID)
 {
     VSPointOut o;
     // _pad carries half-extent of the LOD voxel (0.5/1.0/2.0); scene-rel pos + pad = voxel center.
@@ -261,7 +278,28 @@ VSPointOut vsmain_points(VSIn i)
     o.wpos  = world;
     o.mask  = i.col.a & 0x3Fu;       // visMask packed in color alpha
     o.shadowMask = 0xFFu;
-    o.ao         = AoFromAux(i.pck.w);
+    // Pick the visible face whose outward normal is most aligned with the
+    // direction from voxel center toward the camera. Restricting to faces in
+    // visMask is critical: dominant-axis-of-toCam picks the wrong face for
+    // distant voxels (e.g. top voxels at far-away positions can have toCam.x
+    // > toCam.y and end up showing +X AO instead of +Y).
+    uint ao6 = gPolyAo6[vid + gVoxelBase];
+    float3 toCam = normalize(gCamPos - world);
+    uint visMask = i.col.a & 0x3Fu;
+    float3 faceN[6] = {
+        float3( 1, 0, 0), float3(-1, 0, 0),
+        float3( 0, 1, 0), float3( 0,-1, 0),
+        float3( 0, 0, 1), float3( 0, 0,-1),
+    };
+    float bestDot = -2.0;
+    uint  bestFace = 0u;
+    [unroll] for (uint f = 0u; f < 6u; ++f) {
+        if (((visMask >> f) & 1u) == 0u) continue;
+        float d = dot(faceN[f], toCam);
+        if (d > bestDot) { bestDot = d; bestFace = f; }
+    }
+    uint nib = (ao6 >> (bestFace * 4u)) & 0xFu;
+    o.ao = (float)nib / 15.0;
     return o;
 }
 
@@ -449,9 +487,7 @@ float4 psmain_bounds(VSBoundsOut i) : SV_Target
 // baseVertex = chunkVoxelBase*8 so SV_VertexID = (chunkVoxelBase + i)*8 + corner.
 // VS pulls voxel data from a StructuredBuffer; no VB needed.
 StructuredBuffer<VoxelP> gPolyVoxels : register(t1);
-// Per-voxel packed face AO (4 bits per face × 6 faces in low 24 bits). PolyAxis
-// only — bound at VS slot t2.
-StructuredBuffer<uint>   gPolyAo6    : register(t2);
+// gPolyAo6 declared earlier (shared with the Points VS path).
 
 struct VSPolyVidOut {
     float4 svpos : SV_Position;
@@ -704,7 +740,12 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     // center -> consecutive frames produce the same value on static scenes.
     float2 currUv = (float2(pix) + 0.5) / float2((float)W, (float)H);
     currUv += float2(gJitter.x * 0.5, -gJitter.y * 0.5);
-    float3 curC = gTaaScene.SampleLevel(gTaaSamp, currUv, 0).rgb;
+    float4 curSample = gTaaScene.SampleLevel(gTaaSamp, currUv, 0);
+    float3 curC = curSample.rgb;
+    // Carry the scene-RT alpha through TAA: post pass uses alpha < 0.5 to
+    // detect sky pixels (alpha 0 = empty bg, 1 = scene draw). Without this
+    // every TAA output had alpha = 1 -> sky shader killed.
+    float outAlpha = curSample.a;
     // Read depth at the SAME pixel as color (the jittered sample), not at
     // integer pix. Otherwise depth + color describe two different world
     // points and reprojection wobbles at depth discontinuities (= ghosting).
@@ -712,7 +753,7 @@ float4 psmain_taa(VTaaOut i) : SV_Target
                       int2(0, 0), int2(W - 1, H - 1));
     float  d  = gTaaDepth.Load(int3(jPix, 0));
     if (d <= 0.0) {
-        return float4(curC, 1.0);
+        return float4(curC, outAlpha);
     }
 
     // World pos must reconstruct from the SAME UV that depth+color were read
@@ -729,9 +770,9 @@ float4 psmain_taa(VTaaOut i) : SV_Target
 
     // Reproject to previous frame.
     float4 prevClip = mul(float4(world, 1.0), gPrevViewProj);
-    if (prevClip.w <= 0.0) return float4(curC, 1.0);
+    if (prevClip.w <= 0.0) return float4(curC, outAlpha);
     float3 prevNdc = prevClip.xyz / prevClip.w;
-    if (any(abs(prevNdc.xy) > 1.0)) return float4(curC, 1.0);
+    if (any(abs(prevNdc.xy) > 1.0)) return float4(curC, outAlpha);
     float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
 
     // Catmull-Rom 5-tap (Karis) - bicubic resample via 5 bilinear fetches.
@@ -794,7 +835,7 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     float dist = length(clipped - prevC) / max(length(nMax - nMin), 1e-4);
     float alpha = lerp(0.1, 0.5, saturate(dist));
     float3 outC = lerp(clipped, curC, alpha);
-    return float4(outC, 1.0);
+    return float4(outC, outAlpha);
 }
 
 // Post-process: sky for empty pixels + sharpen + tonemap. Reads TAA history
@@ -866,14 +907,15 @@ float4 psmain_post(VTaaOut i) : SV_Target
 }
 
 // ---------------- Splat technique ----------------
-// Unified splat RT stores ALBEDO.RGB plus alpha encoding the pixel kind:
-//   alpha == 0           -> poly pixel (close cluster, drawn first) OR untouched bg
-//   alpha != 0 (splat)   -> bits [7:6] = lodIdx+1 (1..3), [5:0] = AO quantized
-// Stencil distinguishes poly (1) from bg (0) when alpha == 0.
+// Splat RT alpha encoding:
+//   bit  7      = marker (always 1 for a splat pixel; 0 = bg)
+//   bits 6:5    = lodIdx (0..3 = L0..L3)
+//   bits 4:1    = AO quantized (16 levels)
+//   bit  0      = reserved
 float SplatEncodeAlpha(float ao01, uint lodIdx)
 {
-    uint ao6 = (uint)(saturate(ao01) * 63.0 + 0.5);
-    uint a8  = ((lodIdx + 1u) << 6) | (ao6 & 0x3Fu);
+    uint ao4 = (uint)(saturate(ao01) * 15.0 + 0.5);
+    uint a8  = 0x80u | ((lodIdx & 3u) << 5) | ((ao4 & 0xFu) << 1);
     return (float)a8 / 255.0;
 }
 float4 psmain_splat_albedo(VSPointOut i) : SV_Target
@@ -972,11 +1014,10 @@ ReconOut psmain_splat_reconstruct(VBlitOut vIn)
             float4 s = gSplatColorSrv.Load(int3(sp, 0));
             uint a8 = (uint)(s.a * 255.0 + 0.5);
             if (a8 == 0u) continue;            // poly (stencil=1) or pure bg
-            uint lodp1 = (a8 >> 6) & 3u;
-            if (lodp1 == 0u) continue;
-            uint lodIdx = lodp1 - 1u;
-            uint ao6 = a8 & 0x3Fu;
-            float aoN = (float)ao6 / 63.0;
+            if ((a8 & 0x80u) == 0u) continue;
+            uint lodIdx = (a8 >> 5) & 3u;
+            uint ao4 = (a8 >> 1) & 0xFu;
+            float aoN = (float)ao4 / 15.0;
             float halfExt = (lodIdx == 0u) ? 0.5
                           : (lodIdx == 1u) ? 1.0
                           : (lodIdx == 2u) ? 2.0
@@ -1062,11 +1103,10 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             float4 s = gSplatColorSrv.Load(int3(sp, 0));
             uint a8 = (uint)(s.a * 255.0 + 0.5);
             if (a8 == 0u) continue;                // poly pixel or untouched bg
-            uint lodp1 = (a8 >> 6) & 3u;
-            if (lodp1 == 0u) continue;
-            uint lodIdx = lodp1 - 1u;
-            uint ao6    = a8 & 0x3Fu;
-            float aoN   = (float)ao6 / 63.0;
+            if ((a8 & 0x80u) == 0u) continue;
+            uint lodIdx = (a8 >> 5) & 3u;
+            uint ao4    = (a8 >> 1) & 0xFu;
+            float aoN   = (float)ao4 / 15.0;
             float halfExt = (lodIdx == 0u) ? 0.5
                           : (lodIdx == 1u) ? 1.0
                           : (lodIdx == 2u) ? 2.0
@@ -1112,20 +1152,29 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
 
     if (anyHit) {
         float3 hit = ro + rd * bestT;
-        float3 amb = SampleAmbientCubeTriplanar(bestN) * bestAo;
-        float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, SampleShadow(hit));
-        float3 lit = bestAlbedo * light;
-        // Splat CS: tint per pixel using the winning splat's LOD (gChunkTint
-        // cbuffer is per-chunk, meaningless for compute over the whole screen).
-        float3 splatTint = (gColorizeClusters > 0.5) ? ClusterTint(2u + bestLodIdx) : float3(1.0, 1.0, 1.0);
-        gSplatFinalUav[pix] = float4(Tonemap(ApplyFog(lit * splatTint, hit)), 1.0);
+        int mode = (int)gMode;
+        float3 outRgb;
+        if (mode == 2) {
+            outRgb = ApplyFog(bestN * 0.5 + 0.5, hit);
+        } else if (mode == 1) {
+            outRgb = ApplyFog(bestAlbedo, hit);
+        } else if (mode == 3) {
+            outRgb = ApplyFog(bestAo.xxx, hit);
+        } else {
+            float3 amb = SampleAmbientCubeTriplanar(bestN) * bestAo;
+            float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, SampleShadow(hit));
+            float3 lit = bestAlbedo * light;
+            float3 splatTint = (gColorizeClusters > 0.5) ? ClusterTint(2u + bestLodIdx) : float3(1.0, 1.0, 1.0);
+            outRgb = Tonemap(ApplyFog(lit * splatTint, hit));
+        }
+        gSplatFinalUav[pix] = float4(outRgb, 1.0);
     } else {
         // Fallback: read the un-reconstructed pixel and light it with a flat
         // up-facing normal so far/empty regions stay coherent with the rest of
         // the scene instead of going purple.
         float4 c0 = gSplatColorSrv.Load(int3(pix, 0));
         uint a8 = (uint)(c0.a * 255.0 + 0.5);
-        if (a8 != 0u && ((a8 >> 6) & 3u) != 0u) {
+        if ((a8 & 0x80u) != 0u) {
             float3 n = float3(0, 1, 0);
             float3 amb = SampleAmbientCubeTriplanar(n);
             float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, 1.0);
@@ -1140,13 +1189,23 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
 }
 
 // Composite splat output over the main RT. Discards background pixels.
+// Also writes SV_Depth so TAA reprojection + post sky have valid scene depth
+// at splat pixels (without this, splat-covered pixels read main depth = 0
+// (far) every frame, jitter sampling adjacent splats -> heavy wobble).
 Texture2D<float4> gSplatComposite : register(t8);
-float4 psmain_splat_composite(VBlitOut i) : SV_Target
+Texture2D<float>  gSplatCompositeDepth : register(t7);
+struct CompositeOut { float4 color : SV_Target; float depth : SV_Depth; };
+CompositeOut psmain_splat_composite(VBlitOut i)
 {
+    CompositeOut o;
     int2 pix = int2(i.pos.xy);
     float4 c = gSplatComposite.Load(int3(pix, 0));
-    if (c.a < 0.5) discard;
-    return float4(c.rgb, 1.0);
+    // Splat alpha encodes (lodIdx+1) in top bits; CS sets alpha=1 for lit
+    // pixels and alpha=0 for pure bg. Any non-zero alpha means splat content.
+    if (c.a <= 0.0) discard;
+    o.color = float4(c.rgb, 1.0);
+    o.depth = gSplatCompositeDepth.Load(int3(pix, 0));
+    return o;
 }
 
 // ---------------- AtlasMesh technique ----------------
@@ -1193,8 +1252,9 @@ float4 psmain_atlas(VSAtlasOut i) : SV_Target
     if (mode == 3) return float4(ApplyFog(ao.xxx, i.wpos), 1.0);
 
     float ndotl = saturate(dot(n, normalize(gLightDir)));
+    float shadow = SampleShadow(i.wpos);
     float3 amb  = kAmbientCube[i.face & 7] * ao;
-    float3 sun  = float3(1.10, 1.00, 0.85) * 1.5  * ndotl;
+    float3 sun  = float3(1.10, 1.00, 0.85) * 1.5  * ndotl * shadow * gSunIntensity;
     float3 light = amb + gAmbient * sun;
     return float4(TonemapTinted(ApplyFog(col * light, i.wpos)), 1.0);
 }
@@ -1233,8 +1293,9 @@ float4 psmain_merged(VSMergedOut i) : SV_Target
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     if (mode == 3) return float4(ApplyFog(float3(0.5, 0.5, 0.5), i.wpos), 1.0); // merged: no AO
     float ndotl = saturate(dot(n, normalize(gLightDir)));
+    float shadow = SampleShadow(i.wpos);
     float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl;
+    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl * shadow * gSunIntensity;
     float3 light = amb + gAmbient * sun;
     return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
 }
