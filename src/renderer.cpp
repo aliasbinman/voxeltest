@@ -167,6 +167,12 @@ bool Renderer::CreateRenderTargets()
     splatDsv_.Reset();
     splatFinalTex_.Reset();
     splatFinalUav_.Reset();
+    splatFinalDepthTex_.Reset();
+    splatFinalDepthUav_.Reset();
+    splatFinalDepthSrv_.Reset();
+    splatMaskTex_.Reset();
+    splatMaskRtv_.Reset();
+    splatMaskSrv_.Reset();
 
     // Validate MSAA support; fall back to 1x on unsupported counts.
     DXGI_SAMPLE_DESC sd = { 1, 0 };
@@ -301,6 +307,23 @@ bool Renderer::CreateRenderTargets()
     if (FAILED(device_->CreateTexture2D(&sd2, nullptr, splatFinalTex_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateUnorderedAccessView(splatFinalTex_.Get(), nullptr, splatFinalUav_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateShaderResourceView(splatFinalTex_.Get(), nullptr, splatFinalSrv_.GetAddressOf()))) return false;
+
+    // Per-pixel visMask emitted by point PS (MRT slot 1), consumed by CS.
+    D3D11_TEXTURE2D_DESC smd = sd2;
+    smd.Format = DXGI_FORMAT_R8_UINT;
+    smd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(device_->CreateTexture2D(&smd, nullptr, splatMaskTex_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateRenderTargetView(splatMaskTex_.Get(), nullptr, splatMaskRtv_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateShaderResourceView(splatMaskTex_.Get(), nullptr, splatMaskSrv_.GetAddressOf()))) return false;
+
+    // Dilated depth target — CS writes winning-neighbor reprojected depth so the
+    // composite PS can emit SV_Depth at filled-in pixels (source splat depth = 0
+    // at those pixels since the dilation kernel made them up from neighbors).
+    D3D11_TEXTURE2D_DESC sdf = sd2;
+    sdf.Format = DXGI_FORMAT_R32_FLOAT;
+    if (FAILED(device_->CreateTexture2D(&sdf, nullptr, splatFinalDepthTex_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateUnorderedAccessView(splatFinalDepthTex_.Get(), nullptr, splatFinalDepthUav_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateShaderResourceView(splatFinalDepthTex_.Get(), nullptr, splatFinalDepthSrv_.GetAddressOf()))) return false;
 
     // Dedicated non-MSAA depth for splat pass. R32_TYPELESS so the CS can
     // read the same texture as a SRV alongside the DSV binding.
@@ -623,6 +646,19 @@ bool Renderer::CreatePipelineState()
     bsd.RenderTarget[0].BlendEnable = FALSE;
     bsd.RenderTarget[0].RenderTargetWriteMask = 0;       // no color writes
     if (FAILED(device_->CreateBlendState(&bsd, bsNoColor_.GetAddressOf()))) return false;
+
+    // Alpha-over: src=ALPHA, dst=INV_ALPHA. Alpha=0 -> destination preserved
+    // (used by splat composite so depth-only pixels keep main RT color).
+    D3D11_BLEND_DESC bsa = {};
+    bsa.RenderTarget[0].BlendEnable = TRUE;
+    bsa.RenderTarget[0].SrcBlend  = D3D11_BLEND_SRC_ALPHA;
+    bsa.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bsa.RenderTarget[0].BlendOp   = D3D11_BLEND_OP_ADD;
+    bsa.RenderTarget[0].SrcBlendAlpha  = D3D11_BLEND_ONE;
+    bsa.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bsa.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
+    bsa.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(device_->CreateBlendState(&bsa, bsAlphaOver_.GetAddressOf()))) return false;
 
     // Sun shadow map: D32_FLOAT, reverse-Z ortho, back-face culling, depth bias.
     {
@@ -1881,15 +1917,22 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         MICROPROFILE_SCOPEGPUI("Splat", 0xffffd060);
         float clr[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
         ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clr);
+        const float zeroClear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        ctx_->ClearRenderTargetView(splatMaskRtv_.Get(), zeroClear);
         ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
-        ID3D11RenderTargetView* splatRtvs[] = { splatColorRtv_.Get() };
-        ctx_->OMSetRenderTargets(1, splatRtvs, splatDsv_.Get());
+        // Poly pre-pass (SplatHybrid only) writes color only — bind 1 RT.
+        ID3D11RenderTargetView* splatRtvsColorOnly[] = { splatColorRtv_.Get() };
+        ctx_->OMSetRenderTargets(1, splatRtvsColorOnly, splatDsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
         if (tech == RenderTech::SplatHybrid) {
             MICROPROFILE_SCOPEGPUI("Splat/Poly", 0xffffe080);
             drawPolyJobs(polyJobs);
         }
+
+        // Point pass writes color (slot 0) + visMask (slot 1).
+        ID3D11RenderTargetView* splatRtvs[] = { splatColorRtv_.Get(), splatMaskRtv_.Get() };
+        ctx_->OMSetRenderTargets(2, splatRtvs, splatDsv_.Get());
 
         {
             MICROPROFILE_SCOPEGPUI("Splat/Points", 0xffffc040);
@@ -1946,18 +1989,18 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->CSSetShader(csSplat_.Get(), nullptr, 0);
             ID3D11Buffer* csCbs[] = { cbPerFrame_.Get() };
             ctx_->CSSetConstantBuffers(0, 1, csCbs);
-            ID3D11ShaderResourceView* csSrvs[] = { nullptr, splatDepthSrv_.Get(), splatColorSrv_.Get() };
-            ctx_->CSSetShaderResources(0, 3, csSrvs);
-            ID3D11UnorderedAccessView* csUavs[] = { nullptr, splatFinalUav_.Get() };
-            UINT initc[] = { 0, 0 };
-            ctx_->CSSetUnorderedAccessViews(0, 2, csUavs, initc);
+            ID3D11ShaderResourceView* csSrvs[] = { nullptr, splatDepthSrv_.Get(), splatColorSrv_.Get(), splatMaskSrv_.Get() };
+            ctx_->CSSetShaderResources(0, 4, csSrvs);
+            ID3D11UnorderedAccessView* csUavs[] = { nullptr, splatFinalUav_.Get(), splatFinalDepthUav_.Get() };
+            UINT initc[] = { 0, 0, 0 };
+            ctx_->CSSetUnorderedAccessViews(0, 3, csUavs, initc);
             UINT gx = (width_ + 7) / 8;
             UINT gy = (height_ + 7) / 8;
             ctx_->Dispatch(gx, gy, 1);
-            ID3D11ShaderResourceView* nullCsSrvs[] = { nullptr, nullptr, nullptr };
-            ctx_->CSSetShaderResources(0, 3, nullCsSrvs);
-            ID3D11UnorderedAccessView* nullCsUavs[] = { nullptr, nullptr };
-            ctx_->CSSetUnorderedAccessViews(0, 2, nullCsUavs, initc);
+            ID3D11ShaderResourceView* nullCsSrvs[] = { nullptr, nullptr, nullptr, nullptr };
+            ctx_->CSSetShaderResources(0, 4, nullCsSrvs);
+            ID3D11UnorderedAccessView* nullCsUavs[] = { nullptr, nullptr, nullptr };
+            ctx_->CSSetUnorderedAccessViews(0, 3, nullCsUavs, initc);
             ctx_->CSSetShader(nullptr, nullptr, 0);
         }
 
@@ -1977,9 +2020,13 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->PSSetShader(psSplatComposite_.Get(), nullptr, 0);
         ID3D11ShaderResourceView* compSrv[] = { splatFilter ? splatFinalSrv_.Get() : splatColorSrv_.Get() };
         ctx_->PSSetShaderResources(8, 1, compSrv);
-        ID3D11ShaderResourceView* compDepthSrv[] = { splatDepthSrv_.Get() };
+        ID3D11ShaderResourceView* compDepthSrv[] = {
+            splatFilter ? splatFinalDepthSrv_.Get() : splatDepthSrv_.Get()
+        };
         ctx_->PSSetShaderResources(7, 1, compDepthSrv);
+        ctx_->OMSetBlendState(bsAlphaOver_.Get(), nullptr, 0xFFFFFFFFu);
         ctx_->Draw(3, 0);
+        ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
         ID3D11ShaderResourceView* nullCSrv[] = { nullptr };
         ctx_->PSSetShaderResources(8, 1, nullCSrv);
         ctx_->PSSetShaderResources(7, 1, nullCSrv);

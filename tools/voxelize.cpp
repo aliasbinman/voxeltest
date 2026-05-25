@@ -52,9 +52,19 @@ struct VKeyHash {
 };
 
 #pragma pack(push, 1)
-struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint32_t color; uint8_t ao[6]; };
+// AO stored 4-bit-per-face: 6 faces * 4 bits = 24 bits in 3 packed bytes.
+// color = 16-bit palette index; palette table sits at file start.
+struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint16_t paletteIdx; uint8_t aoPacked[3]; };
 #pragma pack(pop)
-static_assert(sizeof(DiskVoxel) == 14, "");
+static_assert(sizeof(DiskVoxel) == 9, "");
+
+inline void DvSetAo(DiskVoxel& v, int fi, uint8_t ao8)
+{
+    uint8_t n = (uint8_t)(ao8 >> 4); // quantize 8-bit -> 4-bit (drop low nibble)
+    int byte = (fi * 4) >> 3;
+    int shift = (fi * 4) & 7;
+    v.aoPacked[byte] = (uint8_t)((v.aoPacked[byte] & ~(0xFu << shift)) | (n << shift));
+}
 
 // In-memory voxel record. Color RGB + per-face AO (one byte per cardinal
 // face, indexed by kFaceDelta order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
@@ -386,6 +396,31 @@ int main(int argc, char** argv)
     }
     uint64_t droppedBottom = 0, droppedEdge = 0;
 
+    // Build shared palette from unique colors across all voxels (sorted by
+    // frequency desc — most-common gets idx 0 so 8-bit truncation, if ever
+    // re-enabled, keeps the hot colors).
+    std::unordered_map<uint32_t, uint16_t> palMap;
+    std::vector<uint32_t> palette;
+    {
+        std::unordered_map<uint32_t, uint64_t> cnt;
+        for (auto& kv : voxels) ++cnt[kv.second.color];
+        if (cnt.size() > 65535) {
+            fprintf(stderr, "palette exceeds 65535 unique colors (%zu) — bump paletteIdx width\n",
+                    cnt.size());
+            return 1;
+        }
+        std::vector<std::pair<uint32_t, uint64_t>> sorted(cnt.begin(), cnt.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](auto& a, auto& b) { return a.second > b.second; });
+        palette.reserve(sorted.size());
+        for (auto& p : sorted) {
+            palMap[p.first] = (uint16_t)palette.size();
+            palette.push_back(p.first);
+        }
+        printf("Palette: %zu unique colors (%zu B table)\n",
+               palette.size(), palette.size() * sizeof(uint32_t));
+    }
+
     std::unordered_map<CKey, std::vector<DiskVoxel>, CKeyHash, CKeyEq> chunks;
     uint64_t visibleFaces = 0;
     for (auto& kv : voxels) {
@@ -425,8 +460,9 @@ int main(int argc, char** argv)
         v.y = (uint8_t)(ry % CHUNK_DIM);
         v.z = (uint8_t)(rz % CHUNK_DIM);
         v.visMask = mask;
-        v.color = kv.second.color;
-        for (int fi = 0; fi < 6; ++fi) v.ao[fi] = kv.second.ao[fi];
+        v.paletteIdx = palMap[kv.second.color];
+        v.aoPacked[0] = v.aoPacked[1] = v.aoPacked[2] = 0;
+        for (int fi = 0; fi < 6; ++fi) DvSetAo(v, fi, kv.second.ao[fi]);
         chunks[ck].push_back(v);
     }
     printf("Visible faces (after neighbor cull): %llu (avg %.2f/voxel)\n",
@@ -468,6 +504,10 @@ int main(int argc, char** argv)
     fwrite(origin, sizeof(int32_t), 3, f);
     float sunDir[3] = { sunDirX, sunDirY, sunDirZ };
     fwrite(sunDir, sizeof(float), 3, f);
+
+    uint32_t palCount = (uint32_t)palette.size();
+    fwrite(&palCount, sizeof(uint32_t), 1, f);
+    if (palCount) fwrite(palette.data(), sizeof(uint32_t), palCount, f);
 
     fwrite(metas.data(),   sizeof(ChunkMeta), metas.size(),   f);
     fwrite(flatVox.data(), sizeof(DiskVoxel), flatVox.size(), f);
@@ -612,8 +652,9 @@ int main(int argc, char** argv)
             dv.y = (uint8_t)(ry % CHUNK_DIM);
             dv.z = (uint8_t)(rz % CHUNK_DIM);
             dv.visMask = mask;
-            dv.color = kv.second.color;
-            for (int fi = 0; fi < 6; ++fi) dv.ao[fi] = kv.second.ao[fi];
+            dv.paletteIdx = palMap[kv.second.color];
+            dv.aoPacked[0] = dv.aoPacked[1] = dv.aoPacked[2] = 0;
+            for (int fi = 0; fi < 6; ++fi) DvSetAo(dv, fi, kv.second.ao[fi]);
             cChunks[ck].push_back(dv);
         }
         for (auto& kv : cChunks) {
@@ -645,6 +686,8 @@ int main(int argc, char** argv)
         fwrite(&cTotal,  sizeof(uint32_t), 1, cf);
         fwrite(origin,   sizeof(int32_t),  3, cf);
         fwrite(sunDir,   sizeof(float),    3, cf);
+        fwrite(&palCount, sizeof(uint32_t), 1, cf);
+        if (palCount) fwrite(palette.data(), sizeof(uint32_t), palCount, cf);
         fwrite(cMetas.data(),   sizeof(ChunkMeta), cMetas.size(),   cf);
         fwrite(cFlatVox.data(), sizeof(DiskVoxel), cFlatVox.size(), cf);
         long cb = ftell(cf);

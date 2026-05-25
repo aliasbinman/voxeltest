@@ -154,6 +154,7 @@ struct AppState {
     bool     showControls = true;
     bool     showFps      = true;
     bool     showStats    = true;
+
 };
 
 AppState g_app;

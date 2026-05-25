@@ -248,6 +248,14 @@ private:
     ComPtr<ID3D11Texture2D>            splatFinalTex_;
     ComPtr<ID3D11UnorderedAccessView>  splatFinalUav_;
     ComPtr<ID3D11ShaderResourceView>   splatFinalSrv_;
+    ComPtr<ID3D11Texture2D>            splatFinalDepthTex_;
+    ComPtr<ID3D11UnorderedAccessView>  splatFinalDepthUav_;
+    ComPtr<ID3D11ShaderResourceView>   splatFinalDepthSrv_;
+    // Per-pixel visMask emitted by point PS (MRT slot 1), consumed by CS to
+    // restrict the normal-pick to faces that actually exist on that voxel.
+    ComPtr<ID3D11Texture2D>            splatMaskTex_;
+    ComPtr<ID3D11RenderTargetView>     splatMaskRtv_;
+    ComPtr<ID3D11ShaderResourceView>   splatMaskSrv_;
     ComPtr<ID3D11PixelShader>          psSplatComposite_;
     ComPtr<ID3D11ComputeShader>        csSplat_;
     ComPtr<ID3D11PixelShader>          psSplatAlbedo_;
@@ -293,6 +301,7 @@ private:
     ComPtr<ID3D11DepthStencilState> dsAlways_;
     ComPtr<ID3D11DepthStencilState> dsEqual_;
     ComPtr<ID3D11BlendState>        bsNoColor_;
+    ComPtr<ID3D11BlendState>        bsAlphaOver_; // SRC_ALPHA / INV_SRC_ALPHA — preserves dest at alpha=0
     ComPtr<ID3D11VertexShader>      vsDepth_;
 
     ComPtr<ID3D11Buffer>         vb_;

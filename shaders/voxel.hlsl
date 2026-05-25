@@ -918,9 +918,16 @@ float SplatEncodeAlpha(float ao01, uint lodIdx)
     uint a8  = 0x80u | ((lodIdx & 3u) << 5) | ((ao4 & 0xFu) << 1);
     return (float)a8 / 255.0;
 }
-float4 psmain_splat_albedo(VSPointOut i) : SV_Target
+struct SplatPointOut {
+    float4 color : SV_Target0;
+    uint   mask  : SV_Target1;
+};
+SplatPointOut psmain_splat_albedo(VSPointOut i)
 {
-    return float4(i.col, SplatEncodeAlpha(i.ao, gChunkLodIdx));
+    SplatPointOut o;
+    o.color = float4(i.col, SplatEncodeAlpha(i.ao, gChunkLodIdx));
+    o.mask  = i.mask & 0x3Fu;
+    return o;
 }
 // Poly into the shared splat buffer: alpha = 0 marks "poly pixel" so the
 // reconstruction PS skips it during neighbor search.
@@ -937,7 +944,9 @@ float4 psmain_splat_albedo_poly(VSOut i) : SV_Target
 // point whose splat sphere covers it; use its color (background if none).
 Texture2D<float>    gSplatDepth    : register(t1);
 Texture2D<float4>   gSplatColorSrv : register(t2);
-RWTexture2D<float4> gSplatFinalUav : register(u1);
+Texture2D<uint>     gSplatMaskSrv  : register(t3);
+RWTexture2D<float4> gSplatFinalUav      : register(u1);
+RWTexture2D<float>  gSplatFinalDepthUav : register(u2);
 
 // Reconstruct world ray for pixel center using the camera basis (avoids the
 // numerically-fragile inverse view-proj matrix).
@@ -964,8 +973,11 @@ float3 ReconstructNeighborWorld(int2 sp, float zN, int W, int H)
 {
     float viewZ = gNearZ / zN;
     float aspect = (float)W / (float)H;
-    float ndcX = ((float)sp.x + 0.5) / (float)W * 2.0 - 1.0;
-    float ndcY = 1.0 - ((float)sp.y + 0.5) / (float)H * 2.0;
+    // Splat rasterization uses jittered proj: pixel_ndc = clip_ndc + jitter.
+    // So the world point that landed at pixel sp came from clip_ndc = pixel_ndc - jitter.
+    // gJitter.y sign matches the proj inject (Y not flipped at inject site).
+    float ndcX = ((float)sp.x + 0.5) / (float)W * 2.0 - 1.0 - gJitter.x;
+    float ndcY = 1.0 - ((float)sp.y + 0.5) / (float)H * 2.0 - gJitter.y;
     float viewX = ndcX * aspect * gTanHalfFovY * viewZ;
     float viewY = ndcY *          gTanHalfFovY * viewZ;
     return gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
@@ -1096,6 +1108,11 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
 
     float bestAo = 1.0;
     uint  bestLodIdx = 0u;
+    // Depth-only fallback: nearest-Z valid neighbor. Doesn't pollute color
+    // (no color is taken from this), only fills depth at pixels whose ray
+    // missed every AABB. Keeps depth buffer contiguous for TAA / sky / DOF.
+    bool  fbHave = false;
+    float fbZ    = -1.0;        // reverse-Z: larger = nearer
     [loop] for (int dy = -R; dy <= R; ++dy) {
         [loop] for (int dx = -R; dx <= R; ++dx) {
             int2 sp = pix + int2(dx, dy);
@@ -1113,6 +1130,8 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                           :                  4.0;
             float zN = gSplatDepth.Load(int3(sp, 0));
             if (zN <= 0.0) continue;
+            if (zN > fbZ) { fbZ = zN; fbHave = true; }
+            uint visMaskN = gSplatMaskSrv.Load(int3(sp, 0)) & 0x3Fu;
             float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
             // Snap to LOD-aligned voxel grid so adjacent splats from the same
             // cluster collapse to the same AABB. Without this, neighbor pixels
@@ -1133,16 +1152,30 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                 float3 hit = ro + rd * tHit;
                 float3 center = (vmin + vmax) * 0.5;
                 float3 d = hit - center;
+                // Pick face: dominant axis of (hit - center), but restricted to
+                // faces actually present in the voxel's visMask. Without the
+                // mask, edge/corner hits flip between axes pixel-to-pixel where
+                // |d.x| ~= |d.y| ~= |d.z| -> normal noise in lighting.
                 float3 absD = abs(d);
-                float maxC = max(max(absD.x, absD.y), absD.z);
-                float3 n = float3(0, 0, 0);
-                if      (absD.x >= maxC - 1e-3) n.x = d.x >= 0 ? 1.0 : -1.0;
-                else if (absD.y >= maxC - 1e-3) n.y = d.y >= 0 ? 1.0 : -1.0;
-                else                            n.z = d.z >= 0 ? 1.0 : -1.0;
+                float bestProj = -1.0;
+                float3 n = float3(0, 1, 0);
+                [unroll] for (uint fi = 0u; fi < 6u; ++fi) {
+                    if (((visMaskN >> fi) & 1u) == 0u) continue;
+                    float3 fn = float3(0, 0, 0);
+                    if      (fi == 0u) fn = float3( 1, 0, 0);
+                    else if (fi == 1u) fn = float3(-1, 0, 0);
+                    else if (fi == 2u) fn = float3( 0, 1, 0);
+                    else if (fi == 3u) fn = float3( 0,-1, 0);
+                    else if (fi == 4u) fn = float3( 0, 0, 1);
+                    else               fn = float3( 0, 0,-1);
+                    // Project (hit-center) onto face normal: larger = closer to that face.
+                    float p = dot(d, fn);
+                    if (p > bestProj) { bestProj = p; n = fn; }
+                }
                 bestT      = tHit;
                 bestAlbedo = s.rgb;
                 bestN      = n;
-                bestMask   = 0x3Fu;                // no per-face shadow mask now
+                bestMask   = visMaskN;
                 bestAo     = aoN;
                 bestLodIdx = lodIdx;
                 anyHit     = true;
@@ -1168,10 +1201,14 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             outRgb = Tonemap(ApplyFog(lit * splatTint, hit));
         }
         gSplatFinalUav[pix] = float4(outRgb, 1.0);
+        // Reproject winning hit -> clip depth so composite PS emits SV_Depth
+        // consistent with the dilated color (not the un-dilated source depth,
+        // which is 0 at filled-in pixels).
+        float4 clipHit = mul(float4(hit, 1.0), gViewProj);
+        gSplatFinalDepthUav[pix] = saturate(clipHit.z / max(clipHit.w, 1e-6));
     } else {
-        // Fallback: read the un-reconstructed pixel and light it with a flat
-        // up-facing normal so far/empty regions stay coherent with the rest of
-        // the scene instead of going purple.
+        // No AABB hit. Center pixel may still own a splat marker — light flat
+        // up so far/empty regions stay coherent with the rest of the scene.
         float4 c0 = gSplatColorSrv.Load(int3(pix, 0));
         uint a8 = (uint)(c0.a * 255.0 + 0.5);
         if ((a8 & 0x80u) != 0u) {
@@ -1180,10 +1217,13 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, 1.0);
             float3 wp = ReconstructNeighborWorld(pix, max(gSplatDepth.Load(int3(pix, 0)), 1e-6), W, H);
             gSplatFinalUav[pix] = float4(Tonemap(ApplyFog(c0.rgb * light, wp)), 1.0);
+            gSplatFinalDepthUav[pix] = gSplatDepth.Load(int3(pix, 0));
         } else {
-            // Pure background pixel: alpha = 0 lets the composite PS discard
-            // (preserves whatever main RT had — e.g. close PolyAxis draws).
+            // Pure background pixel for color (alpha = 0). Depth: write the
+            // nearest-Z valid neighbor seen during dilation if any, so the
+            // composite PS can emit SV_Depth even where no color was filled.
             gSplatFinalUav[pix] = float4(c0.rgb, 0.0);
+            gSplatFinalDepthUav[pix] = fbHave ? fbZ : 0.0;
         }
     }
 }
@@ -1200,11 +1240,14 @@ CompositeOut psmain_splat_composite(VBlitOut i)
     CompositeOut o;
     int2 pix = int2(i.pos.xy);
     float4 c = gSplatComposite.Load(int3(pix, 0));
-    // Splat alpha encodes (lodIdx+1) in top bits; CS sets alpha=1 for lit
-    // pixels and alpha=0 for pure bg. Any non-zero alpha means splat content.
-    if (c.a <= 0.0) discard;
-    o.color = float4(c.rgb, 1.0);
-    o.depth = gSplatCompositeDepth.Load(int3(pix, 0));
+    float  z = gSplatCompositeDepth.Load(int3(pix, 0));
+    // Color: alpha=0 -> blend state preserves main RT (no discard, so SV_Depth
+    // still fires). Alpha=1 -> src wins. Depth: written unconditionally if z>0
+    // (CS wrote either a real hit or a nearest-neighbor fallback). Zero-depth
+    // pixels are true bg / outside any dilation reach -> let main DSV stand.
+    o.color = c;
+    if (z <= 0.0) { o.depth = 0.0; discard; } // genuine bg: keep main RT + DSV
+    o.depth = z;
     return o;
 }
 

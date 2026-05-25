@@ -16,9 +16,18 @@
 namespace {
 
 #pragma pack(push, 1)
-struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint32_t color; uint8_t ao[6]; };
+// AO stored as 4-bit-per-face (6 faces = 24 bits = 3 bytes packed).
+// Face index = visMask bit order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
+// Color stored as 16-bit palette index; palette table sits at file start.
+struct DiskVoxel { uint8_t x, y, z; uint8_t visMask; uint16_t paletteIdx; uint8_t aoPacked[3]; };
 #pragma pack(pop)
-static_assert(sizeof(DiskVoxel) == 14, "");
+static_assert(sizeof(DiskVoxel) == 9, "");
+
+inline uint8_t DvAo(const DiskVoxel& v, int fi)
+{
+    uint8_t n = (v.aoPacked[(fi * 4) >> 3] >> ((fi * 4) & 7)) & 0xFu;
+    return (uint8_t)((n << 4) | n); // replicate nibble -> 0..255 in 16 steps
+}
 
 struct ChunkMeta {
     uint16_t cx, cy, cz, _pad;
@@ -72,12 +81,23 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
     out.sunDir[1] = sunDir[1];
     out.sunDir[2] = sunDir[2];
 
+    uint32_t paletteCount = 0;
+    if (fread(&paletteCount, sizeof(uint32_t), 1, f) != 1) {
+        fclose(f); err = "missing palette header"; return false;
+    }
+    std::vector<uint32_t> palette(paletteCount);
+    if (paletteCount) fread(palette.data(), sizeof(uint32_t), paletteCount, f);
+
     std::vector<ChunkMeta> metas(chunkCount);
     if (chunkCount) fread(metas.data(), sizeof(ChunkMeta), chunkCount, f);
 
     std::vector<DiskVoxel> voxels(totalVoxels);
     if (totalVoxels) fread(voxels.data(), sizeof(DiskVoxel), totalVoxels, f);
     fclose(f);
+
+    auto DvColor = [&](const DiskVoxel& v) -> uint32_t {
+        return v.paletteIdx < palette.size() ? palette[v.paletteIdx] : 0xFF000000u;
+    };
 
     const int D = (int)chunkDim;
     if (D <= 0 || D > 256) { err = "bad chunkDim"; return false; }
@@ -149,14 +169,15 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
             uint8_t pointAo = 0;
             for (int fi = 0; fi < 6; ++fi) {
                 if (!((mask >> fi) & 1u)) continue;
-                pointAo = std::max(pointAo, dv.ao[fi]);
+                pointAo = std::max(pointAo, DvAo(dv, fi));
             }
-            out.pointVertices.push_back(MakeVoxVertex(srx, sry, srz, dv.color, dv.visMask, pointAo));
+            const uint32_t dvCol = DvColor(dv);
+            out.pointVertices.push_back(MakeVoxVertex(srx, sry, srz, dvCol, dv.visMask, pointAo));
             // Pack per-face AO: 4 bits per face × 6 faces in low 24 bits. Face
             // order matches visMask (0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z).
             uint32_t ao6 = 0;
             for (int fi = 0; fi < 6; ++fi) {
-                uint32_t a4 = (uint32_t)(dv.ao[fi] >> 4) & 0xFu;
+                uint32_t a4 = (uint32_t)(DvAo(dv, fi) >> 4) & 0xFu;
                 ao6 |= (a4 << (fi * 4));
             }
             out.pointAo6.push_back(ao6);
@@ -167,14 +188,14 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
             // overall since each voxel averages ~2 visible faces × 4 = 8.
             for (int fi = 0; fi < 6; ++fi) {
                 if (!((mask >> fi) & 1u)) continue;
-                uint8_t faceAo = dv.ao[fi];
+                uint8_t faceAo = DvAo(dv, fi);
                 uint32_t vBase = (uint32_t)out.vertices.size();
                 for (int k = 0; k < 4; ++k) {
                     int c = kFaceCornerIdx[fi][k];
                     int x = srx + kCornerOffset[c][0];
                     int y = sry + kCornerOffset[c][1];
                     int z = srz + kCornerOffset[c][2];
-                    out.vertices.push_back(MakeVoxVertex(x, y, z, dv.color, 0xFF, faceAo));
+                    out.vertices.push_back(MakeVoxVertex(x, y, z, dvCol, 0xFF, faceAo));
 
                     float wx = baseX + (float)kCornerOffset[c][0] + (float)dv.x;
                     float wy = baseY + (float)kCornerOffset[c][1] + (float)dv.y;
@@ -223,16 +244,17 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
                 uint32_t sz = dv.z / step;
                 uint32_t key = sx | (sy << 8) | (sz << 16);
                 Accum& a = bins[key];
-                a.r += (dv.color >>  0) & 0xFF;
-                a.g += (dv.color >>  8) & 0xFF;
-                a.b += (dv.color >> 16) & 0xFF;
+                const uint32_t dvCol = DvColor(dv);
+                a.r += (dvCol >>  0) & 0xFF;
+                a.g += (dvCol >>  8) & 0xFF;
+                a.b += (dvCol >> 16) & 0xFF;
                 // Per-voxel AO = brightest visible face (max), then averaged
                 // across the LOD bin. Keeps points/splats bright on open-top
                 // surfaces like the poly path.
                 uint32_t voxAoMax = 0;
                 for (int fi = 0; fi < 6; ++fi) {
                     if (!((dv.visMask >> fi) & 1u)) continue;
-                    voxAoMax = std::max(voxAoMax, (uint32_t)dv.ao[fi]);
+                    voxAoMax = std::max(voxAoMax, (uint32_t)DvAo(dv, fi));
                 }
                 a.ao += voxAoMax;
                 a.count++;
@@ -483,9 +505,9 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
                 maskSyms.push_back(dv.visMask & 0x3Fu);
                 uint32_t ao6 = 0;
                 for (int fi = 0; fi < 6; ++fi)
-                    ao6 |= (uint32_t)((dv.ao[fi] >> 4) & 0xFu) << (fi * 4);
+                    ao6 |= (uint32_t)((DvAo(dv, fi) >> 4) & 0xFu) << (fi * 4);
                 aoSyms.push_back(ao6);
-                auto it = palMap.find(dv.color & 0x00FFFFFFu);
+                auto it = palMap.find(DvColor(dv) & 0x00FFFFFFu);
                 palSyms.push_back(it != palMap.end() ? it->second : 0u);
 
                 uint32_t cx = dv.x / S, cy = dv.y / S, cz = dv.z / S;
