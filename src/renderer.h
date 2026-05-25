@@ -130,6 +130,36 @@ public:
     uint64_t TotalVertices()  const { return totalVertices_; }
     uint64_t VbBytes()        const { return vbBytes_; }
     uint64_t IbBytes()        const { return ibBytes_; }
+    uint64_t PointBytes()     const { return pointBytes_; }
+    uint64_t PointCountL0()   const { return pointCountL0_; }
+    uint64_t PointCountL1()   const { return pointCountL1_; }
+    uint64_t PointCountL2()   const { return pointCountL2_; }
+    uint64_t PointCountL3()   const { return pointCountL3_; }
+    uint64_t MergedVbBytes()  const { return mergedVbBytes_; }
+    uint64_t MergedIbBytes()  const { return mergedIbBytes_; }
+    uint64_t AtlasVbBytes()   const { return atlasVbBytes_; }
+    uint64_t AtlasIbBytes()   const { return atlasIbBytes_; }
+    uint64_t AtlasTexBytes()  const { return atlasTexBytes_; }
+    const std::vector<std::pair<uint32_t, uint64_t>>& ColorHistogram() const { return colorHistogram_; }
+    double   ColorEntropyBits() const { return colorEntropyBits_; }
+    double   ColorHuffmanBits() const { return colorHuffmanBits_; }
+    uint32_t ColorPaletteBits() const { return colorPaletteBits_; }
+    uint64_t CompRawBytes()        const { return compRawBytes_; }
+    uint64_t CompPosBytes()        const { return compPosBytes_; }
+    uint64_t CompMaskBytes()       const { return compMaskBytes_; }
+    uint64_t CompAoBytes()         const { return compAoBytes_; }
+    uint64_t CompPaletteBytes()    const { return compPaletteBytes_; }
+    uint64_t CompColorPalIdxBytes()const { return compColorPalIdxBytes_; }
+    uint64_t CompColorHuffBytes()  const { return compColorHuffBytes_; }
+    uint32_t CompPosBitsPerAxis()  const { return compPosBitsPerAxis_; }
+    uint32_t CompChunkDim()        const { return compChunkDim_; }
+    uint64_t CompSubclusterPosBytes() const { return compSubclusterPosBytes_; }
+    uint32_t CompSubclusterDim()      const { return compSubclusterDim_; }
+    uint64_t CompLz4PosBytes()        const { return compLz4PosBytes_; }
+    uint64_t CompLz4MaskBytes()       const { return compLz4MaskBytes_; }
+    uint64_t CompLz4AoBytes()         const { return compLz4AoBytes_; }
+    uint64_t CompLz4ColorPalBytes()   const { return compLz4ColorPalBytes_; }
+    uint64_t CompLz4TotalBytes()      const { return compLz4TotalBytes_; }
     size_t   DrawCount()      const { return subs_.size(); }
     uint32_t LastDrawnCount() const { return lastDrawn_; }
     uint64_t LastDrawnTris()  const { return lastDrawnTris_; }
@@ -275,6 +305,36 @@ private:
     uint64_t totalVertices_  = 0;
     uint64_t vbBytes_ = 0;
     uint64_t ibBytes_ = 0;
+    uint64_t pointBytes_     = 0;
+    uint64_t pointCountL0_   = 0;
+    uint64_t pointCountL1_   = 0;
+    uint64_t pointCountL2_   = 0;
+    uint64_t pointCountL3_   = 0;
+    std::vector<std::pair<uint32_t, uint64_t>> colorHistogram_;
+    double   colorEntropyBits_ = 0.0;
+    double   colorHuffmanBits_ = 0.0;
+    uint32_t colorPaletteBits_ = 0;
+    uint64_t compRawBytes_         = 0;
+    uint64_t compPosBytes_         = 0;
+    uint64_t compMaskBytes_        = 0;
+    uint64_t compAoBytes_          = 0;
+    uint64_t compPaletteBytes_     = 0;
+    uint64_t compColorPalIdxBytes_ = 0;
+    uint64_t compColorHuffBytes_   = 0;
+    uint32_t compPosBitsPerAxis_   = 0;
+    uint32_t compChunkDim_         = 0;
+    uint64_t compSubclusterPosBytes_ = 0;
+    uint32_t compSubclusterDim_      = 0;
+    uint64_t compLz4PosBytes_        = 0;
+    uint64_t compLz4MaskBytes_       = 0;
+    uint64_t compLz4AoBytes_         = 0;
+    uint64_t compLz4ColorPalBytes_   = 0;
+    uint64_t compLz4TotalBytes_      = 0;
+    uint64_t mergedVbBytes_  = 0;
+    uint64_t mergedIbBytes_  = 0;
+    uint64_t atlasVbBytes_   = 0;
+    uint64_t atlasIbBytes_   = 0;
+    uint64_t atlasTexBytes_  = 0;
     uint32_t lastDrawn_ = 0;
     uint64_t lastDrawnTris_ = 0;
     uint64_t lastPolyTris_ = 0;

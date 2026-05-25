@@ -149,6 +149,11 @@ struct AppState {
     float    fpsAvg = 0.0f;
     float    fpsHist[120] = {};
     int      fpsHistIdx = 0;
+
+    // window visibility
+    bool     showControls = true;
+    bool     showFps      = true;
+    bool     showStats    = true;
 };
 
 AppState g_app;
@@ -237,18 +242,210 @@ void UpdateCamera(float dt)
     }
 }
 
-void FrameTopBar()
+void FrameMenuBar()
 {
-    ImGui::Begin("VoxelTest");
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("Windows")) {
+            ImGui::MenuItem("Controls", nullptr, &g_app.showControls);
+            ImGui::MenuItem("FPS",      nullptr, &g_app.showFps);
+            ImGui::MenuItem("Stats",    nullptr, &g_app.showStats);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+}
 
-    // fps stats
+void FrameFpsWindow()
+{
     g_app.fpsAvg = 1000.0f / (g_app.cpuFrameMs > 0.001 ? (float)g_app.cpuFrameMs : 16.0f);
     g_app.fpsHist[g_app.fpsHistIdx] = g_app.fpsAvg;
     g_app.fpsHistIdx = (g_app.fpsHistIdx + 1) % IM_ARRAYSIZE(g_app.fpsHist);
 
+    if (!g_app.showFps) return;
+    if (!ImGui::Begin("FPS", &g_app.showFps)) { ImGui::End(); return; }
     ImGui::Text("CPU frame: %.2f ms (%.0f FPS)", g_app.cpuFrameMs, g_app.fpsAvg);
     ImGui::PlotLines("FPS", g_app.fpsHist, IM_ARRAYSIZE(g_app.fpsHist),
                      g_app.fpsHistIdx, nullptr, 0.0f, 240.0f, ImVec2(0, 60));
+    ImGui::End();
+}
+
+void FrameStatsWindow()
+{
+    if (!g_app.showStats) return;
+    if (!ImGui::Begin("Stats", &g_app.showStats)) { ImGui::End(); return; }
+
+    auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
+
+    ImGui::Text("Scene");
+    {
+        size_t totalChunks = g_app.renderer.DrawCount() * (size_t)g_app.gridSize * (size_t)g_app.gridSize;
+        ImGui::Text("  Chunks: %zu  drawn: %u  (%.1f%%)",
+                    totalChunks,
+                    g_app.renderer.LastDrawnCount(),
+                    totalChunks ? 100.0f * g_app.renderer.LastDrawnCount() / (float)totalChunks : 0.0f);
+    }
+    ImGui::Text("  Tris drawn: %llu / %llu",
+                (unsigned long long)g_app.renderer.LastDrawnTris(),
+                (unsigned long long)g_app.renderer.TotalTriangles());
+    ImGui::Text("  Poly:  %llu tris  %llu verts",
+                (unsigned long long)g_app.renderer.LastPolyTris(),
+                (unsigned long long)g_app.renderer.LastPolyVerts());
+    ImGui::Text("  Points: %llu", (unsigned long long)g_app.renderer.LastPointCount());
+    ImGui::Text("  Vertices:  %llu", (unsigned long long)g_app.renderer.TotalVertices());
+    ImGui::Text("  Triangles: %llu", (unsigned long long)g_app.renderer.TotalTriangles());
+
+    ImGui::Separator();
+    ImGui::Text("GPU Memory (Full poly)");
+    ImGui::Text("  VB: %7.2f MB", mb(g_app.renderer.VbBytes()));
+    ImGui::Text("  IB: %7.2f MB", mb(g_app.renderer.IbBytes()));
+
+    ImGui::Separator();
+    ImGui::Text("Points (per LOD)");
+    {
+        const uint64_t bpp = sizeof(Vertex) + sizeof(uint32_t); // 12 + 4 = 16 B/pt
+        const uint64_t l0 = g_app.renderer.PointCountL0();
+        const uint64_t l1 = g_app.renderer.PointCountL1();
+        const uint64_t l2 = g_app.renderer.PointCountL2();
+        const uint64_t l3 = g_app.renderer.PointCountL3();
+        const uint64_t tot = l0 + l1 + l2 + l3;
+        ImGui::Text("  L0 (1 per voxel): %10llu  (%.2f MB)", (unsigned long long)l0, mb(l0 * bpp));
+        ImGui::Text("  L1 (2x2x2):       %10llu  (%.2f MB)", (unsigned long long)l1, mb(l1 * bpp));
+        ImGui::Text("  L2 (4x4x4):       %10llu  (%.2f MB)", (unsigned long long)l2, mb(l2 * bpp));
+        ImGui::Text("  L3 (8x8x8):       %10llu  (%.2f MB)", (unsigned long long)l3, mb(l3 * bpp));
+        ImGui::Text("  TOTAL:            %10llu  (%.2f MB)", (unsigned long long)tot, mb(g_app.renderer.PointBytes()));
+    }
+
+    ImGui::Separator();
+    ImGui::Text("GPU Memory (Merged)");
+    ImGui::Text("  VB: %7.2f MB", mb(g_app.renderer.MergedVbBytes()));
+    ImGui::Text("  IB: %7.2f MB", mb(g_app.renderer.MergedIbBytes()));
+
+    ImGui::Separator();
+    ImGui::Text("GPU Memory (Reduced / Atlas)");
+    ImGui::Text("  VB:      %7.2f MB", mb(g_app.renderer.AtlasVbBytes()));
+    ImGui::Text("  IB:      %7.2f MB", mb(g_app.renderer.AtlasIbBytes()));
+    ImGui::Text("  Texture: %7.2f MB", mb(g_app.renderer.AtlasTexBytes()));
+    ImGui::Text("  TOTAL:   %7.2f MB",
+                mb(g_app.renderer.AtlasVbBytes()
+                 + g_app.renderer.AtlasIbBytes()
+                 + g_app.renderer.AtlasTexBytes()));
+
+    ImGui::Separator();
+    ImGui::Text("Disk Compression Sim (L0 stream)");
+    {
+        const uint64_t raw   = g_app.renderer.CompRawBytes();
+        const uint64_t pos   = g_app.renderer.CompPosBytes();
+        const uint64_t mask  = g_app.renderer.CompMaskBytes();
+        const uint64_t ao    = g_app.renderer.CompAoBytes();
+        const uint64_t pal   = g_app.renderer.CompPaletteBytes();
+        const uint64_t cpal  = g_app.renderer.CompColorPalIdxBytes();
+        const uint64_t chuff = g_app.renderer.CompColorHuffBytes();
+        const uint64_t fixed = pos + mask + ao;
+        const uint64_t totPal  = fixed + cpal  + pal;
+        const uint64_t totHuff = fixed + chuff + pal;
+        auto ratio = [&](uint64_t t) { return t ? (double)raw / (double)t : 0.0; };
+        ImGui::Text("  chunkDim %u, posBits/axis %u",
+                    g_app.renderer.CompChunkDim(), g_app.renderer.CompPosBitsPerAxis());
+        ImGui::Text("  Raw (in-mem):   %7.2f MB", mb(raw));
+        ImGui::Text("  Pos stream:     %7.2f MB", mb(pos));
+        ImGui::Text("  visMask stream: %7.2f MB", mb(mask));
+        ImGui::Text("  AO stream:      %7.2f MB", mb(ao));
+        ImGui::Text("  Color (pal8):   %7.2f MB  + palette %llu B", mb(cpal), (unsigned long long)pal);
+        ImGui::Text("  Color (huff):   %7.2f MB  + palette %llu B", mb(chuff), (unsigned long long)pal);
+        ImGui::Separator();
+        ImGui::Text("  TOTAL pal8:     %7.2f MB  (%.2fx vs raw)", mb(totPal),  ratio(totPal));
+        ImGui::Text("  TOTAL huff:     %7.2f MB  (%.2fx vs raw)", mb(totHuff), ratio(totHuff));
+
+        const uint64_t subPos = g_app.renderer.CompSubclusterPosBytes();
+        const uint32_t subDim = g_app.renderer.CompSubclusterDim();
+        const uint64_t totSub = (fixed - pos) + subPos + cpal + pal;
+        ImGui::Separator();
+        ImGui::Text("Sub-cluster pos (S=%u): %.2f MB  (raw pos %.2f MB)",
+                    subDim, mb(subPos), mb(pos));
+        ImGui::Text("  TOTAL pal8+sub: %7.2f MB  (%.2fx vs raw)", mb(totSub), ratio(totSub));
+
+        const uint64_t lzP = g_app.renderer.CompLz4PosBytes();
+        const uint64_t lzM = g_app.renderer.CompLz4MaskBytes();
+        const uint64_t lzA = g_app.renderer.CompLz4AoBytes();
+        const uint64_t lzC = g_app.renderer.CompLz4ColorPalBytes();
+        const uint64_t lzT = g_app.renderer.CompLz4TotalBytes();
+        ImGui::Separator();
+        ImGui::Text("LZ4 per-cluster:");
+        ImGui::Text("  pos     %7.2f MB  (-> %.1f%% of raw)", mb(lzP), pos  ? 100.0 * lzP / (double)pos  : 0.0);
+        ImGui::Text("  mask    %7.2f MB  (-> %.1f%% of raw)", mb(lzM), mask ? 100.0 * lzM / (double)mask : 0.0);
+        ImGui::Text("  ao      %7.2f MB  (-> %.1f%% of raw)", mb(lzA), ao   ? 100.0 * lzA / (double)ao   : 0.0);
+        ImGui::Text("  colorPI %7.2f MB  (-> %.1f%% of raw)", mb(lzC), cpal ? 100.0 * lzC / (double)cpal : 0.0);
+        ImGui::Text("  TOTAL   %7.2f MB  (%.2fx vs raw, %.2fx vs pal8 uncompressed)",
+                    mb(lzT), ratio(lzT), totPal ? (double)totPal / (double)lzT : 0.0);
+    }
+
+    ImGui::Separator();
+    {
+        const auto& hist = g_app.renderer.ColorHistogram();
+        uint64_t totalVoxels = 0;
+        for (const auto& p : hist) totalVoxels += p.second;
+        ImGui::Text("Color Histogram (%zu unique, %llu voxels)",
+                    hist.size(), (unsigned long long)totalVoxels);
+        {
+            const double hBits   = g_app.renderer.ColorEntropyBits();
+            const double huff    = g_app.renderer.ColorHuffmanBits();
+            const uint32_t palBits = g_app.renderer.ColorPaletteBits();
+            const double raw24Mb = mb((uint64_t)totalVoxels * 3);   // 24 bpp
+            const double palMb   = mb(((uint64_t)totalVoxels * palBits + 7) / 8);
+            const double huffMb  = (totalVoxels * huff) / 8.0 / (1024.0 * 1024.0);
+            const double entMb   = (totalVoxels * hBits) / 8.0 / (1024.0 * 1024.0);
+            ImGui::Text("  Raw RGB24:    24.00 bits/color  (%7.2f MB)", raw24Mb);
+            ImGui::Text("  Palette idx:  %2u   bits/color  (%7.2f MB)  [palette %zu*3B = %.1f KB]",
+                        palBits, palMb, hist.size(), hist.size() * 3 / 1024.0);
+            ImGui::Text("  Huffman avg:  %5.3f bits/color  (%7.2f MB)", huff, huffMb);
+            ImGui::Text("  Shannon H:    %5.3f bits/color  (%7.2f MB, theoretical min)",
+                        hBits, entMb);
+            if (raw24Mb > 0.0) {
+                ImGui::Text("  Huffman ratio vs RGB24: %.2fx smaller", raw24Mb / (huffMb > 0.0 ? huffMb : 1e-9));
+            }
+        }
+        if (ImGui::BeginChild("##colorhist", ImVec2(0, 220), true,
+                              ImGuiWindowFlags_HorizontalScrollbar)) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float sw = ImGui::GetFontSize();
+            for (const auto& p : hist) {
+                const uint32_t c = p.first;
+                const uint8_t r = (uint8_t)(c & 0xFF);
+                const uint8_t g = (uint8_t)((c >> 8) & 0xFF);
+                const uint8_t b = (uint8_t)((c >> 16) & 0xFF);
+                ImVec2 pos = ImGui::GetCursorScreenPos();
+                dl->AddRectFilled(pos, ImVec2(pos.x + sw, pos.y + sw),
+                                  IM_COL32(r, g, b, 255));
+                ImGui::Dummy(ImVec2(sw, sw));
+                ImGui::SameLine();
+                const double pct = totalVoxels ? 100.0 * (double)p.second / (double)totalVoxels : 0.0;
+                ImGui::Text("#%02X%02X%02X  %10llu  (%.2f%%)",
+                            r, g, b, (unsigned long long)p.second, pct);
+            }
+        }
+        ImGui::EndChild();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Camera");
+    ImGui::Text("  Pos: %.1f %.1f %.1f",
+                (float)g_app.camera.position.x,
+                (float)g_app.camera.position.y,
+                (float)g_app.camera.position.z);
+    ImGui::Text("  Yaw: %.2f  Pitch: %.2f", g_app.camera.yaw, g_app.camera.pitch);
+
+    if (!g_app.sceneReady) {
+        ImGui::Separator();
+        ImGui::TextUnformatted(g_app.loadStatus.c_str());
+    }
+
+    ImGui::End();
+}
+
+void FrameControlsWindow()
+{
+    if (!g_app.showControls) return;
+    if (!ImGui::Begin("Controls", &g_app.showControls)) { ImGui::End(); return; }
 
     const char* datasets[] = { "Full", "Merged", "Reduced" };
     {
@@ -361,41 +558,9 @@ void FrameTopBar()
     ImGui::ColorEdit3("Clear color", g_app.bgColor);
 
     ImGui::Separator();
-    ImGui::Text("Scene");
-    {
-        size_t totalChunks = g_app.renderer.DrawCount() * (size_t)g_app.gridSize * (size_t)g_app.gridSize;
-        ImGui::Text("  Chunks: %zu  drawn: %u  (%.1f%%)",
-                    totalChunks,
-                    g_app.renderer.LastDrawnCount(),
-                    totalChunks ? 100.0f * g_app.renderer.LastDrawnCount() / (float)totalChunks : 0.0f);
-    }
-    ImGui::Text("  Tris drawn: %llu / %llu",
-                (unsigned long long)g_app.renderer.LastDrawnTris(),
-                (unsigned long long)g_app.renderer.TotalTriangles());
-    ImGui::Text("  Poly:  %llu tris  %llu verts",
-                (unsigned long long)g_app.renderer.LastPolyTris(),
-                (unsigned long long)g_app.renderer.LastPolyVerts());
-    ImGui::Text("  Points: %llu", (unsigned long long)g_app.renderer.LastPointCount());
-    ImGui::Text("  Vertices:  %llu", (unsigned long long)g_app.renderer.TotalVertices());
-    ImGui::Text("  Triangles: %llu", (unsigned long long)g_app.renderer.TotalTriangles());
-    ImGui::Text("  VB: %.1f MB   IB: %.1f MB   (24 B/vert, 4 B/idx)",
-                g_app.renderer.VbBytes() / (1024.0 * 1024.0),
-                g_app.renderer.IbBytes() / (1024.0 * 1024.0));
-
-    ImGui::Separator();
     ImGui::Text("Camera");
-    ImGui::Text("  Pos: %.1f %.1f %.1f",
-                (float)g_app.camera.position.x,
-                (float)g_app.camera.position.y,
-                (float)g_app.camera.position.z);
-    ImGui::Text("  Yaw: %.2f  Pitch: %.2f", g_app.camera.yaw, g_app.camera.pitch);
     ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
     ImGui::SliderFloat("FOV", &g_app.camera.fovDeg, 30.0f, 110.0f, "%.0f");
-
-    if (!g_app.sceneReady) {
-        ImGui::Separator();
-        ImGui::TextUnformatted(g_app.loadStatus.c_str());
-    }
 
     ImGui::Separator();
     ImGui::TextUnformatted("RMB drag: look | WASD: move | Wheel: speed | Q/E or Ctrl/Space: down/up");
@@ -550,7 +715,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        FrameTopBar();
+        FrameMenuBar();
+        FrameFpsWindow();
+        FrameStatsWindow();
+        FrameControlsWindow();
         ImGui::Render();
 
         float clear[4];

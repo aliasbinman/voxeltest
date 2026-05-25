@@ -4,7 +4,9 @@
 
 #include <d3dcompiler.h>
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <queue>
 #include <sstream>
 
 #pragma comment(lib, "d3d11.lib")
@@ -894,6 +896,74 @@ void Renderer::UploadScene(const Scene& scene)
     }
     vbBytes_ = scene.vertices.size() * sizeof(VoxelPolyVertex);
     ibBytes_ = ibCount * sizeof(uint32_t);
+    pointBytes_ = scene.pointVertices.size() * sizeof(Vertex)
+                + scene.pointAo6.size() * sizeof(uint32_t);
+    pointCountL0_ = 0;
+    pointCountL1_ = 0;
+    pointCountL2_ = 0;
+    pointCountL3_ = 0;
+    for (const auto& s : scene.subs) {
+        pointCountL0_ += s.pointCount;
+        pointCountL1_ += s.pointCountL1;
+        pointCountL2_ += s.pointCountL2;
+        pointCountL3_ += s.pointCountL3;
+    }
+    colorHistogram_ = scene.colorHistogram;
+    compRawBytes_         = scene.compRawBytes;
+    compPosBytes_         = scene.compPosBytes;
+    compMaskBytes_        = scene.compMaskBytes;
+    compAoBytes_          = scene.compAoBytes;
+    compPaletteBytes_     = scene.compPaletteBytes;
+    compColorPalIdxBytes_ = scene.compColorPalIdxBytes;
+    compColorHuffBytes_   = scene.compColorHuffBytes;
+    compPosBitsPerAxis_   = scene.compPosBitsPerAxis;
+    compChunkDim_         = scene.compChunkDim;
+    compSubclusterPosBytes_ = scene.compSubclusterPosBytes;
+    compSubclusterDim_      = scene.compSubclusterDim;
+    compLz4PosBytes_        = scene.compLz4PosBytes;
+    compLz4MaskBytes_       = scene.compLz4MaskBytes;
+    compLz4AoBytes_         = scene.compLz4AoBytes;
+    compLz4ColorPalBytes_   = scene.compLz4ColorPalBytes;
+    compLz4TotalBytes_      = scene.compLz4TotalBytes;
+
+    // Color entropy / Huffman avg bits per symbol.
+    {
+        colorEntropyBits_ = 0.0;
+        colorHuffmanBits_ = 0.0;
+        colorPaletteBits_ = 0;
+        uint64_t total = 0;
+        for (const auto& p : colorHistogram_) total += p.second;
+        if (total > 0 && !colorHistogram_.empty()) {
+            const double invT = 1.0 / (double)total;
+            for (const auto& p : colorHistogram_) {
+                const double pr = (double)p.second * invT;
+                if (pr > 0.0) colorEntropyBits_ -= pr * std::log2(pr);
+            }
+            // Palette bits: ceil(log2(unique)).
+            const size_t n = colorHistogram_.size();
+            colorPaletteBits_ = (n <= 1) ? 1u
+                : (uint32_t)std::ceil(std::log2((double)n));
+
+            // Exact Huffman: build tree via min-heap on weights; sum of all
+            // internal-node weights = total code length in symbol-occurrences.
+            // avg bits = totalCodeLen / total.
+            if (n == 1) {
+                colorHuffmanBits_ = 1.0; // degenerate: must emit something
+            } else {
+                std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> pq;
+                for (const auto& p : colorHistogram_) pq.push(p.second);
+                uint64_t totalCodeLen = 0;
+                while (pq.size() > 1) {
+                    uint64_t a = pq.top(); pq.pop();
+                    uint64_t b = pq.top(); pq.pop();
+                    uint64_t s = a + b;
+                    totalCodeLen += s;
+                    pq.push(s);
+                }
+                colorHuffmanBits_ = (double)totalCodeLen / (double)total;
+            }
+        }
+    }
 }
 
 void Renderer::UploadMergedMesh(const MergedMesh& mesh)
@@ -901,6 +971,8 @@ void Renderer::UploadMergedMesh(const MergedMesh& mesh)
     mergedVb_.Reset();
     mergedIb_.Reset();
     mergedIndexCount_ = 0;
+    mergedVbBytes_ = 0;
+    mergedIbBytes_ = 0;
     if (mesh.vertices.empty() || mesh.indices.empty()) return;
 
     D3D11_BUFFER_DESC bd = {};
@@ -918,6 +990,8 @@ void Renderer::UploadMergedMesh(const MergedMesh& mesh)
     if (FAILED(device_->CreateBuffer(&bd, &sd, mergedIb_.GetAddressOf()))) return;
 
     mergedIndexCount_ = (uint32_t)mesh.indices.size();
+    mergedVbBytes_ = mesh.vertices.size() * sizeof(MergedVertex);
+    mergedIbBytes_ = mesh.indices.size() * sizeof(uint32_t);
 }
 
 void Renderer::UploadAtlasMesh(const AtlasMesh& mesh)
@@ -927,6 +1001,9 @@ void Renderer::UploadAtlasMesh(const AtlasMesh& mesh)
     atlasTex_.Reset();
     atlasSrv_.Reset();
     atlasIndexCount_ = 0;
+    atlasVbBytes_  = 0;
+    atlasIbBytes_  = 0;
+    atlasTexBytes_ = 0;
     if (mesh.vertices.empty() || mesh.indices.empty()
         || mesh.atlasPixels.empty() || mesh.atlasW == 0 || mesh.atlasH == 0) return;
 
@@ -960,6 +1037,9 @@ void Renderer::UploadAtlasMesh(const AtlasMesh& mesh)
     if (FAILED(device_->CreateShaderResourceView(atlasTex_.Get(), nullptr, atlasSrv_.GetAddressOf()))) return;
 
     atlasIndexCount_ = (uint32_t)mesh.indices.size();
+    atlasVbBytes_  = mesh.vertices.size() * sizeof(AtlasVertex);
+    atlasIbBytes_  = mesh.indices.size() * sizeof(uint32_t);
+    atlasTexBytes_ = (uint64_t)mesh.atlasW * (uint64_t)mesh.atlasH * 4;
     atlasOrigin_[0] = (float)mesh.origin[0];
     atlasOrigin_[1] = (float)mesh.origin[1];
     atlasOrigin_[2] = (float)mesh.origin[2];

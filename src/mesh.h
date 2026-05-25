@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 // Unified 12-byte vertex (vb_ and pointVb_). Scene-relative position with
@@ -54,4 +55,24 @@ struct Scene {
     float    aabbMax[3] = { -1e30f, -1e30f, -1e30f };
     uint64_t totalTriangles = 0;
     uint64_t totalVertices  = 0;
+    // Per-color voxel counts (L0). RGB packed 0x00BBGGRR; sorted desc by count.
+    std::vector<std::pair<uint32_t, uint64_t>> colorHistogram;
+
+    // Disk-compression simulation results (L0 only). All bytes.
+    uint64_t compRawBytes        = 0;  // pointVertices+pointAo6 today
+    uint64_t compPaletteBytes    = 0;  // palette table cost (n_unique * 3)
+    uint64_t compPosBytes        = 0;  // bit-packed positions (chunk-local)
+    uint64_t compMaskBytes       = 0;  // bit-packed 6-bit visMask
+    uint64_t compAoBytes         = 0;  // bit-packed 24-bit AO (6 faces * 4 bits)
+    uint64_t compColorPalIdxBytes = 0; // 8-bit palette indices
+    uint64_t compColorHuffBytes  = 0;  // Huffman-coded color indices
+    uint32_t compPosBitsPerAxis  = 0;  // ceil(log2(chunkDim))
+    uint32_t compChunkDim        = 0;
+    uint64_t compSubclusterPosBytes = 0; // pos via sub-cluster headers + intra-cell bits
+    uint32_t compSubclusterDim      = 0; // S (sub-cell edge in voxels)
+    uint64_t compLz4PosBytes       = 0; // LZ4 over pos stream (per-chunk concat)
+    uint64_t compLz4MaskBytes      = 0;
+    uint64_t compLz4AoBytes        = 0;
+    uint64_t compLz4ColorPalBytes  = 0;
+    uint64_t compLz4TotalBytes     = 0; // sum + palette table
 };

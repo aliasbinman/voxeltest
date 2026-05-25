@@ -6,8 +6,12 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
+#include <queue>
 #include <vector>
 #include <unordered_map>
+
+#include "lz4.h"
 
 namespace {
 
@@ -277,5 +281,256 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
 
     out.totalVertices  = out.vertices.size();
     out.totalTriangles = out.indices.size() / 3;
+
+    {
+        uint64_t l0 = 0, l1 = 0, l2 = 0, l3 = 0;
+        for (const auto& s : out.subs) {
+            l0 += s.pointCount;
+            l1 += s.pointCountL1;
+            l2 += s.pointCountL2;
+            l3 += s.pointCountL3;
+        }
+        const uint64_t total = l0 + l1 + l2 + l3;
+        const uint64_t bytesPerPoint = sizeof(Vertex) + sizeof(uint32_t); // pointVertices + pointAo6
+        auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
+        std::printf("[pointcloud] L0: %10llu pts  %8.2f MB\n", (unsigned long long)l0, mb(l0 * bytesPerPoint));
+        std::printf("[pointcloud] L1: %10llu pts  %8.2f MB\n", (unsigned long long)l1, mb(l1 * bytesPerPoint));
+        std::printf("[pointcloud] L2: %10llu pts  %8.2f MB\n", (unsigned long long)l2, mb(l2 * bytesPerPoint));
+        std::printf("[pointcloud] L3: %10llu pts  %8.2f MB\n", (unsigned long long)l3, mb(l3 * bytesPerPoint));
+        std::printf("[pointcloud] TOTAL: %llu pts  %.2f MB (vtx %zu + ao %zu actual = %.2f MB)\n",
+                    (unsigned long long)total, mb(total * bytesPerPoint),
+                    out.pointVertices.size(), out.pointAo6.size(),
+                    mb(out.pointVertices.size() * sizeof(Vertex) + out.pointAo6.size() * sizeof(uint32_t)));
+    }
+
+    {
+        std::unordered_map<uint32_t, uint64_t> hist;
+        hist.reserve(4096);
+        for (const auto& s : out.subs) {
+            const uint32_t end = s.pointFirst + s.pointCount; // L0 only: 1 per voxel
+            for (uint32_t i = s.pointFirst; i < end; ++i) {
+                const uint32_t rgb = out.pointVertices[i].color & 0x00FFFFFFu;
+                ++hist[rgb];
+            }
+        }
+        out.colorHistogram.assign(hist.begin(), hist.end());
+        std::sort(out.colorHistogram.begin(), out.colorHistogram.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::printf("[colorhist] %zu unique colors (L0 voxels)\n", out.colorHistogram.size());
+        for (const auto& p : out.colorHistogram) {
+            const uint32_t c = p.first;
+            std::printf("  #%02X%02X%02X  %10llu\n",
+                        c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
+                        (unsigned long long)p.second);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Disk-compression simulation (L0 only).
+    // Streams (interleaved at load time, separated on disk):
+    //   pos:      ceil(log2(chunkDim)) bits/axis * 3 = posBits per voxel
+    //   visMask:  6 bits
+    //   AO6:      24 bits (4 bits * 6 faces)
+    //   color:    8-bit palette idx OR Huffman over palette idx
+    // Plus per-chunk header (cx,cy,cz,count = 8 B) and palette table (n*3 B).
+    // -----------------------------------------------------------------
+    {
+        // True L0 count (one entry per visible voxel). pointVertices includes
+        // L1/L2/L3 aggregates too — exclude those: LODs are re-derivable from
+        // L0 on load so they don't need to live on disk.
+        uint64_t L0 = 0;
+        for (const auto& s : out.subs) L0 += s.pointCount;
+        const uint32_t posBitsPerAxis = (D <= 1) ? 1u
+            : (uint32_t)std::ceil(std::log2((double)D));
+        const uint32_t posBits  = posBitsPerAxis * 3u;
+        const uint32_t maskBits = 6u;
+        const uint32_t aoBits   = 24u;
+        const uint32_t palIdxBits = 8u; // assumes <=256 unique; otherwise raise
+
+        out.compChunkDim       = (uint32_t)D;
+        out.compPosBitsPerAxis = posBitsPerAxis;
+        out.compRawBytes       = L0 * (sizeof(Vertex) + sizeof(uint32_t));
+        out.compPaletteBytes   = (uint64_t)out.colorHistogram.size() * 3ull;
+        out.compPosBytes       = (L0 * posBits + 7) / 8;
+        out.compMaskBytes      = (L0 * maskBits + 7) / 8;
+        out.compAoBytes        = (L0 * aoBits + 7) / 8;
+        out.compColorPalIdxBytes = (L0 * palIdxBits + 7) / 8;
+
+        // Exact Huffman over color symbols (weights = histogram counts).
+        double huffBitsPerSym = 0.0;
+        const size_t n = out.colorHistogram.size();
+        if (n == 1) {
+            huffBitsPerSym = 1.0;
+        } else if (n >= 2) {
+            std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> pq;
+            for (const auto& p : out.colorHistogram) pq.push(p.second);
+            uint64_t totalCodeLen = 0;
+            while (pq.size() > 1) {
+                uint64_t a = pq.top(); pq.pop();
+                uint64_t b = pq.top(); pq.pop();
+                uint64_t s = a + b;
+                totalCodeLen += s;
+                pq.push(s);
+            }
+            huffBitsPerSym = (double)totalCodeLen / (double)L0;
+        }
+        // Total color bits = huffBitsPerSym * L0. Plus code-table cost
+        // (canonical Huffman: ~n bytes for code lengths). Negligible vs payload.
+        const uint64_t huffPayloadBits = (uint64_t)std::ceil(huffBitsPerSym * (double)L0);
+        out.compColorHuffBytes = (huffPayloadBits + 7) / 8 + n; // +n for code-len table
+
+        auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
+        const uint64_t fixedStreams = out.compPosBytes + out.compMaskBytes + out.compAoBytes;
+        const uint64_t totalPal  = fixedStreams + out.compColorPalIdxBytes + out.compPaletteBytes;
+        const uint64_t totalHuff = fixedStreams + out.compColorHuffBytes   + out.compPaletteBytes;
+
+        std::printf("[compress] L0=%llu voxels, chunkDim=%d, posBits/axis=%u\n",
+                    (unsigned long long)L0, D, posBitsPerAxis);
+        std::printf("[compress]   raw (in-mem):      %8.2f MB  (%u B/voxel)\n",
+                    mb(out.compRawBytes), (unsigned)(sizeof(Vertex) + sizeof(uint32_t)));
+        std::printf("[compress]   pos stream:       %8.2f MB  (%u bits/voxel)\n", mb(out.compPosBytes), posBits);
+        std::printf("[compress]   visMask stream:   %8.2f MB  (%u bits/voxel)\n", mb(out.compMaskBytes), maskBits);
+        std::printf("[compress]   AO stream:        %8.2f MB  (%u bits/voxel)\n", mb(out.compAoBytes), aoBits);
+        std::printf("[compress]   color (pal8):     %8.2f MB  (8 bits/voxel) + palette %llu B\n",
+                    mb(out.compColorPalIdxBytes), (unsigned long long)out.compPaletteBytes);
+        std::printf("[compress]   color (huffman):  %8.2f MB  (%.3f bits/voxel avg) + palette %llu B\n",
+                    mb(out.compColorHuffBytes), huffBitsPerSym, (unsigned long long)out.compPaletteBytes);
+        std::printf("[compress]   TOTAL pal8:       %8.2f MB  (ratio %.2fx)\n",
+                    mb(totalPal), out.compRawBytes ? (double)out.compRawBytes / (double)totalPal : 0.0);
+        std::printf("[compress]   TOTAL huffman:    %8.2f MB  (ratio %.2fx)\n",
+                    mb(totalHuff), out.compRawBytes ? (double)out.compRawBytes / (double)totalHuff : 0.0);
+    }
+
+    // -----------------------------------------------------------------
+    // Sub-cluster position scheme + LZ4 over per-chunk binary blobs.
+    // Build palette map from colorHistogram (palette index = rank).
+    // -----------------------------------------------------------------
+    {
+        std::unordered_map<uint32_t, uint32_t> palMap;
+        palMap.reserve(out.colorHistogram.size() * 2);
+        for (uint32_t i = 0; i < out.colorHistogram.size(); ++i)
+            palMap[out.colorHistogram[i].first] = i;
+
+        const uint32_t posBitsPerAxis = (D <= 1) ? 1u
+            : (uint32_t)std::ceil(std::log2((double)D));
+
+        // Sub-cluster S: pick largest power-of-two <= D/4 (at least 2).
+        uint32_t S = 4;
+        while (S * 2 <= (uint32_t)D / 2) S *= 2;
+        if (S < 2) S = 2;
+        const uint32_t cellsPerAxis = (uint32_t)D / S;          // assumes D % S == 0
+        const uint32_t cellIdxBits  = (cellsPerAxis <= 1) ? 1u
+            : (uint32_t)std::ceil(std::log2((double)cellsPerAxis)) * 3u;
+        const uint32_t intraBits    = (S <= 1) ? 3u
+            : (uint32_t)std::ceil(std::log2((double)S)) * 3u;
+        // Per-cell header: cellIdx + uint16 count.
+        const uint32_t cellHdrBits  = cellIdxBits + 16u;
+
+        out.compSubclusterDim = S;
+
+        // LZ4 stream-per-chunk: accumulate compressed sizes.
+        uint64_t lz4Pos = 0, lz4Mask = 0, lz4Ao = 0, lz4Pal = 0;
+        uint64_t subPosBits = 0;
+
+        // Reusable scratch buffers.
+        std::vector<uint8_t> posBlob, maskBlob, aoBlob, palBlob, compScratch;
+
+        auto packStream = [](std::vector<uint8_t>& dst, uint32_t bitsPerSym,
+                             const std::vector<uint32_t>& syms) {
+            const uint64_t totalBits = (uint64_t)bitsPerSym * syms.size();
+            dst.assign((totalBits + 7) / 8, 0);
+            uint64_t bitPos = 0;
+            for (uint32_t v : syms) {
+                for (uint32_t b = 0; b < bitsPerSym; ++b) {
+                    if ((v >> b) & 1u) dst[bitPos >> 3] |= (uint8_t)(1u << (bitPos & 7));
+                    ++bitPos;
+                }
+            }
+        };
+
+        auto lz4Compress = [&](const std::vector<uint8_t>& src) -> int {
+            if (src.empty()) return 0;
+            const int bound = LZ4_compressBound((int)src.size());
+            if (bound <= 0) return 0;
+            if ((int)compScratch.size() < bound) compScratch.resize((size_t)bound);
+            return LZ4_compress_default((const char*)src.data(), (char*)compScratch.data(),
+                                        (int)src.size(), bound);
+        };
+
+        for (uint32_t ci = 0; ci < chunkCount; ++ci) {
+            const ChunkMeta& m = metas[ci];
+            if (m.voxelCount == 0) continue;
+            const DiskVoxel* cv = voxels.data() + m.voxelOffset;
+
+            // Collect symbol streams (visible voxels only — match L0 pipeline).
+            std::vector<uint32_t> posSyms, maskSyms, aoSyms, palSyms;
+            posSyms.reserve(m.voxelCount);
+            maskSyms.reserve(m.voxelCount);
+            aoSyms.reserve(m.voxelCount);
+            palSyms.reserve(m.voxelCount);
+
+            // Sub-cluster bin count per cell (for header cost).
+            std::unordered_map<uint32_t, uint32_t> cellCount;
+            cellCount.reserve(64);
+
+            for (uint32_t i = 0; i < m.voxelCount; ++i) {
+                const DiskVoxel& dv = cv[i];
+                if (dv.visMask == 0) continue;
+                uint32_t pos = (uint32_t)dv.x
+                             | ((uint32_t)dv.y << 8)
+                             | ((uint32_t)dv.z << 16);
+                posSyms.push_back(pos);
+                maskSyms.push_back(dv.visMask & 0x3Fu);
+                uint32_t ao6 = 0;
+                for (int fi = 0; fi < 6; ++fi)
+                    ao6 |= (uint32_t)((dv.ao[fi] >> 4) & 0xFu) << (fi * 4);
+                aoSyms.push_back(ao6);
+                auto it = palMap.find(dv.color & 0x00FFFFFFu);
+                palSyms.push_back(it != palMap.end() ? it->second : 0u);
+
+                uint32_t cx = dv.x / S, cy = dv.y / S, cz = dv.z / S;
+                uint32_t cellId = cx + cy * cellsPerAxis + cz * cellsPerAxis * cellsPerAxis;
+                ++cellCount[cellId];
+            }
+            if (posSyms.empty()) continue;
+
+            // Sub-cluster bit cost: occupied cell headers + per-voxel intra bits.
+            subPosBits += (uint64_t)cellHdrBits * cellCount.size()
+                       +  (uint64_t)intraBits   * posSyms.size();
+
+            // Build packed blobs for LZ4. Pos stream = raw 15..18 bits/voxel
+            // (whatever posBits resolved to); palette idx = 1 byte each.
+            packStream(posBlob,  posBitsPerAxis * 3u, posSyms);
+            packStream(maskBlob, 6u,                  maskSyms);
+            packStream(aoBlob,   24u,                 aoSyms);
+            palBlob.assign(palSyms.size(), 0);
+            for (size_t k = 0; k < palSyms.size(); ++k) palBlob[k] = (uint8_t)palSyms[k];
+
+            lz4Pos  += (uint64_t)lz4Compress(posBlob);
+            lz4Mask += (uint64_t)lz4Compress(maskBlob);
+            lz4Ao   += (uint64_t)lz4Compress(aoBlob);
+            lz4Pal  += (uint64_t)lz4Compress(palBlob);
+        }
+
+        out.compSubclusterPosBytes = (subPosBits + 7) / 8;
+        out.compLz4PosBytes        = lz4Pos;
+        out.compLz4MaskBytes       = lz4Mask;
+        out.compLz4AoBytes         = lz4Ao;
+        out.compLz4ColorPalBytes   = lz4Pal;
+        out.compLz4TotalBytes      = lz4Pos + lz4Mask + lz4Ao + lz4Pal + out.compPaletteBytes;
+
+        auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
+        std::printf("[compress] subcluster S=%u (cellIdx %u bits + intra %u bits): pos = %.2f MB\n",
+                    S, cellIdxBits, intraBits, mb(out.compSubclusterPosBytes));
+        std::printf("[compress] LZ4 per-chunk:\n");
+        std::printf("[compress]   pos     %.2f MB  (raw %.2f MB)\n", mb(lz4Pos),  mb(out.compPosBytes));
+        std::printf("[compress]   mask    %.2f MB  (raw %.2f MB)\n", mb(lz4Mask), mb(out.compMaskBytes));
+        std::printf("[compress]   ao      %.2f MB  (raw %.2f MB)\n", mb(lz4Ao),   mb(out.compAoBytes));
+        std::printf("[compress]   colorPI %.2f MB  (raw %.2f MB)\n", mb(lz4Pal),  mb(out.compColorPalIdxBytes));
+        std::printf("[compress]   TOTAL   %.2f MB + palette %llu B  (ratio vs raw %.2fx)\n",
+                    mb(out.compLz4TotalBytes), (unsigned long long)out.compPaletteBytes,
+                    out.compRawBytes ? (double)out.compRawBytes / (double)out.compLz4TotalBytes : 0.0);
+    }
+
     return true;
 }
