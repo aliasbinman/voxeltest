@@ -36,28 +36,130 @@ struct ChunkMeta {
 };
 static_assert(sizeof(ChunkMeta) == 16, "");
 
-// 8 cube corners. Index bits: bit0=x, bit1=y, bit2=z.
-static const uint8_t kCornerOffset[8][3] = {
-    {0,0,0}, {1,0,0}, {0,1,0}, {1,1,0},
-    {0,0,1}, {1,0,1}, {0,1,1}, {1,1,1},
+// -----------------------------------------------------------------
+// Baked sidecar (.vxb): pre-computed everything LoadVoxScene would
+// generate on the slow path. Lets the loader skip lodPass / palette
+// expansion / histogram entirely.
+// -----------------------------------------------------------------
+struct VxbHeader {
+    char     magic[4];           // "VXB1"
+    uint32_t version;            // kAssetVersion
+    int32_t  origin[3];
+    float    sunDir[3];
+    float    aabbMin[3];
+    float    aabbMax[3];
+    uint32_t pointTotal;         // pointVertices.size() (L0+L1+L2+L3 concat)
+    uint32_t subCount;           // subs.size()
+    uint32_t histCount;          // colorHistogram.size()
+    uint32_t _pad;
 };
+static_assert(sizeof(VxbHeader) == 4 + 4 + 12 + 12 + 12 + 12 + 16, "");
 
-// Per face: 4 corner indices into the 8-corner cube, in winding order so
-// that triangles (c0,c1,c2)(c0,c2,c3) have outward cross product.
-// Order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z (matches visMask bits)
-static const uint8_t kFaceCornerIdx[6][4] = {
-    { 1, 3, 7, 5 },   // +X
-    { 4, 6, 2, 0 },   // -X
-    { 2, 6, 7, 3 },   // +Y
-    { 0, 1, 5, 4 },   // -Y
-    { 5, 7, 6, 4 },   // +Z
-    { 0, 2, 3, 1 },   // -Z
-};
+static std::string BakedPath(const char* voxPath)
+{
+    std::string p(voxPath);
+    size_t dot = p.find_last_of('.');
+    if (dot != std::string::npos) p.resize(dot);
+    p += ".vxb";
+    return p;
+}
+
+static bool LoadBakedScene(const char* path, Scene& out, std::string& err)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) { err = "no baked file"; return false; }
+
+    VxbHeader h;
+    if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); err = "vxb: header read"; return false; }
+    if (memcmp(h.magic, "VXB1", 4) != 0) { fclose(f); err = "vxb: bad magic"; return false; }
+    if (h.version != kAssetVersion)      { fclose(f); err = "vxb: stale version"; return false; }
+
+    for (int i = 0; i < 3; ++i) {
+        out.origin[i]  = h.origin[i];
+        out.sunDir[i]  = h.sunDir[i];
+        out.aabbMin[i] = h.aabbMin[i];
+        out.aabbMax[i] = h.aabbMax[i];
+    }
+
+    out.subs.assign(h.subCount, SubMesh{});
+    if (h.subCount && fread(out.subs.data(), sizeof(SubMesh), h.subCount, f) != h.subCount) {
+        fclose(f); err = "vxb: subs read"; return false;
+    }
+
+    out.pointVertices.assign(h.pointTotal, Vertex{});
+    if (h.pointTotal && fread(out.pointVertices.data(), sizeof(Vertex), h.pointTotal, f) != h.pointTotal) {
+        fclose(f); err = "vxb: verts read"; return false;
+    }
+
+    out.pointAo6.assign(h.pointTotal, 0u);
+    if (h.pointTotal && fread(out.pointAo6.data(), sizeof(uint32_t), h.pointTotal, f) != h.pointTotal) {
+        fclose(f); err = "vxb: ao6 read"; return false;
+    }
+
+    out.colorHistogram.clear();
+    out.colorHistogram.resize(h.histCount);
+    for (uint32_t i = 0; i < h.histCount; ++i) {
+        uint32_t rgb = 0; uint64_t cnt = 0;
+        if (fread(&rgb, sizeof(uint32_t), 1, f) != 1 ||
+            fread(&cnt, sizeof(uint64_t), 1, f) != 1) {
+            fclose(f); err = "vxb: hist read"; return false;
+        }
+        out.colorHistogram[i] = { rgb, cnt };
+    }
+
+    fclose(f);
+    return true;
+}
+
+static bool WriteBakedScene(const char* path, const Scene& s)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+
+    VxbHeader h{};
+    memcpy(h.magic, "VXB1", 4);
+    h.version = kAssetVersion;
+    for (int i = 0; i < 3; ++i) {
+        h.origin[i]  = s.origin[i];
+        h.sunDir[i]  = s.sunDir[i];
+        h.aabbMin[i] = s.aabbMin[i];
+        h.aabbMax[i] = s.aabbMax[i];
+    }
+    h.pointTotal = (uint32_t)s.pointVertices.size();
+    h.subCount   = (uint32_t)s.subs.size();
+    h.histCount  = (uint32_t)s.colorHistogram.size();
+    h._pad = 0;
+    fwrite(&h, sizeof(h), 1, f);
+
+    if (h.subCount)     fwrite(s.subs.data(),         sizeof(SubMesh),  h.subCount,    f);
+    if (h.pointTotal)   fwrite(s.pointVertices.data(),sizeof(Vertex),   h.pointTotal,  f);
+    if (h.pointTotal)   fwrite(s.pointAo6.data(),     sizeof(uint32_t), h.pointTotal,  f);
+    for (const auto& p : s.colorHistogram) {
+        uint32_t rgb = p.first;
+        uint64_t cnt = p.second;
+        fwrite(&rgb, sizeof(uint32_t), 1, f);
+        fwrite(&cnt, sizeof(uint64_t), 1, f);
+    }
+
+    fclose(f);
+    return true;
+}
 
 } // namespace
 
 bool LoadVoxScene(const char* path, Scene& out, std::string& err)
 {
+    // Try the baked sidecar first — everything pre-computed (LOD aggregates,
+    // palette-expanded RGB, histogram). Direct fread, no post-processing.
+    std::string baked = BakedPath(path);
+    std::string bakedErr;
+    if (LoadBakedScene(baked.c_str(), out, bakedErr)) {
+        std::printf("[load] baked %s\n", baked.c_str());
+        return true;
+    }
+    std::printf("[load] no baked file (%s) — building from %s\n",
+                bakedErr.c_str(), path);
+
     FILE* f = fopen(path, "rb");
     if (!f) { err = "open failed"; return false; }
 
@@ -102,17 +204,11 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
     const int D = (int)chunkDim;
     if (D <= 0 || D > 256) { err = "bad chunkDim"; return false; }
 
-    out.vertices.clear();
-    out.indices.clear();
     out.pointVertices.clear();
     out.subs.clear();
     out.aabbMin[0] = out.aabbMin[1] = out.aabbMin[2] =  1e30f;
     out.aabbMax[0] = out.aabbMax[1] = out.aabbMax[2] = -1e30f;
-    out.totalVertices = 0;
-    out.totalTriangles = 0;
     out.subs.reserve(chunkCount);
-    out.vertices.reserve((size_t)totalVoxels * 8);
-    out.indices.reserve((size_t)totalVoxels * 12);
     out.pointVertices.reserve(totalVoxels);
     out.pointAo6.reserve(totalVoxels);
     out.origin[0] = origin[0];
@@ -126,7 +222,7 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
     std::vector<SubMesh> temp(chunkCount);
     std::vector<uint8_t> chunkValid(chunkCount, 0);
 
-    // Pass 1: poly mesh + L0 points (one per visible voxel).
+    // Pass 1: L0 points (one per visible voxel). AABB is the voxel-cell extent.
     for (uint32_t ci = 0; ci < chunkCount; ++ci) {
         const ChunkMeta& m = metas[ci];
         if (m.voxelCount == 0) continue;
@@ -136,8 +232,6 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
         float baseZ = (float)(origin[2] + (int32_t)m.cz * D);
 
         SubMesh sm;
-        sm.firstIndex = (uint32_t)out.indices.size();
-        sm.baseVertex = 0;
         sm.pointFirst = (uint32_t)out.pointVertices.size();
         sm.pointCount = 0;
         sm.chunkBase[0] = baseX;
@@ -160,12 +254,8 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
             int sry = sceneBaseY + dv.y;
             int srz = sceneBaseZ + dv.z;
 
-            // Point vertex AO: brightest visible face (max). Matches the poly
-            // path's per-face AO for top-facing surfaces so splats and polys
-            // line up visually in SplatHybrid mode.
-            // Max-of-visible-faces AO. Matches the L1/L2/L3 cluster aggregation
-            // (which sums voxAoMax then averages over the bin), so AO debug
-            // view stays consistent across LODs.
+            // Point vertex AO: brightest visible face (max). Matches the L1/L2/L3
+            // cluster aggregation so AO debug stays consistent across LODs.
             uint8_t pointAo = 0;
             for (int fi = 0; fi < 6; ++fi) {
                 if (!((mask >> fi) & 1u)) continue;
@@ -183,40 +273,21 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
             out.pointAo6.push_back(ao6);
             ++sm.pointCount;
 
-            // Poly: emit 4 verts per visible face (each carries that face's
-            // AO in vertex aux). Drops the 8-corner sharing — same vert count
-            // overall since each voxel averages ~2 visible faces × 4 = 8.
-            for (int fi = 0; fi < 6; ++fi) {
-                if (!((mask >> fi) & 1u)) continue;
-                uint8_t faceAo = DvAo(dv, fi);
-                uint32_t vBase = (uint32_t)out.vertices.size();
-                for (int k = 0; k < 4; ++k) {
-                    int c = kFaceCornerIdx[fi][k];
-                    int x = srx + kCornerOffset[c][0];
-                    int y = sry + kCornerOffset[c][1];
-                    int z = srz + kCornerOffset[c][2];
-                    out.vertices.push_back(MakeVoxVertex(x, y, z, dvCol, 0xFF, faceAo));
-
-                    float wx = baseX + (float)kCornerOffset[c][0] + (float)dv.x;
-                    float wy = baseY + (float)kCornerOffset[c][1] + (float)dv.y;
-                    float wz = baseZ + (float)kCornerOffset[c][2] + (float)dv.z;
-                    if (wx < sm.aabbMin[0]) sm.aabbMin[0] = wx;
-                    if (wy < sm.aabbMin[1]) sm.aabbMin[1] = wy;
-                    if (wz < sm.aabbMin[2]) sm.aabbMin[2] = wz;
-                    if (wx > sm.aabbMax[0]) sm.aabbMax[0] = wx;
-                    if (wy > sm.aabbMax[1]) sm.aabbMax[1] = wy;
-                    if (wz > sm.aabbMax[2]) sm.aabbMax[2] = wz;
-                }
-                out.indices.push_back(vBase + 0);
-                out.indices.push_back(vBase + 1);
-                out.indices.push_back(vBase + 2);
-                out.indices.push_back(vBase + 0);
-                out.indices.push_back(vBase + 2);
-                out.indices.push_back(vBase + 3);
-            }
+            // AABB: voxel cell occupies [pos, pos+1] in world coords.
+            float wxMin = baseX + (float)dv.x;
+            float wyMin = baseY + (float)dv.y;
+            float wzMin = baseZ + (float)dv.z;
+            float wxMax = wxMin + 1.0f;
+            float wyMax = wyMin + 1.0f;
+            float wzMax = wzMin + 1.0f;
+            if (wxMin < sm.aabbMin[0]) sm.aabbMin[0] = wxMin;
+            if (wyMin < sm.aabbMin[1]) sm.aabbMin[1] = wyMin;
+            if (wzMin < sm.aabbMin[2]) sm.aabbMin[2] = wzMin;
+            if (wxMax > sm.aabbMax[0]) sm.aabbMax[0] = wxMax;
+            if (wyMax > sm.aabbMax[1]) sm.aabbMax[1] = wyMax;
+            if (wzMax > sm.aabbMax[2]) sm.aabbMax[2] = wzMax;
         }
-        sm.indexCount = (uint32_t)out.indices.size() - sm.firstIndex;
-        if (sm.indexCount == 0 && sm.pointCount == 0) continue;
+        if (sm.pointCount == 0) continue;
         if (sm.aabbMax[0] < sm.aabbMin[0]) {
             sm.aabbMin[0] = baseX; sm.aabbMin[1] = baseY; sm.aabbMin[2] = baseZ;
             sm.aabbMax[0] = baseX + D; sm.aabbMax[1] = baseY + D; sm.aabbMax[2] = baseZ + D;
@@ -301,35 +372,12 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
         out.subs.push_back(sm);
     }
 
-    out.totalVertices  = out.vertices.size();
-    out.totalTriangles = out.indices.size() / 3;
-
-    {
-        uint64_t l0 = 0, l1 = 0, l2 = 0, l3 = 0;
-        for (const auto& s : out.subs) {
-            l0 += s.pointCount;
-            l1 += s.pointCountL1;
-            l2 += s.pointCountL2;
-            l3 += s.pointCountL3;
-        }
-        const uint64_t total = l0 + l1 + l2 + l3;
-        const uint64_t bytesPerPoint = sizeof(Vertex) + sizeof(uint32_t); // pointVertices + pointAo6
-        auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
-        std::printf("[pointcloud] L0: %10llu pts  %8.2f MB\n", (unsigned long long)l0, mb(l0 * bytesPerPoint));
-        std::printf("[pointcloud] L1: %10llu pts  %8.2f MB\n", (unsigned long long)l1, mb(l1 * bytesPerPoint));
-        std::printf("[pointcloud] L2: %10llu pts  %8.2f MB\n", (unsigned long long)l2, mb(l2 * bytesPerPoint));
-        std::printf("[pointcloud] L3: %10llu pts  %8.2f MB\n", (unsigned long long)l3, mb(l3 * bytesPerPoint));
-        std::printf("[pointcloud] TOTAL: %llu pts  %.2f MB (vtx %zu + ao %zu actual = %.2f MB)\n",
-                    (unsigned long long)total, mb(total * bytesPerPoint),
-                    out.pointVertices.size(), out.pointAo6.size(),
-                    mb(out.pointVertices.size() * sizeof(Vertex) + out.pointAo6.size() * sizeof(uint32_t)));
-    }
-
+    // Color histogram (L0 only). Cheap pass; kept in load path so Stats has data.
     {
         std::unordered_map<uint32_t, uint64_t> hist;
         hist.reserve(4096);
         for (const auto& s : out.subs) {
-            const uint32_t end = s.pointFirst + s.pointCount; // L0 only: 1 per voxel
+            const uint32_t end = s.pointFirst + s.pointCount;
             for (uint32_t i = s.pointFirst; i < end; ++i) {
                 const uint32_t rgb = out.pointVertices[i].color & 0x00FFFFFFu;
                 ++hist[rgb];
@@ -338,23 +386,13 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
         out.colorHistogram.assign(hist.begin(), hist.end());
         std::sort(out.colorHistogram.begin(), out.colorHistogram.end(),
                   [](const auto& a, const auto& b) { return a.second > b.second; });
-        std::printf("[colorhist] %zu unique colors (L0 voxels)\n", out.colorHistogram.size());
-        for (const auto& p : out.colorHistogram) {
-            const uint32_t c = p.first;
-            std::printf("  #%02X%02X%02X  %10llu\n",
-                        c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF,
-                        (unsigned long long)p.second);
-        }
     }
 
+    // Compression simulation was removed from the load path — call
+    // RunCompressionAnalysis() on demand (from the Stats window).
+#if 0
     // -----------------------------------------------------------------
     // Disk-compression simulation (L0 only).
-    // Streams (interleaved at load time, separated on disk):
-    //   pos:      ceil(log2(chunkDim)) bits/axis * 3 = posBits per voxel
-    //   visMask:  6 bits
-    //   AO6:      24 bits (4 bits * 6 faces)
-    //   color:    8-bit palette idx OR Huffman over palette idx
-    // Plus per-chunk header (cx,cy,cz,count = 8 B) and palette table (n*3 B).
     // -----------------------------------------------------------------
     {
         // True L0 count (one entry per visible voxel). pointVertices includes
@@ -553,6 +591,193 @@ bool LoadVoxScene(const char* path, Scene& out, std::string& err)
                     mb(out.compLz4TotalBytes), (unsigned long long)out.compPaletteBytes,
                     out.compRawBytes ? (double)out.compRawBytes / (double)out.compLz4TotalBytes : 0.0);
     }
+#endif
 
+    if (WriteBakedScene(baked.c_str(), out)) {
+        std::printf("[load] wrote baked %s\n", baked.c_str());
+    } else {
+        std::printf("[load] WARN: failed to write baked %s\n", baked.c_str());
+    }
+
+    return true;
+}
+
+// -----------------------------------------------------------------
+// On-demand: re-reads raw .vox + runs LZ4/Huffman/sub-cluster analysis.
+// Writes results into out.comp* fields. colorHistogram must already exist.
+// -----------------------------------------------------------------
+bool RunCompressionAnalysis(const char* path, Scene& out, std::string& err)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) { err = "open failed"; return false; }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "VXL3", 4) != 0) {
+        fclose(f); err = "bad magic"; return false;
+    }
+    uint32_t version = 0;
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1 || version != kAssetVersion) {
+        fclose(f); err = "asset version mismatch"; return false;
+    }
+    uint32_t chunkDim = 0, chunkCount = 0, totalVoxels = 0;
+    int32_t origin[3] = { 0, 0, 0 };
+    float sunDir[3] = { 0, 0, 0 };
+    fread(&chunkDim, sizeof(uint32_t), 1, f);
+    fread(&chunkCount, sizeof(uint32_t), 1, f);
+    fread(&totalVoxels, sizeof(uint32_t), 1, f);
+    fread(origin, sizeof(int32_t), 3, f);
+    fread(sunDir, sizeof(float), 3, f);
+
+    uint32_t paletteCount = 0;
+    fread(&paletteCount, sizeof(uint32_t), 1, f);
+    std::vector<uint32_t> palette(paletteCount);
+    if (paletteCount) fread(palette.data(), sizeof(uint32_t), paletteCount, f);
+
+    std::vector<ChunkMeta> metas(chunkCount);
+    if (chunkCount) fread(metas.data(), sizeof(ChunkMeta), chunkCount, f);
+
+    std::vector<DiskVoxel> voxels(totalVoxels);
+    if (totalVoxels) fread(voxels.data(), sizeof(DiskVoxel), totalVoxels, f);
+    fclose(f);
+
+    auto DvColor = [&](const DiskVoxel& v) -> uint32_t {
+        return v.paletteIdx < palette.size() ? palette[v.paletteIdx] : 0xFF000000u;
+    };
+
+    const int D = (int)chunkDim;
+    uint64_t L0 = 0;
+    for (const auto& s : out.subs) L0 += s.pointCount;
+
+    const uint32_t posBitsPerAxis = (D <= 1) ? 1u
+        : (uint32_t)std::ceil(std::log2((double)D));
+    const uint32_t posBits  = posBitsPerAxis * 3u;
+    const uint32_t maskBits = 6u;
+    const uint32_t aoBits   = 24u;
+    const uint32_t palIdxBits = 8u;
+
+    out.compChunkDim       = (uint32_t)D;
+    out.compPosBitsPerAxis = posBitsPerAxis;
+    out.compRawBytes       = L0 * (sizeof(Vertex) + sizeof(uint32_t));
+    out.compPaletteBytes   = (uint64_t)out.colorHistogram.size() * 3ull;
+    out.compPosBytes       = (L0 * posBits + 7) / 8;
+    out.compMaskBytes      = (L0 * maskBits + 7) / 8;
+    out.compAoBytes        = (L0 * aoBits + 7) / 8;
+    out.compColorPalIdxBytes = (L0 * palIdxBits + 7) / 8;
+
+    // Exact Huffman over color symbols.
+    double huffBitsPerSym = 0.0;
+    const size_t n = out.colorHistogram.size();
+    if (n == 1) huffBitsPerSym = 1.0;
+    else if (n >= 2) {
+        std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> pq;
+        for (const auto& p : out.colorHistogram) pq.push(p.second);
+        uint64_t totalCodeLen = 0;
+        while (pq.size() > 1) {
+            uint64_t a = pq.top(); pq.pop();
+            uint64_t b = pq.top(); pq.pop();
+            uint64_t ss = a + b;
+            totalCodeLen += ss;
+            pq.push(ss);
+        }
+        huffBitsPerSym = L0 ? (double)totalCodeLen / (double)L0 : 0.0;
+    }
+    const uint64_t huffPayloadBits = (uint64_t)std::ceil(huffBitsPerSym * (double)L0);
+    out.compColorHuffBytes = (huffPayloadBits + 7) / 8 + n;
+
+    // Sub-cluster + LZ4 over per-chunk binary blobs.
+    std::unordered_map<uint32_t, uint32_t> palMap;
+    palMap.reserve(out.colorHistogram.size() * 2);
+    for (uint32_t i = 0; i < out.colorHistogram.size(); ++i)
+        palMap[out.colorHistogram[i].first] = i;
+
+    uint32_t S = 4;
+    while (S * 2 <= (uint32_t)D / 2) S *= 2;
+    if (S < 2) S = 2;
+    const uint32_t cellsPerAxis = (uint32_t)D / S;
+    const uint32_t cellIdxBits  = (cellsPerAxis <= 1) ? 1u
+        : (uint32_t)std::ceil(std::log2((double)cellsPerAxis)) * 3u;
+    const uint32_t intraBits    = (S <= 1) ? 3u
+        : (uint32_t)std::ceil(std::log2((double)S)) * 3u;
+    const uint32_t cellHdrBits  = cellIdxBits + 16u;
+    out.compSubclusterDim = S;
+
+    uint64_t lz4Pos = 0, lz4Mask = 0, lz4Ao = 0, lz4Pal = 0;
+    uint64_t subPosBits = 0;
+    std::vector<uint8_t> posBlob, maskBlob, aoBlob, palBlob, compScratch;
+
+    auto packStream = [](std::vector<uint8_t>& dst, uint32_t bitsPerSym,
+                         const std::vector<uint32_t>& syms) {
+        const uint64_t totalBits = (uint64_t)bitsPerSym * syms.size();
+        dst.assign((totalBits + 7) / 8, 0);
+        uint64_t bitPos = 0;
+        for (uint32_t v : syms) {
+            for (uint32_t b = 0; b < bitsPerSym; ++b) {
+                if ((v >> b) & 1u) dst[bitPos >> 3] |= (uint8_t)(1u << (bitPos & 7));
+                ++bitPos;
+            }
+        }
+    };
+    auto lz4Compress = [&](const std::vector<uint8_t>& src) -> int {
+        if (src.empty()) return 0;
+        const int bound = LZ4_compressBound((int)src.size());
+        if (bound <= 0) return 0;
+        if ((int)compScratch.size() < bound) compScratch.resize((size_t)bound);
+        return LZ4_compress_default((const char*)src.data(), (char*)compScratch.data(),
+                                    (int)src.size(), bound);
+    };
+
+    for (uint32_t ci = 0; ci < chunkCount; ++ci) {
+        const ChunkMeta& m = metas[ci];
+        if (m.voxelCount == 0) continue;
+        const DiskVoxel* cv = voxels.data() + m.voxelOffset;
+
+        std::vector<uint32_t> posSyms, maskSyms, aoSyms, palSyms;
+        posSyms.reserve(m.voxelCount);
+        maskSyms.reserve(m.voxelCount);
+        aoSyms.reserve(m.voxelCount);
+        palSyms.reserve(m.voxelCount);
+
+        std::unordered_map<uint32_t, uint32_t> cellCount;
+        cellCount.reserve(64);
+
+        for (uint32_t i = 0; i < m.voxelCount; ++i) {
+            const DiskVoxel& dv = cv[i];
+            if (dv.visMask == 0) continue;
+            uint32_t pos = (uint32_t)dv.x | ((uint32_t)dv.y << 8) | ((uint32_t)dv.z << 16);
+            posSyms.push_back(pos);
+            maskSyms.push_back(dv.visMask & 0x3Fu);
+            uint32_t ao6 = 0;
+            for (int fi = 0; fi < 6; ++fi)
+                ao6 |= (uint32_t)((DvAo(dv, fi) >> 4) & 0xFu) << (fi * 4);
+            aoSyms.push_back(ao6);
+            auto it = palMap.find(DvColor(dv) & 0x00FFFFFFu);
+            palSyms.push_back(it != palMap.end() ? it->second : 0u);
+            uint32_t cx = dv.x / S, cy = dv.y / S, cz = dv.z / S;
+            uint32_t cellId = cx + cy * cellsPerAxis + cz * cellsPerAxis * cellsPerAxis;
+            ++cellCount[cellId];
+        }
+        if (posSyms.empty()) continue;
+
+        subPosBits += (uint64_t)cellHdrBits * cellCount.size()
+                   +  (uint64_t)intraBits   * posSyms.size();
+
+        packStream(posBlob,  posBitsPerAxis * 3u, posSyms);
+        packStream(maskBlob, 6u,                  maskSyms);
+        packStream(aoBlob,   24u,                 aoSyms);
+        palBlob.assign(palSyms.size(), 0);
+        for (size_t k = 0; k < palSyms.size(); ++k) palBlob[k] = (uint8_t)palSyms[k];
+
+        lz4Pos  += (uint64_t)lz4Compress(posBlob);
+        lz4Mask += (uint64_t)lz4Compress(maskBlob);
+        lz4Ao   += (uint64_t)lz4Compress(aoBlob);
+        lz4Pal  += (uint64_t)lz4Compress(palBlob);
+    }
+
+    out.compSubclusterPosBytes = (subPosBits + 7) / 8;
+    out.compLz4PosBytes        = lz4Pos;
+    out.compLz4MaskBytes       = lz4Mask;
+    out.compLz4AoBytes         = lz4Ao;
+    out.compLz4ColorPalBytes   = lz4Pal;
+    out.compLz4TotalBytes      = lz4Pos + lz4Mask + lz4Ao + lz4Pal + out.compPaletteBytes;
     return true;
 }

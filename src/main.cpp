@@ -7,7 +7,6 @@
 #include "renderer.h"
 #include "camera.h"
 #include "vox_loader.h"
-#include "mesh_loader.h"
 #include "asset_version.h"
 
 #include "imgui.h"
@@ -40,64 +39,12 @@ void SetCwdToProjectRoot()
     }
 }
 
-// Check magic + version of a baked asset. Returns false if file is missing,
-// has wrong magic, or has stale version -> caller regenerates.
-bool AssetIsCurrent(const char* path, const char* magic4)
-{
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    char m[4];
-    if (fread(m, 1, 4, f) != 4 || memcmp(m, magic4, 4) != 0) { fclose(f); return false; }
-    uint32_t v = 0;
-    bool okv = (fread(&v, sizeof(uint32_t), 1, f) == 1 && v == kAssetVersion);
-    fclose(f);
-    return okv;
-}
-
-bool AllAssetsCurrent()
-{
-    return AssetIsCurrent("assets/kingslanding.vox",        "VXL3")
-        && AssetIsCurrent("assets/kingslanding_culled.vox", "VXL3")
-        && AssetIsCurrent("assets/kingslanding_merged.msh", "MSH1")
-        && AssetIsCurrent("assets/kingslanding_atlas.msh",  "MSH2");
-}
-
-// Synchronously runs voxelize.exe (which sits next to voxeltest.exe). Returns
-// true on success. Stdout from voxelize is inherited so users see progress.
-bool RunVoxelize()
-{
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    wchar_t* slash = wcsrchr(exePath, L'\\');
-    if (!slash) return false;
-    *(slash + 1) = 0;
-    std::wstring tool = std::wstring(exePath) + L"voxelize.exe";
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = {};
-    std::wstring cmd = L"\"" + tool + L"\" "
-                       L"\"assets\\KingsLanding2017\\KingsLandingFull.obj\" "
-                       L"\"assets\\kingslanding.vox\"";
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                        0, nullptr, nullptr, &si, &pi)) {
-        return false;
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return code == 0;
-}
-
-
 struct AppState {
     Renderer renderer;
     Camera   camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech  tech = RenderTech::PolygonBased;     // "Close" tech
-    RenderTech  techFar = RenderTech::Splat;
+    RenderTech  tech    = RenderTech::Splat;     // close tech
+    RenderTech  techFar = RenderTech::Splat;     // far tech
     bool        closeEnabled = true;
     bool        farEnabled   = true;
     float    sunPitchDeg = 60.0f;
@@ -105,14 +52,10 @@ struct AppState {
     float    sunIntensityEV = 0.0f;     // log2 stops; linear = 2^EV
     float    exposureEV     = 0.0f;     // log2 stops; linear = 2^EV
     float    roughness      = 0.6f;
-    bool     sunShadows     = false;
     bool     colorizeClusters = false;
     bool     vsync = false;
     int      gridSize = 1;
-    bool     showChunkBounds = false;
-    bool     wireframe = false;
     bool     taa = true;
-    bool     zPrepass = false;
     PointLighting pointLight = PointLighting::Complex;
     PointLod pointLod = PointLod::Auto;
     float    pointLodScale = 1.0f;
@@ -124,18 +67,18 @@ struct AppState {
     float    heightFogDensity = 4.5f;        // 0 = off
     float    heightFogFalloff = 0.05f;       // exp falloff per unit height
     float    heightFogStart   = -6.5f;        // world Y of fog ground plane
-    int      msaa = 1;
     bool     rmbDown = false;
     POINT    lastMouse = { 0, 0 };
     bool     keys[256] = {};
     bool     wantQuit = false;
     bool     sceneReady = false;
-    std::string loadStatus = "Loading kingslanding.obj...";
+    std::string loadStatus = "Loading kingslanding.vox...";
+    std::string currentVoxPath;
     Scene       pendingScene;
-    MergedMesh  pendingMerged;
-    bool        mergedLoaded = false;
-    AtlasMesh   pendingAtlas;
-    bool        atlasLoaded = false;
+    // Snapshot kept after upload so on-demand compression analysis can run
+    // without holding the full pointVertices/ao6 buffers.
+    Scene       compScene;
+    std::string compStatus;
     bool        everLoaded = false;
     DataSet     dataset = DataSet::Reduced;
     std::atomic<bool> reloadRequested{ false };
@@ -198,7 +141,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (ImGui::GetIO().WantCaptureMouse) return 0;
         short delta = (short)HIWORD(wp);
         float notches = (float)delta / (float)WHEEL_DELTA;
-        // log-scale: each notch multiplies speed by ~1.2
         g_app.camera.moveSpeed *= powf(1.2f, notches);
         g_app.camera.moveSpeed = std::clamp(g_app.camera.moveSpeed, 0.05f, 10000.0f);
         return 0;
@@ -285,20 +227,7 @@ void FrameStatsWindow()
                     g_app.renderer.LastDrawnCount(),
                     totalChunks ? 100.0f * g_app.renderer.LastDrawnCount() / (float)totalChunks : 0.0f);
     }
-    ImGui::Text("  Tris drawn: %llu / %llu",
-                (unsigned long long)g_app.renderer.LastDrawnTris(),
-                (unsigned long long)g_app.renderer.TotalTriangles());
-    ImGui::Text("  Poly:  %llu tris  %llu verts",
-                (unsigned long long)g_app.renderer.LastPolyTris(),
-                (unsigned long long)g_app.renderer.LastPolyVerts());
-    ImGui::Text("  Points: %llu", (unsigned long long)g_app.renderer.LastPointCount());
-    ImGui::Text("  Vertices:  %llu", (unsigned long long)g_app.renderer.TotalVertices());
-    ImGui::Text("  Triangles: %llu", (unsigned long long)g_app.renderer.TotalTriangles());
-
-    ImGui::Separator();
-    ImGui::Text("GPU Memory (Full poly)");
-    ImGui::Text("  VB: %7.2f MB", mb(g_app.renderer.VbBytes()));
-    ImGui::Text("  IB: %7.2f MB", mb(g_app.renderer.IbBytes()));
+    ImGui::Text("  Points drawn: %llu", (unsigned long long)g_app.renderer.LastPointCount());
 
     ImGui::Separator();
     ImGui::Text("Points (per LOD)");
@@ -317,67 +246,77 @@ void FrameStatsWindow()
     }
 
     ImGui::Separator();
-    ImGui::Text("GPU Memory (Merged)");
-    ImGui::Text("  VB: %7.2f MB", mb(g_app.renderer.MergedVbBytes()));
-    ImGui::Text("  IB: %7.2f MB", mb(g_app.renderer.MergedIbBytes()));
-
-    ImGui::Separator();
-    ImGui::Text("GPU Memory (Reduced / Atlas)");
-    ImGui::Text("  VB:      %7.2f MB", mb(g_app.renderer.AtlasVbBytes()));
-    ImGui::Text("  IB:      %7.2f MB", mb(g_app.renderer.AtlasIbBytes()));
-    ImGui::Text("  Texture: %7.2f MB", mb(g_app.renderer.AtlasTexBytes()));
-    ImGui::Text("  TOTAL:   %7.2f MB",
-                mb(g_app.renderer.AtlasVbBytes()
-                 + g_app.renderer.AtlasIbBytes()
-                 + g_app.renderer.AtlasTexBytes()));
+    ImGui::Text("GPU Memory");
+    {
+        const uint64_t pb = g_app.renderer.PointBytes();
+        const uint64_t rt = g_app.renderer.SplatRtBytes();
+        ImGui::Text("  Point VB + AO6:   %7.2f MB", mb(pb));
+        ImGui::Text("  Splat RTs/UAVs:   %7.2f MB", mb(rt));
+        ImGui::Text("  TOTAL:            %7.2f MB", mb(pb + rt));
+    }
 
     ImGui::Separator();
     ImGui::Text("Disk Compression Sim (L0 stream)");
+    if (ImGui::Button("Run analysis") && !g_app.currentVoxPath.empty()) {
+        std::string err;
+        if (RunCompressionAnalysis(g_app.currentVoxPath.c_str(), g_app.compScene, err)) {
+            g_app.compStatus = "done";
+        } else {
+            g_app.compStatus = "error: " + err;
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted(g_app.compStatus.c_str());
     {
-        const uint64_t raw   = g_app.renderer.CompRawBytes();
-        const uint64_t pos   = g_app.renderer.CompPosBytes();
-        const uint64_t mask  = g_app.renderer.CompMaskBytes();
-        const uint64_t ao    = g_app.renderer.CompAoBytes();
-        const uint64_t pal   = g_app.renderer.CompPaletteBytes();
-        const uint64_t cpal  = g_app.renderer.CompColorPalIdxBytes();
-        const uint64_t chuff = g_app.renderer.CompColorHuffBytes();
+        const Scene& cs = g_app.compScene;
+        const uint64_t raw   = cs.compRawBytes;
+        const uint64_t pos   = cs.compPosBytes;
+        const uint64_t mask  = cs.compMaskBytes;
+        const uint64_t ao    = cs.compAoBytes;
+        const uint64_t pal   = cs.compPaletteBytes;
+        const uint64_t cpal  = cs.compColorPalIdxBytes;
+        const uint64_t chuff = cs.compColorHuffBytes;
         const uint64_t fixed = pos + mask + ao;
         const uint64_t totPal  = fixed + cpal  + pal;
         const uint64_t totHuff = fixed + chuff + pal;
         auto ratio = [&](uint64_t t) { return t ? (double)raw / (double)t : 0.0; };
-        ImGui::Text("  chunkDim %u, posBits/axis %u",
-                    g_app.renderer.CompChunkDim(), g_app.renderer.CompPosBitsPerAxis());
-        ImGui::Text("  Raw (in-mem):   %7.2f MB", mb(raw));
-        ImGui::Text("  Pos stream:     %7.2f MB", mb(pos));
-        ImGui::Text("  visMask stream: %7.2f MB", mb(mask));
-        ImGui::Text("  AO stream:      %7.2f MB", mb(ao));
-        ImGui::Text("  Color (pal8):   %7.2f MB  + palette %llu B", mb(cpal), (unsigned long long)pal);
-        ImGui::Text("  Color (huff):   %7.2f MB  + palette %llu B", mb(chuff), (unsigned long long)pal);
-        ImGui::Separator();
-        ImGui::Text("  TOTAL pal8:     %7.2f MB  (%.2fx vs raw)", mb(totPal),  ratio(totPal));
-        ImGui::Text("  TOTAL huff:     %7.2f MB  (%.2fx vs raw)", mb(totHuff), ratio(totHuff));
+        if (raw == 0) {
+            ImGui::TextUnformatted("  (no results yet — click Run analysis)");
+        } else {
+            ImGui::Text("  chunkDim %u, posBits/axis %u",
+                        cs.compChunkDim, cs.compPosBitsPerAxis);
+            ImGui::Text("  Raw (in-mem):   %7.2f MB", mb(raw));
+            ImGui::Text("  Pos stream:     %7.2f MB", mb(pos));
+            ImGui::Text("  visMask stream: %7.2f MB", mb(mask));
+            ImGui::Text("  AO stream:      %7.2f MB", mb(ao));
+            ImGui::Text("  Color (pal8):   %7.2f MB  + palette %llu B", mb(cpal), (unsigned long long)pal);
+            ImGui::Text("  Color (huff):   %7.2f MB  + palette %llu B", mb(chuff), (unsigned long long)pal);
+            ImGui::Separator();
+            ImGui::Text("  TOTAL pal8:     %7.2f MB  (%.2fx vs raw)", mb(totPal),  ratio(totPal));
+            ImGui::Text("  TOTAL huff:     %7.2f MB  (%.2fx vs raw)", mb(totHuff), ratio(totHuff));
 
-        const uint64_t subPos = g_app.renderer.CompSubclusterPosBytes();
-        const uint32_t subDim = g_app.renderer.CompSubclusterDim();
-        const uint64_t totSub = (fixed - pos) + subPos + cpal + pal;
-        ImGui::Separator();
-        ImGui::Text("Sub-cluster pos (S=%u): %.2f MB  (raw pos %.2f MB)",
-                    subDim, mb(subPos), mb(pos));
-        ImGui::Text("  TOTAL pal8+sub: %7.2f MB  (%.2fx vs raw)", mb(totSub), ratio(totSub));
+            const uint64_t subPos = cs.compSubclusterPosBytes;
+            const uint32_t subDim = cs.compSubclusterDim;
+            const uint64_t totSub = (fixed - pos) + subPos + cpal + pal;
+            ImGui::Separator();
+            ImGui::Text("Sub-cluster pos (S=%u): %.2f MB  (raw pos %.2f MB)",
+                        subDim, mb(subPos), mb(pos));
+            ImGui::Text("  TOTAL pal8+sub: %7.2f MB  (%.2fx vs raw)", mb(totSub), ratio(totSub));
 
-        const uint64_t lzP = g_app.renderer.CompLz4PosBytes();
-        const uint64_t lzM = g_app.renderer.CompLz4MaskBytes();
-        const uint64_t lzA = g_app.renderer.CompLz4AoBytes();
-        const uint64_t lzC = g_app.renderer.CompLz4ColorPalBytes();
-        const uint64_t lzT = g_app.renderer.CompLz4TotalBytes();
-        ImGui::Separator();
-        ImGui::Text("LZ4 per-cluster:");
-        ImGui::Text("  pos     %7.2f MB  (-> %.1f%% of raw)", mb(lzP), pos  ? 100.0 * lzP / (double)pos  : 0.0);
-        ImGui::Text("  mask    %7.2f MB  (-> %.1f%% of raw)", mb(lzM), mask ? 100.0 * lzM / (double)mask : 0.0);
-        ImGui::Text("  ao      %7.2f MB  (-> %.1f%% of raw)", mb(lzA), ao   ? 100.0 * lzA / (double)ao   : 0.0);
-        ImGui::Text("  colorPI %7.2f MB  (-> %.1f%% of raw)", mb(lzC), cpal ? 100.0 * lzC / (double)cpal : 0.0);
-        ImGui::Text("  TOTAL   %7.2f MB  (%.2fx vs raw, %.2fx vs pal8 uncompressed)",
-                    mb(lzT), ratio(lzT), totPal ? (double)totPal / (double)lzT : 0.0);
+            const uint64_t lzP = cs.compLz4PosBytes;
+            const uint64_t lzM = cs.compLz4MaskBytes;
+            const uint64_t lzA = cs.compLz4AoBytes;
+            const uint64_t lzC = cs.compLz4ColorPalBytes;
+            const uint64_t lzT = cs.compLz4TotalBytes;
+            ImGui::Separator();
+            ImGui::Text("LZ4 per-cluster:");
+            ImGui::Text("  pos     %7.2f MB  (-> %.1f%% of raw)", mb(lzP), pos  ? 100.0 * lzP / (double)pos  : 0.0);
+            ImGui::Text("  mask    %7.2f MB  (-> %.1f%% of raw)", mb(lzM), mask ? 100.0 * lzM / (double)mask : 0.0);
+            ImGui::Text("  ao      %7.2f MB  (-> %.1f%% of raw)", mb(lzA), ao   ? 100.0 * lzA / (double)ao   : 0.0);
+            ImGui::Text("  colorPI %7.2f MB  (-> %.1f%% of raw)", mb(lzC), cpal ? 100.0 * lzC / (double)cpal : 0.0);
+            ImGui::Text("  TOTAL   %7.2f MB  (%.2fx vs raw, %.2fx vs pal8 uncompressed)",
+                        mb(lzT), ratio(lzT), totPal ? (double)totPal / (double)lzT : 0.0);
+        }
     }
 
     ImGui::Separator();
@@ -448,21 +387,17 @@ void FrameControlsWindow()
     if (!g_app.showControls) return;
     if (!ImGui::Begin("Controls", &g_app.showControls)) { ImGui::End(); return; }
 
-    const char* datasets[] = { "Full", "Merged", "Reduced" };
+    const char* datasets[] = { "Full", "Reduced" };
     {
         int ds = (int)g_app.dataset;
         if (ImGui::Combo("Dataset", &ds, datasets, IM_ARRAYSIZE(datasets))) {
-            DataSet prev = g_app.dataset;
             g_app.dataset = (DataSet)ds;
-            // Full+Merged share the Original .vox; Reduced uses the Culled .vox.
-            bool needReload = ((prev == DataSet::Reduced) != (g_app.dataset == DataSet::Reduced));
-            if (needReload) g_app.reloadRequested.store(true);
+            g_app.reloadRequested.store(true);
         }
     }
-    // Non-hybrid techs only. Close/Far selectors compose hybrids implicitly.
+    // Single tech combo: point-derived techniques only.
     struct TechEntry { const char* name; RenderTech val; };
     static const TechEntry kTechList[] = {
-        { "TriMesh",      RenderTech::PolygonBased },
         { "Points",       RenderTech::Points       },
         { "HexSprite",    RenderTech::HexSprite    },
         { "PointCS",      RenderTech::PointCS      },
@@ -479,23 +414,22 @@ void FrameControlsWindow()
         return 0;
     };
     {
-        // Close pulldown: required (no None entry).
-        const char* closeNames[16]; for (int k = 0; k < kTechCount; ++k) closeNames[k] = kTechList[k].name;
+        const char* techNames[16];
+        for (int k = 0; k < kTechCount; ++k) techNames[k] = kTechList[k].name;
+        // Close (near) tech
         int tt = techIdxFrom(g_app.tech);
         ImGui::PushItemWidth(180.0f);
-        if (ImGui::Combo("##Technique Close", &tt, closeNames, kTechCount, kTechCount)) {
+        if (ImGui::Combo("##TechClose", &tt, techNames, kTechCount, kTechCount)) {
             g_app.tech = kTechList[tt].val;
         }
         ImGui::PopItemWidth();
         ImGui::SameLine();
         ImGui::Checkbox("Close", &g_app.closeEnabled);
-        // Far pulldown: same list prefixed with "None".
-        const char* farNames[17]; farNames[0] = "None";
-        for (int k = 0; k < kTechCount; ++k) farNames[k + 1] = kTechList[k].name;
-        int tf = (g_app.techFar == RenderTech::None) ? 0 : (techIdxFrom(g_app.techFar) + 1);
+        // Far tech
+        int tf = techIdxFrom(g_app.techFar);
         ImGui::PushItemWidth(180.0f);
-        if (ImGui::Combo("##Technique Far", &tf, farNames, kTechCount + 1, kTechCount + 1)) {
-            g_app.techFar = (tf == 0) ? RenderTech::None : kTechList[tf - 1].val;
+        if (ImGui::Combo("##TechFar", &tf, techNames, kTechCount, kTechCount)) {
+            g_app.techFar = kTechList[tf].val;
         }
         ImGui::PopItemWidth();
         ImGui::SameLine();
@@ -535,27 +469,13 @@ void FrameControlsWindow()
     }
     ImGui::Checkbox("VSync", &g_app.vsync);
     ImGui::SliderInt("Grid size", &g_app.gridSize, 1, 10);
-    ImGui::Checkbox("Show chunk bounds", &g_app.showChunkBounds);
-    ImGui::Checkbox("Wireframe", &g_app.wireframe);
     ImGui::Checkbox("TAA", &g_app.taa);
-    ImGui::Checkbox("Z Prepass", &g_app.zPrepass);
-    ImGui::Checkbox("Sun shadows", &g_app.sunShadows);
     ImGui::Checkbox("Colorize clusters", &g_app.colorizeClusters);
     ImGui::SliderFloat("Sun pitch",     &g_app.sunPitchDeg, 5.0f, 89.0f, "%.1f deg");
     ImGui::SliderFloat("Sun yaw",       &g_app.sunYawDeg, -180.0f, 180.0f, "%.1f deg");
     ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
     ImGui::SliderFloat("Exposure",      &g_app.exposureEV,     -3.0f, 3.0f, "%.2f EV");
     ImGui::SliderFloat("Roughness",     &g_app.roughness,       0.05f, 1.0f, "%.2f");
-    {
-        const char* msaaItems[] = { "Off", "2x", "4x", "8x" };
-        const int   msaaVals[]  = { 1, 2, 4, 8 };
-        int sel = 0;
-        for (int k = 0; k < 4; ++k) if (msaaVals[k] == g_app.msaa) sel = k;
-        if (ImGui::Combo("MSAA", &sel, msaaItems, IM_ARRAYSIZE(msaaItems))) {
-            g_app.msaa = msaaVals[sel];
-            g_app.renderer.SetMsaa((uint32_t)g_app.msaa);
-        }
-    }
     ImGui::ColorEdit3("Clear color", g_app.bgColor);
 
     ImGui::Separator();
@@ -612,38 +532,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_app.renderer.Device(), g_app.renderer.Context());
 
-    auto kickLoader = [](bool firstLoad) {
-        std::thread([firstLoad] {
+    auto kickLoader = []() {
+        std::thread([] {
             std::string err;
-            // Detect missing/stale baked assets and regen via voxelize.exe.
-            if (!AllAssetsCurrent()) {
-                g_app.loadStatus = "Regenerating baked assets (running voxelize.exe)...";
-                if (!RunVoxelize() || !AllAssetsCurrent()) {
-                    g_app.loadErr = "voxelize.exe failed (missing OBJ?)";
-                    g_app.loadOk.store(false);
-                    g_app.loadDone.store(true);
-                    return;
-                }
-            }
             const char* voxPath = (g_app.dataset == DataSet::Reduced)
                 ? "assets/kingslanding_culled.vox"
                 : "assets/kingslanding.vox";
+            g_app.currentVoxPath = voxPath;
             g_app.loadStatus = std::string("Loading ") + voxPath + "...";
             bool ok = LoadVoxScene(voxPath, g_app.pendingScene, err);
-            if (ok && firstLoad) {
-                std::string merr;
-                g_app.mergedLoaded = LoadMergedMesh("assets/kingslanding_merged.msh",
-                                                    g_app.pendingMerged, merr);
-                std::string aerr;
-                g_app.atlasLoaded = LoadAtlasMesh("assets/kingslanding_atlas.msh",
-                                                  g_app.pendingAtlas, aerr);
-            }
+            if (!ok && err.empty()) err = "vox load failed";
             g_app.loadErr = err;
             g_app.loadOk.store(ok);
             g_app.loadDone.store(true);
         }).detach();
     };
-    kickLoader(true);
+    kickLoader();
 
     auto last = std::chrono::high_resolution_clock::now();
 
@@ -667,7 +571,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             g_app.sceneReady = false;
             g_app.loadDone.store(false);
             g_app.loadOk.store(false);
-            kickLoader(false);
+            kickLoader();
         }
 
         // upload scene once loader done
@@ -675,19 +579,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             if (g_app.loadOk.load()) {
                 bool firstUpload = !g_app.everLoaded;
                 g_app.renderer.UploadScene(g_app.pendingScene);
-                // Merged/Atlas are static across reloads; upload only when we
-                // actually loaded fresh data (firstUpload). Re-uploading empties
-                // would reset the GPU buffers to null.
-                if (firstUpload && g_app.mergedLoaded && !g_app.pendingMerged.vertices.empty()) {
-                    g_app.renderer.UploadMergedMesh(g_app.pendingMerged);
-                    g_app.pendingMerged = MergedMesh{};
-                }
-                if (firstUpload && g_app.atlasLoaded && !g_app.pendingAtlas.vertices.empty()) {
-                    g_app.renderer.UploadAtlasMesh(g_app.pendingAtlas);
-                    g_app.pendingAtlas = AtlasMesh{};
-                }
-                // Center the camera only on the very first load; keep the
-                // user's view when switching dataset.
                 if (firstUpload) {
                     float cx = 0.5f * (g_app.pendingScene.aabbMin[0] + g_app.pendingScene.aabbMax[0]);
                     float cz = 0.5f * (g_app.pendingScene.aabbMin[2] + g_app.pendingScene.aabbMax[2]);
@@ -702,6 +593,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                     g_app.camera.farZ = ext * 4.0f + 1000.0f;
                 }
                 g_app.everLoaded = true;
+                // Snapshot lightweight bits for on-demand compression analysis
+                // (histogram + per-chunk subs). Keeps full pointVertices out of
+                // memory after the upload.
+                g_app.compScene = Scene{};
+                g_app.compScene.colorHistogram = g_app.pendingScene.colorHistogram;
+                g_app.compScene.subs           = g_app.pendingScene.subs;
+                g_app.compStatus.clear();
                 g_app.pendingScene = Scene{};
                 g_app.sceneReady = true;
                 g_app.loadStatus = "Loaded.";
@@ -737,7 +635,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         g_app.renderer.BeginFrame(clear);
         if (g_app.sceneReady && g_app.loadOk.load()) {
             float effFogDensity = (g_app.fogMode == 0) ? 0.0f : g_app.fogDensity;
-            // Spherical sun direction from pitch/yaw sliders.
             const float kDeg2Rad = 3.14159265358979f / 180.0f;
             float pr = g_app.sunPitchDeg * kDeg2Rad;
             float yr = g_app.sunYawDeg   * kDeg2Rad;
@@ -750,11 +647,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             DrawSceneParams ps;
             ps.mode             = g_app.mode;
             ps.gridSize         = g_app.gridSize;
-            ps.techClose        = g_app.tech;
+            ps.tech             = g_app.tech;
             ps.techFar          = g_app.techFar;
-            ps.dataset          = g_app.dataset;
-            ps.showChunkBounds  = g_app.showChunkBounds;
-            ps.zPrepass         = g_app.zPrepass;
+            ps.closeEnabled     = g_app.closeEnabled;
+            ps.farEnabled       = g_app.farEnabled;
             ps.pointLight       = g_app.pointLight;
             ps.pointLod         = g_app.pointLod;
             ps.pointLodScale    = g_app.pointLodScale;
@@ -766,8 +662,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.heightFogDensity = g_app.heightFogDensity;
             ps.heightFogFalloff = g_app.heightFogFalloff;
             ps.heightFogStart   = g_app.heightFogStart;
-            ps.hybridThreshold  = 1.0f;
-            ps.wireframe        = g_app.wireframe;
             ps.splatRadius      = g_app.splatRadius;
             ps.taa              = g_app.taa;
             ps.sunDir[0]        = sunDir[0];
@@ -776,10 +670,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.sunIntensity     = exp2f(g_app.sunIntensityEV);
             ps.exposure         = exp2f(g_app.exposureEV);
             ps.roughness        = g_app.roughness;
-            ps.sunShadows       = g_app.sunShadows;
             ps.colorizeClusters = g_app.colorizeClusters;
-            ps.closeEnabled     = g_app.closeEnabled;
-            ps.farEnabled       = g_app.farEnabled;
             g_app.renderer.DrawScene(g_app.camera, ps);
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -791,9 +682,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         g_app.cpuFrameMs = std::chrono::duration<double, std::milli>(end - now).count();
     }
 
-    // Loader threads are detached; nothing to join.
-
-    MicroProfileShutdown();
+    // MicroProfileShutdown joins worker threads (web server, context-switch ETW
+    // tracer, GPU timers). On Windows the ETW unregister can take seconds.
+    // Skip it — the OS reclaims sockets/threads at process exit.
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

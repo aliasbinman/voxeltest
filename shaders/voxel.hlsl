@@ -143,42 +143,10 @@ uint FaceFromNormal(float3 n)
 float ShadowBit(uint mask, uint fi)         { return (float)((mask >> fi) & 1u); }
 float ShadowBitN(uint mask, float3 n)       { return ShadowBit(mask, FaceFromNormal(n)); }
 
-// Sun shadow map: D32 depth, reverse-Z ortho, sampled with comparison.
-Texture2D<float>          gShadowMap : register(t10);
-SamplerComparisonState    gShadowSamp : register(s2);
+// Shadow map removed; keep stub so existing call sites compile unchanged.
+float SampleShadow(float3 wpos) { return 1.0; }
 
-// Project wpos into sun NDC and PCF-sample (3x3 box). Returns 1 lit, 0 shadowed.
-// When gGridSize > 1 the scene tiles in XZ, so wrap wpos.xz back to the base
-// cell so one shadow map serves every replica. With grid=1 (single cell) we
-// must NOT wrap — otherwise voxels outside the cell get spurious shadow.
-float SampleShadow(float3 wpos)
-{
-    if (gShadowEnable < 0.5) return 1.0;
-    float3 wpLocal = wpos;
-    if (gGridSize > 1.5) {
-        float2 relXZ = float2(wpos.x - gSceneOrigin.x, wpos.z - gSceneOrigin.z);
-        relXZ.x -= floor(relXZ.x / gSceneSpan.x) * gSceneSpan.x;
-        relXZ.y -= floor(relXZ.y / gSceneSpan.z) * gSceneSpan.z;
-        wpLocal.x = gSceneOrigin.x + relXZ.x;
-        wpLocal.z = gSceneOrigin.z + relXZ.y;
-    }
-
-    float4 sclip = mul(float4(wpLocal, 1.0), gSunViewProj);
-    if (sclip.w <= 0.0) return 1.0;
-    float3 sn = sclip.xyz / sclip.w;
-    float2 uv = float2(sn.x * 0.5 + 0.5, -sn.y * 0.5 + 0.5);
-    if (any(uv < 0.0) || any(uv > 1.0)) return 1.0;
-    float ref = sn.z + gShadowBias;     // reverse-Z: lit when depth >= ref
-    float sum = 0.0;
-    float ts = 1.0 / gShadowMapSize;
-    [unroll] for (int dy = -1; dy <= 1; ++dy)
-    [unroll] for (int dx = -1; dx <= 1; ++dx)
-        sum += gShadowMap.SampleCmpLevelZero(gShadowSamp, uv + float2(dx, dy) * ts, ref);
-    return sum * (1.0 / 9.0);
-}
-
-// Combined lighting using baked sun-shadow term. shadow=0 kills sun but keeps
-// full ambient so shadowed faces stay readable; shadow=1 = fully lit.
+// Combined lighting (no shadow map). shadow argument retained for call-site compat.
 float3 ApplyShadowLighting(float3 amb, float3 sunDir, float3 n, float shadow)
 {
     float ndotl = saturate(dot(n, sunDir));
@@ -211,46 +179,6 @@ float3 Tonemap(float3 x)
 
 // Per-chunk tint pre-tonemap. Lit PS paths read gChunkTint from per-chunk CB.
 float3 TonemapTinted(float3 x) { return Tonemap(ApplyClusterTint(x)); }
-
-// Depth-only VS (Z prepass). No PS bound.
-struct VSDepthOut { float4 svpos : SV_Position; };
-// `precise` forces bit-exact identical math in both VS variants so the
-// prepass and main pass produce the same SV_Position -> no z-fighting.
-VSDepthOut vsmain_depth(VSPolyIn i)
-{
-    VSDepthOut o;
-    precise float3 local = UnpackVoxPos(i.pck);
-    precise float3 world = gChunkBase + local;
-    precise float4 clip  = mul(float4(world, 1.0), gViewProj);
-    o.svpos = clip;
-    return o;
-}
-
-// Shadow map VS: uses gSunViewProj instead of camera VP. No PS bound.
-VSDepthOut vsmain_shadow(VSPolyIn i)
-{
-    VSDepthOut o;
-    precise float3 local = UnpackVoxPos(i.pck);
-    precise float3 world = gChunkBase + local;
-    precise float4 clip  = mul(float4(world, 1.0), gSunViewProj);
-    o.svpos = clip;
-    return o;
-}
-
-VSOut vsmain(VSPolyIn i)
-{
-    VSOut o;
-    precise float3 local = UnpackVoxPos(i.pck);
-    precise float3 world = gChunkBase + local;
-    precise float4 clip  = mul(float4(world, 1.0), gViewProj);
-    o.wpos    = world;
-    o.svpos   = clip;
-    o.col     = float4(float3(i.col.rgb) / 255.0, 1.0);
-    o.faceIdx = 0;
-    o.shadowMask = 0xFFu;                   // shadow bake removed -> always lit
-    o.ao         = AoFromAux(i.pck.w);
-    return o;
-}
 
 // Per-voxel packed face AO (4 bits per face × 6 faces, low 24 bits). Indexed
 // by global vertex ID for point paths; by voxelIdx for PolyVID/PolyAxis.
@@ -459,27 +387,6 @@ float4 psmain_blit(VBlitOut i) : SV_Target
     c.b = ((pack >> 16u) & 0xFFu) / 255.0;
     c.a = 1.0;
     return c;
-}
-
-// ---------------- Chunk bounds debug (line list) ----------------
-// gChunkBase = chunk origin (world), _pad0 = chunk box size (e.g. 64).
-struct VSBoundsIn  { float3 pos : POSITION; };
-struct VSBoundsOut { float4 svpos : SV_Position; };
-
-VSBoundsOut vsmain_bounds(VSBoundsIn i)
-{
-    VSBoundsOut o;
-    // Tight AABB: chunkBase = world aabbMin; size.x = _pad, size.yz = asfloat(_pad2).
-    // chunkLodIdx is between voxelBase and _pad2 so bounds keeps its own slots.
-    float3 size = float3(_pad, asfloat(_pad2.x), asfloat(_pad2.y));
-    float3 world = gChunkBase + i.pos * size;
-    o.svpos = mul(float4(world, 1.0), gViewProj);
-    return o;
-}
-
-float4 psmain_bounds(VSBoundsOut i) : SV_Target
-{
-    return float4(1.0, 1.0, 0.0, 1.0);   // yellow
 }
 
 // ---------------- PolyVID technique ----------------
@@ -929,17 +836,6 @@ SplatPointOut psmain_splat_albedo(VSPointOut i)
     o.mask  = i.mask & 0x3Fu;
     return o;
 }
-// Poly into the shared splat buffer: alpha = 0 marks "poly pixel" so the
-// reconstruction PS skips it during neighbor search.
-float4 psmain_splat_albedo_poly(VSOut i) : SV_Target
-{
-    float3 n   = normalize(cross(ddx(i.wpos), ddy(i.wpos)));
-    float3 amb = SampleAmbientCubeTriplanar(n) * i.ao;
-    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
-    float3 lit = i.col.rgb * light;
-    return float4(Tonemap(ApplyFog(ApplyClusterTint(lit), i.wpos)), 0.0);
-}
-
 // CS reconstruction: for each output pixel, search neighbors for the nearest
 // point whose splat sphere covers it; use its color (background if none).
 Texture2D<float>    gSplatDepth    : register(t1);
@@ -1251,98 +1147,6 @@ CompositeOut psmain_splat_composite(VBlitOut i)
     return o;
 }
 
-// ---------------- AtlasMesh technique ----------------
-// Compact 12 B vertex: uint16 px,py,pz; uint8 face; uint8 _pad; uint16 u,v.
-// Sampled with Load (no sampler/no atlas-size needed) — UV is already in
-// texel coords; linear interp + truncation gives exact texel per pixel.
-Texture2D<float4> gAtlasTex : register(t3);
-
-struct VSAtlasIn {
-    uint4 pos : POSITION;   // .xyz = scene-local grid coords (uint16), .w = (pad<<8)|face
-    uint2 uv  : UV;         // atlas texel coords (uint16)
-};
-struct VSAtlasOut {
-    float4 svpos : SV_Position;
-    float3 wpos  : WPOS;
-    float2 uv    : UV;
-    nointerpolation uint face : FIDX;
-};
-
-VSAtlasOut vsmain_atlas(VSAtlasIn i)
-{
-    VSAtlasOut o;
-    float3 local = float3(i.pos.xyz);
-    float3 world = gChunkBase + local;
-    o.svpos = mul(float4(world, 1.0), gViewProj);
-    o.wpos  = world;
-    o.uv    = float2(i.uv);
-    o.face  = i.pos.w & 0xFFu;
-    return o;
-}
-
-float4 psmain_atlas(VSAtlasOut i) : SV_Target
-{
-    int2 tx = int2(i.uv);                            // truncate -> exact texel
-    float4 texel = gAtlasTex.Load(int3(tx, 0));
-    float3 col = texel.rgb;
-    float  ao  = texel.a;                            // alpha = baked AO
-    float3 n = kFaceNormals[i.face & 7];
-
-    int mode = (int)gMode;
-    float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
-    if (mode == 1) return float4(ApplyFog(col, i.wpos), 1.0);
-    if (mode == 3) return float4(ApplyFog(ao.xxx, i.wpos), 1.0);
-
-    float ndotl = saturate(dot(n, normalize(gLightDir)));
-    float shadow = SampleShadow(i.wpos);
-    float3 amb  = kAmbientCube[i.face & 7] * ao;
-    float3 sun  = float3(1.10, 1.00, 0.85) * 1.5  * ndotl * shadow * gSunIntensity;
-    float3 light = amb + gAmbient * sun;
-    return float4(TonemapTinted(ApplyFog(col * light, i.wpos)), 1.0);
-}
-
-// ---------------- MergedMesh technique ----------------
-// Greedy-meshed triangles, single big VB/IB. Float3 pos + rgba8 color.
-// Normal computed per-pixel via ddx/ddy of world position.
-struct VSMergedIn {
-    float3 pos : POSITION;
-    float4 col : COLOR;
-};
-struct VSMergedOut {
-    float4 svpos : SV_Position;
-    float3 wpos  : WPOS;
-    float3 col   : COL;
-};
-VSMergedOut vsmain_merged(VSMergedIn i)
-{
-    VSMergedOut o;
-    float3 world = i.pos + gChunkBase;   // gChunkBase used as grid offset
-    o.wpos  = world;
-    o.svpos = mul(float4(world, 1.0), gViewProj);
-    o.col   = i.col.rgb;
-    return o;
-}
-float4 psmain_merged(VSMergedOut i) : SV_Target
-{
-    float3 dpx = ddx(i.wpos);
-    float3 dpy = ddy(i.wpos);
-    float3 n = normalize(cross(dpx, dpy));
-    n = sign(n) * pow(abs(n), 7.0);
-    n = normalize(n);
-    int mode = (int)gMode;
-    float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
-    if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
-    if (mode == 3) return float4(ApplyFog(float3(0.5, 0.5, 0.5), i.wpos), 1.0); // merged: no AO
-    float ndotl = saturate(dot(n, normalize(gLightDir)));
-    float shadow = SampleShadow(i.wpos);
-    float3 amb  = SampleAmbientCubeTriplanar(n);
-    float3 sun  = float3(1.10, 1.00, 0.85) * ndotl * shadow * gSunIntensity;
-    float3 light = amb + gAmbient * sun;
-    return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
-}
-
 // ---------------- Billboard technique ----------------
 // 1 voxel = 1 quad (4 verts) in screen space covering voxel's NDC bounding rect.
 // PS performs ray-vs-AABB intersection to find the hit face + true depth.
@@ -1540,29 +1344,4 @@ float4 psmain_hex(VSHexOut i) : SV_Target
     float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
     float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
     return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
-}
-
-// ---------------- Polygon technique ----------------
-float4 psmain(VSOut i) : SV_Target
-{
-    // Per-pixel face normal from world-pos derivatives.
-    // DX screen-y is top-to-bottom; cross(ddx, ddy) yields the outward
-    // normal for front-facing triangles.
-    float3 dpx = ddx(i.wpos);
-    float3 dpy = ddy(i.wpos);
-    float3 n   = normalize(cross(dpx, dpy));
-    // ddx/ddy is noisy for near-camera small triangles. Sharpen toward the
-    // dominant cardinal axis: raise to high odd power (sign preserved), renorm.
-    n = sign(n) * pow(abs(n), 7.0);
-    n = normalize(n);
-
-    int mode = (int)gMode;
-    float fogDist = length(i.wpos - gCamPos);
-    if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
-    if (mode == 1) return float4(ApplyFog(i.col.rgb, i.wpos), 1.0);
-    if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
-
-    float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
-    float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
-    return float4(TonemapTinted(ApplyFog(i.col.rgb * light, i.wpos)), 1.0);
 }

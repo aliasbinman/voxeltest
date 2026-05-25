@@ -43,24 +43,24 @@ struct CBPerFrame {
     float prevViewProj[16];
     float jitter[2];
     float _pad7[2];
-    float sunViewProj[16];        // sun ortho VP for shadow map
+    float sunViewProj[16];        // unused (kept for shader CB layout compatibility)
     float shadowBias;
     float shadowMapSize;
-    float shadowEnable;           // 0 = bypass shadow sample
-    float sunIntensity;           // linear (2^EV)
-    float exposure;               // linear (2^EV)
-    float roughness;              // reserved
+    float shadowEnable;           // always 0 now (shadows removed)
+    float sunIntensity;
+    float exposure;
+    float roughness;
     float colorizeClusters;       // 0/1 tint on/off
     float gridSize;               // for shadow wrap (1 = no wrap)
 };
 
 struct CBPerChunk {
     float    chunkBase[3];
-    float    _pad;          // lodHalfExtent (points) / chunkSize (bounds)
+    float    _pad;          // lodHalfExtent (points)
     uint32_t voxelBase;     // PolyVID: chunk's first voxel index in pointSb_
     uint32_t chunkLodIdx;   // 0..3 splat LOD index
-    uint32_t chunkTint;     // colorize-clusters debug: 1 green close, 2/3/4 red/orange/yellow L0/L1/L2
-    uint32_t _pad2[2];      // bounds path repurposes as asfloat(_pad2.xy) = sizeY/sizeZ
+    uint32_t chunkTint;     // colorize-clusters debug
+    uint32_t _pad2[2];
 };
 
 struct CBPerCS {
@@ -99,8 +99,6 @@ bool Renderer::Init(HWND hwnd)
 void Renderer::Shutdown()
 {
     subs_.clear();
-    vb_.Reset();
-    ib_.Reset();
 }
 
 bool Renderer::CreateDeviceAndSwap(HWND hwnd)
@@ -153,8 +151,6 @@ bool Renderer::CreateRenderTargets()
     rtv_.Reset();
     dsv_.Reset();
     depthTex_.Reset();
-    msaaColorTex_.Reset();
-    msaaRtv_.Reset();
     csColorTex_.Reset();
     csDepthTex_.Reset();
     csColorUav_.Reset();
@@ -174,23 +170,6 @@ bool Renderer::CreateRenderTargets()
     splatMaskRtv_.Reset();
     splatMaskSrv_.Reset();
 
-    // Validate MSAA support; fall back to 1x on unsupported counts.
-    DXGI_SAMPLE_DESC sd = { 1, 0 };
-    if (msaaSamples_ > 1) {
-        UINT q = 0;
-        device_->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, msaaSamples_, &q);
-        if (q > 0) {
-            sd.Count   = msaaSamples_;
-            sd.Quality = q - 1;
-            msaaQuality_ = q - 1;
-        } else {
-            msaaSamples_ = 1;
-            msaaQuality_ = 0;
-        }
-    } else {
-        msaaQuality_ = 0;
-    }
-
     ComPtr<ID3D11Texture2D> backBuf;
     HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(backBuf.GetAddressOf()));
     if (FAILED(hr)) return false;
@@ -204,19 +183,18 @@ bool Renderer::CreateRenderTargets()
     td.ArraySize = 1;
     // R32_TYPELESS so TAA can sample depth as SRV.
     td.Format = DXGI_FORMAT_R32_TYPELESS;
-    td.SampleDesc = sd;
+    td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | (msaaSamples_ > 1 ? 0 : D3D11_BIND_SHADER_RESOURCE);
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     hr = device_->CreateTexture2D(&td, nullptr, depthTex_.GetAddressOf());
     if (FAILED(hr)) return false;
     D3D11_DEPTH_STENCIL_VIEW_DESC dsvd = {};
     dsvd.Format = DXGI_FORMAT_D32_FLOAT;
-    dsvd.ViewDimension = (msaaSamples_ > 1) ? D3D11_DSV_DIMENSION_TEXTURE2DMS
-                                            : D3D11_DSV_DIMENSION_TEXTURE2D;
+    dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
     hr = device_->CreateDepthStencilView(depthTex_.Get(), &dsvd, dsv_.GetAddressOf());
     if (FAILED(hr)) return false;
     depthSrv_.Reset();
-    if (msaaSamples_ == 1) {
+    {
         D3D11_SHADER_RESOURCE_VIEW_DESC dsv = {};
         dsv.Format = DXGI_FORMAT_R32_FLOAT;
         dsv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -231,7 +209,6 @@ bool Renderer::CreateRenderTargets()
         taaHistValid_[i] = false;
     }
     {
-        // Scene RT matches backbuffer format (we CopyResource between them).
         D3D11_TEXTURE2D_DESC ct = {};
         ct.Width = width_; ct.Height = height_;
         ct.MipLevels = 1; ct.ArraySize = 1;
@@ -243,7 +220,6 @@ bool Renderer::CreateRenderTargets()
         device_->CreateRenderTargetView(taaSceneTex_.Get(), nullptr, taaSceneRtv_.GetAddressOf());
         device_->CreateShaderResourceView(taaSceneTex_.Get(), nullptr, taaSceneSrv_.GetAddressOf());
 
-        // History needs higher precision so repeated lerp doesn't quantize down.
         D3D11_TEXTURE2D_DESC ht = ct;
         ht.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         for (int i = 0; i < 2; ++i) {
@@ -253,25 +229,7 @@ bool Renderer::CreateRenderTargets()
         }
     }
 
-    // Optional MSAA color target. Backbuffer stays 1x; resolve at EndFrame.
-    if (msaaSamples_ > 1) {
-        D3D11_TEXTURE2D_DESC mt = {};
-        mt.Width = width_;
-        mt.Height = height_;
-        mt.MipLevels = 1;
-        mt.ArraySize = 1;
-        mt.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        mt.SampleDesc = sd;
-        mt.Usage = D3D11_USAGE_DEFAULT;
-        mt.BindFlags = D3D11_BIND_RENDER_TARGET;
-        if (FAILED(device_->CreateTexture2D(&mt, nullptr, msaaColorTex_.GetAddressOf()))) return false;
-        D3D11_RENDER_TARGET_VIEW_DESC rtvd = {};
-        rtvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
-        if (FAILED(device_->CreateRenderTargetView(msaaColorTex_.Get(), &rtvd, msaaRtv_.GetAddressOf()))) return false;
-    }
-
-    // PointCS color/depth UAV textures (R32_UINT for atomic ops + RGBA8 packing).
+    // PointCS color/depth UAV textures.
     D3D11_TEXTURE2D_DESC ud = {};
     ud.Width = width_;
     ud.Height = height_;
@@ -289,7 +247,7 @@ bool Renderer::CreateRenderTargets()
     if (FAILED(device_->CreateTexture2D(&ud, nullptr, csDepthTex_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateUnorderedAccessView(csDepthTex_.Get(), nullptr, csDepthUav_.GetAddressOf()))) return false;
 
-    // Splat color RT (R8G8B8A8_UNORM) + final UAV target.
+    // Splat color RT + final UAV target.
     D3D11_TEXTURE2D_DESC sd2 = {};
     sd2.Width = width_;
     sd2.Height = height_;
@@ -316,17 +274,14 @@ bool Renderer::CreateRenderTargets()
     if (FAILED(device_->CreateRenderTargetView(splatMaskTex_.Get(), nullptr, splatMaskRtv_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateShaderResourceView(splatMaskTex_.Get(), nullptr, splatMaskSrv_.GetAddressOf()))) return false;
 
-    // Dilated depth target — CS writes winning-neighbor reprojected depth so the
-    // composite PS can emit SV_Depth at filled-in pixels (source splat depth = 0
-    // at those pixels since the dilation kernel made them up from neighbors).
+    // Dilated depth target.
     D3D11_TEXTURE2D_DESC sdf = sd2;
     sdf.Format = DXGI_FORMAT_R32_FLOAT;
     if (FAILED(device_->CreateTexture2D(&sdf, nullptr, splatFinalDepthTex_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateUnorderedAccessView(splatFinalDepthTex_.Get(), nullptr, splatFinalDepthUav_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateShaderResourceView(splatFinalDepthTex_.Get(), nullptr, splatFinalDepthSrv_.GetAddressOf()))) return false;
 
-    // Dedicated non-MSAA depth for splat pass. R32_TYPELESS so the CS can
-    // read the same texture as a SRV alongside the DSV binding.
+    // Dedicated depth for splat pass.
     D3D11_TEXTURE2D_DESC sdd = {};
     sdd.Width = width_;
     sdd.Height = height_;
@@ -346,6 +301,25 @@ bool Renderer::CreateRenderTargets()
     sdsv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     sdsv.Texture2D.MipLevels = 1;
     if (FAILED(device_->CreateShaderResourceView(splatDepthTex_.Get(), &sdsv, splatDepthSrv_.GetAddressOf()))) return false;
+
+    // GPU-memory accounting for the splat pass RTs/UAVs.
+    auto bytesOf = [&](DXGI_FORMAT f) -> uint64_t {
+        switch (f) {
+            case DXGI_FORMAT_R8G8B8A8_UNORM: return 4ull;
+            case DXGI_FORMAT_R32_FLOAT:
+            case DXGI_FORMAT_R32_UINT:
+            case DXGI_FORMAT_R32_TYPELESS:   return 4ull;
+            case DXGI_FORMAT_R8_UINT:        return 1ull;
+            default: return 4ull;
+        }
+    };
+    uint64_t pix = (uint64_t)width_ * (uint64_t)height_;
+    splatRtBytes_ = pix * (
+          bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM)   // splatColorTex_
+        + bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM)   // splatFinalTex_
+        + bytesOf(DXGI_FORMAT_R8_UINT)          // splatMaskTex_
+        + bytesOf(DXGI_FORMAT_R32_FLOAT)        // splatFinalDepthTex_
+        + bytesOf(DXGI_FORMAT_R32_TYPELESS));   // splatDepthTex_
     return true;
 }
 
@@ -366,8 +340,6 @@ bool Renderer::CreateShaders()
             std::string msg = "Shader compile error [";
             msg += entry; msg += "]\n";
             if (errs) msg += std::string((const char*)errs->GetBufferPointer(), errs->GetBufferSize());
-            // Mirror to the VS debugger Output window so the full message
-            // stays visible (the modal MessageBox truncates long error lists).
             OutputDebugStringA(msg.c_str());
             OutputDebugStringA("\n");
             MessageBoxA(nullptr, msg.c_str(), entry, MB_ICONERROR);
@@ -376,9 +348,7 @@ bool Renderer::CreateShaders()
         return true;
     };
 
-    ComPtr<ID3DBlob> vsb, psb, vsbp, psbp, vsbh, psbh, vsbb, psbb;
-    if (!compile("vsmain", "vs_5_0", vsb)) return false;
-    if (!compile("psmain", "ps_5_0", psb)) return false;
+    ComPtr<ID3DBlob> vsbp, psbp, vsbh, psbh;
     if (!compile("vsmain_points", "vs_5_0", vsbp)) return false;
     if (!compile("psmain_points", "ps_5_0", psbp)) return false;
     ComPtr<ID3DBlob> psbps;
@@ -396,12 +366,6 @@ bool Renderer::CreateShaders()
     if (!compile("vsmain_billboard", "vs_5_0", vsbB)) return false;
     if (!compile("psmain_billboard", "ps_5_0", psbB)) return false;
     if (!compile("vsmain_billboard_tri", "vs_5_0", vsbBT)) return false;
-    ComPtr<ID3DBlob> vsbM, psbM;
-    if (!compile("vsmain_merged", "vs_5_0", vsbM)) return false;
-    if (!compile("psmain_merged", "ps_5_0", psbM)) return false;
-    ComPtr<ID3DBlob> vsbA, psbA;
-    if (!compile("vsmain_atlas", "vs_5_0", vsbA)) return false;
-    if (!compile("psmain_atlas", "ps_5_0", psbA)) return false;
     ComPtr<ID3DBlob> csbSp, psbSa, vsbTa, psbTa, psbPo;
     if (!compile("csmain_splat",        "cs_5_0", csbSp)) return false;
     if (!compile("psmain_splat_albedo", "ps_5_0", psbSa)) return false;
@@ -409,28 +373,15 @@ bool Renderer::CreateShaders()
     if (!compile("psmain_splat_composite", "ps_5_0", psbSc)) return false;
     ComPtr<ID3DBlob> psbSr;
     if (!compile("psmain_splat_reconstruct", "ps_5_0", psbSr)) return false;
-    ComPtr<ID3DBlob> psbSp;
-    if (!compile("psmain_splat_albedo_poly", "ps_5_0", psbSp)) return false;
-    ComPtr<ID3DBlob> psbPa0;
-    if (!compile("psmain_polyvid_alpha0", "ps_5_0", psbPa0)) return false;
     if (!compile("vsmain_taa",          "vs_5_0", vsbTa)) return false;
     if (!compile("psmain_taa",          "ps_5_0", psbTa)) return false;
     if (!compile("psmain_post",         "ps_5_0", psbPo)) return false;
-    if (!compile("vsmain_bounds", "vs_5_0", vsbb)) return false;
-    if (!compile("psmain_bounds", "ps_5_0", psbb)) return false;
-    ComPtr<ID3DBlob> vsbd;
-    if (!compile("vsmain_depth", "vs_5_0", vsbd)) return false;
-    ComPtr<ID3DBlob> vsbSh;
-    if (!compile("vsmain_shadow", "vs_5_0", vsbSh)) return false;
     ComPtr<ID3DBlob> csb, vsbl, psbl;
     if (!compile("csmain_points_cs", "cs_5_0", csb)) return false;
     if (!compile("vsmain_blit",      "vs_5_0", vsbl)) return false;
     if (!compile("psmain_blit",      "ps_5_0", psbl)) return false;
 
-    HRESULT hr = device_->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, vs_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, ps_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    HRESULT hr;
     hr = device_->CreateVertexShader(vsbp->GetBufferPointer(), vsbp->GetBufferSize(), nullptr, vsPoints_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbp->GetBufferPointer(), psbp->GetBufferSize(), nullptr, psPoints_.GetAddressOf());
@@ -455,24 +406,6 @@ bool Renderer::CreateShaders()
     if (FAILED(hr)) return false;
     hr = device_->CreateVertexShader(vsbBT->GetBufferPointer(), vsbBT->GetBufferSize(), nullptr, vsBillboardTri_.GetAddressOf());
     if (FAILED(hr)) return false;
-    hr = device_->CreateVertexShader(vsbM->GetBufferPointer(), vsbM->GetBufferSize(), nullptr, vsMerged_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psbM->GetBufferPointer(), psbM->GetBufferSize(), nullptr, psMerged_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreateVertexShader(vsbA->GetBufferPointer(), vsbA->GetBufferSize(), nullptr, vsAtlas_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psbA->GetBufferPointer(), psbA->GetBufferSize(), nullptr, psAtlas_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    {
-        D3D11_INPUT_ELEMENT_DESC ilA[] = {
-            { "POSITION", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "UV",       0, DXGI_FORMAT_R16G16_UINT,       0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        };
-        hr = device_->CreateInputLayout(ilA, _countof(ilA),
-                                        vsbA->GetBufferPointer(), vsbA->GetBufferSize(),
-                                        atlasInputLayout_.GetAddressOf());
-        if (FAILED(hr)) return false;
-    }
     hr = device_->CreateComputeShader(csbSp->GetBufferPointer(), csbSp->GetBufferSize(), nullptr, csSplat_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbSa->GetBufferPointer(), psbSa->GetBufferSize(), nullptr, psSplatAlbedo_.GetAddressOf());
@@ -480,10 +413,6 @@ bool Renderer::CreateShaders()
     hr = device_->CreatePixelShader(psbSc->GetBufferPointer(), psbSc->GetBufferSize(), nullptr, psSplatComposite_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbSr->GetBufferPointer(), psbSr->GetBufferSize(), nullptr, psSplatRecon_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psbSp->GetBufferPointer(), psbSp->GetBufferSize(), nullptr, psSplatAlbedoPoly_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psbPa0->GetBufferPointer(), psbPa0->GetBufferSize(), nullptr, psPolyVidAlpha0_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreateVertexShader(vsbTa->GetBufferPointer(), vsbTa->GetBufferSize(), nullptr, vsTaa_.GetAddressOf());
     if (FAILED(hr)) return false;
@@ -498,22 +427,6 @@ bool Renderer::CreateShaders()
         sm.MinLOD = 0; sm.MaxLOD = D3D11_FLOAT32_MAX;
         device_->CreateSamplerState(&sm, linearClampSampler_.GetAddressOf());
     }
-    D3D11_INPUT_ELEMENT_DESC ilM[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,                            D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UNORM,  0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-    };
-    hr = device_->CreateInputLayout(ilM, _countof(ilM),
-                                    vsbM->GetBufferPointer(), vsbM->GetBufferSize(),
-                                    mergedInputLayout_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreateVertexShader(vsbb->GetBufferPointer(), vsbb->GetBufferSize(), nullptr, vsBounds_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psbb->GetBufferPointer(), psbb->GetBufferSize(), nullptr, psBounds_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreateVertexShader(vsbd->GetBufferPointer(), vsbd->GetBufferSize(), nullptr, vsDepth_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreateVertexShader(vsbSh->GetBufferPointer(), vsbSh->GetBufferSize(), nullptr, vsShadow_.GetAddressOf());
-    if (FAILED(hr)) return false;
     hr = device_->CreateComputeShader(csb->GetBufferPointer(), csb->GetBufferSize(), nullptr, csPoints_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreateVertexShader(vsbl->GetBufferPointer(), vsbl->GetBufferSize(), nullptr, vsBlit_.GetAddressOf());
@@ -528,10 +441,9 @@ bool Renderer::CreateShaders()
         { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UINT,     0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     hr = device_->CreateInputLayout(il, _countof(il),
-                                    vsb->GetBufferPointer(), vsb->GetBufferSize(),
+                                    vsbp->GetBufferPointer(), vsbp->GetBufferSize(),
                                     inputLayout_.GetAddressOf());
     if (FAILED(hr)) return false;
-    inputLayoutPoly_ = inputLayout_;   // same layout; alias kept for clarity
 
     // HexSprite: same vertex format, per-instance stepping.
     D3D11_INPUT_ELEMENT_DESC ilHex[] = {
@@ -541,14 +453,6 @@ bool Renderer::CreateShaders()
     hr = device_->CreateInputLayout(ilHex, _countof(ilHex),
                                     vsbh->GetBufferPointer(), vsbh->GetBufferSize(),
                                     inputLayoutHex_.GetAddressOf());
-    if (FAILED(hr)) return false;
-
-    D3D11_INPUT_ELEMENT_DESC ilB[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-    };
-    hr = device_->CreateInputLayout(ilB, _countof(ilB),
-                                    vsbb->GetBufferPointer(), vsbb->GetBufferSize(),
-                                    inputLayoutBounds_.GetAddressOf());
     if (FAILED(hr)) return false;
 
     // PolyVID input layout: per-instance step on pointVb_.
@@ -561,38 +465,8 @@ bool Renderer::CreateShaders()
                                     inputLayoutPolyVid_.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // Unit cube wireframe: 8 corner positions + 24 line-list indices (12 edges).
-    float cubeVerts[8][3] = {
-        {0,0,0},{1,0,0},{0,1,0},{1,1,0},
-        {0,0,1},{1,0,1},{0,1,1},{1,1,1},
-    };
-    uint32_t cubeLines[24] = {
-        0,1, 0,2, 0,4, 1,3, 1,5, 2,3,
-        2,6, 3,7, 4,5, 4,6, 5,7, 6,7,
-    };
-    D3D11_BUFFER_DESC bdb = {};
-    bdb.Usage = D3D11_USAGE_IMMUTABLE;
-    bdb.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    bdb.ByteWidth = sizeof(cubeVerts);
-    D3D11_SUBRESOURCE_DATA sdb = { cubeVerts, 0, 0 };
-    if (FAILED(device_->CreateBuffer(&bdb, &sdb, boundsVb_.GetAddressOf()))) return false;
-    bdb.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    bdb.ByteWidth = sizeof(cubeLines);
-    sdb.pSysMem = cubeLines;
-    if (FAILED(device_->CreateBuffer(&bdb, &sdb, boundsIb_.GetAddressOf()))) return false;
-
-    // PolyVID IB is built per-scene in UploadScene (depends on max chunk size).
     return true;
 }
-
-static const uint8_t kCubeTriCornerPattern[36] = {
-    1, 3, 7,  1, 7, 5,    // +X
-    4, 6, 2,  4, 2, 0,    // -X
-    2, 6, 7,  2, 7, 3,    // +Y
-    0, 1, 5,  0, 5, 4,    // -Y
-    5, 7, 6,  5, 6, 4,    // +Z
-    0, 2, 3,  0, 3, 1,    // -Z
-};
 
 bool Renderer::CreatePipelineState()
 {
@@ -619,11 +493,6 @@ bool Renderer::CreatePipelineState()
     rdNo.CullMode = D3D11_CULL_NONE;
     if (FAILED(device_->CreateRasterizerState(&rdNo, rsNoCull_.GetAddressOf()))) return false;
 
-    D3D11_RASTERIZER_DESC rdW = rd;
-    rdW.FillMode = D3D11_FILL_WIREFRAME;
-    rdW.CullMode = D3D11_CULL_NONE;     // see thin lines from both sides
-    if (FAILED(device_->CreateRasterizerState(&rdW, rsWire_.GetAddressOf()))) return false;
-
     D3D11_DEPTH_STENCIL_DESC dd = {};
     dd.DepthEnable = TRUE;
     dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
@@ -636,19 +505,7 @@ bool Renderer::CreatePipelineState()
     ddNo.DepthFunc = D3D11_COMPARISON_ALWAYS;
     if (FAILED(device_->CreateDepthStencilState(&ddNo, dsAlways_.GetAddressOf()))) return false;
 
-    D3D11_DEPTH_STENCIL_DESC ddEq = {};
-    ddEq.DepthEnable = TRUE;
-    ddEq.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;   // prepass already wrote depth
-    ddEq.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
-    if (FAILED(device_->CreateDepthStencilState(&ddEq, dsEqual_.GetAddressOf()))) return false;
-
-    D3D11_BLEND_DESC bsd = {};
-    bsd.RenderTarget[0].BlendEnable = FALSE;
-    bsd.RenderTarget[0].RenderTargetWriteMask = 0;       // no color writes
-    if (FAILED(device_->CreateBlendState(&bsd, bsNoColor_.GetAddressOf()))) return false;
-
-    // Alpha-over: src=ALPHA, dst=INV_ALPHA. Alpha=0 -> destination preserved
-    // (used by splat composite so depth-only pixels keep main RT color).
+    // Alpha-over: src=ALPHA, dst=INV_ALPHA. Alpha=0 -> destination preserved.
     D3D11_BLEND_DESC bsa = {};
     bsa.RenderTarget[0].BlendEnable = TRUE;
     bsa.RenderTarget[0].SrcBlend  = D3D11_BLEND_SRC_ALPHA;
@@ -660,79 +517,22 @@ bool Renderer::CreatePipelineState()
     bsa.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     if (FAILED(device_->CreateBlendState(&bsa, bsAlphaOver_.GetAddressOf()))) return false;
 
-    // Sun shadow map: D32_FLOAT, reverse-Z ortho, back-face culling, depth bias.
+    // Splat depth states.
     {
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width  = shadowSize_;
-        td.Height = shadowSize_;
-        td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R32_TYPELESS;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(device_->CreateTexture2D(&td, nullptr, shadowTex_.GetAddressOf()))) return false;
-
-        D3D11_DEPTH_STENCIL_VIEW_DESC dvd = {};
-        dvd.Format = DXGI_FORMAT_D32_FLOAT;
-        dvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-        if (FAILED(device_->CreateDepthStencilView(shadowTex_.Get(), &dvd, shadowDsv_.GetAddressOf()))) return false;
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC svd = {};
-        svd.Format = DXGI_FORMAT_R32_FLOAT;
-        svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        svd.Texture2D.MipLevels = 1;
-        if (FAILED(device_->CreateShaderResourceView(shadowTex_.Get(), &svd, shadowSrv_.GetAddressOf()))) return false;
-
-        D3D11_SAMPLER_DESC sd = {};
-        sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
-        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
-        sd.BorderColor[0] = sd.BorderColor[1] = sd.BorderColor[2] = sd.BorderColor[3] = 1.0f;
-        // Reverse-Z ortho: lit when sample >= ref → use GREATER_EQUAL.
-        sd.ComparisonFunc = D3D11_COMPARISON_GREATER_EQUAL;
-        if (FAILED(device_->CreateSamplerState(&sd, shadowSamp_.GetAddressOf()))) return false;
-
-        D3D11_RASTERIZER_DESC rsd = {};
-        rsd.FillMode = D3D11_FILL_SOLID;
-        rsd.CullMode = D3D11_CULL_BACK;
-        rsd.DepthClipEnable = TRUE;
-        rsd.DepthBias = 0;
-        rsd.DepthBiasClamp = 0.0f;
-        rsd.SlopeScaledDepthBias = 0.0f;
-        if (FAILED(device_->CreateRasterizerState(&rsd, rsShadow_.GetAddressOf()))) return false;
-    }
-
-    // Splat stencil-based pipeline. dsSplatPoly: poly draws set stencil=1.
-    // dsSplatPoint: splat-marker draws don't touch stencil.
-    {
-        D3D11_DEPTH_STENCIL_DESC dd = {};
-        dd.DepthEnable = TRUE;
-        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-        dd.DepthFunc = D3D11_COMPARISON_GREATER;
-        dd.StencilEnable = TRUE;
-        dd.StencilReadMask = 0xFF;
-        dd.StencilWriteMask = 0xFF;
-        dd.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
-        dd.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
-        dd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
-        dd.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
-        dd.BackFace = dd.FrontFace;
-        if (FAILED(device_->CreateDepthStencilState(&dd, dsSplatPoly_.GetAddressOf()))) return false;
+        D3D11_DEPTH_STENCIL_DESC dde = {};
+        dde.DepthEnable = TRUE;
+        dde.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dde.DepthFunc = D3D11_COMPARISON_GREATER;
+        dde.StencilEnable = FALSE;
+        if (FAILED(device_->CreateDepthStencilState(&dde, dsSplatPoint_.GetAddressOf()))) return false;
     }
     {
-        D3D11_DEPTH_STENCIL_DESC dd = {};
-        dd.DepthEnable = TRUE;
-        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-        dd.DepthFunc = D3D11_COMPARISON_GREATER;
-        dd.StencilEnable = FALSE;
-        if (FAILED(device_->CreateDepthStencilState(&dd, dsSplatPoint_.GetAddressOf()))) return false;
-    }
-    {
-        D3D11_DEPTH_STENCIL_DESC dd = {};
-        dd.DepthEnable = TRUE;
-        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-        dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
-        dd.StencilEnable = FALSE;
-        if (FAILED(device_->CreateDepthStencilState(&dd, dsAlwaysWrite_.GetAddressOf()))) return false;
+        D3D11_DEPTH_STENCIL_DESC dde = {};
+        dde.DepthEnable = TRUE;
+        dde.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dde.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        dde.StencilEnable = FALSE;
+        if (FAILED(device_->CreateDepthStencilState(&dde, dsAlwaysWrite_.GetAddressOf()))) return false;
     }
     return true;
 }
@@ -751,115 +551,68 @@ void Renderer::Resize(uint32_t w, uint32_t h)
 
 void Renderer::UploadScene(const Scene& scene)
 {
-    // New geometry → cached shadow map is stale.
-    shadowValid_ = false;
     subs_.clear();
-    vb_.Reset();
-    ib_.Reset();
-    totalTriangles_ = 0;
-    totalVertices_  = 0;
-    vbBytes_ = 0;
-    ibBytes_ = 0;
-
-    if (scene.vertices.empty()) return;
-
-    D3D11_BUFFER_DESC bd = {};
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    D3D11_SUBRESOURCE_DATA sd = {};
-
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    bd.ByteWidth = (UINT)(scene.vertices.size() * sizeof(VoxelPolyVertex));
-    sd.pSysMem = scene.vertices.data();
-    if (FAILED(device_->CreateBuffer(&bd, &sd, vb_.GetAddressOf()))) return;
-
-    std::vector<uint32_t> sharedIb;
-    const uint32_t* ibPtr = nullptr;
-    size_t ibCount = 0;
-
-    if (scene.indices.empty()) {
-        // Shared cube IB: pattern (4f, 4f+1, 4f+2, 4f, 4f+2, 4f+3) per face.
-        // Size for the largest chunk so any DrawIndexed fits.
-        uint32_t maxIndexCount = 0;
-        for (const auto& s : scene.subs)
-            maxIndexCount = std::max(maxIndexCount, s.indexCount);
-        uint32_t maxFaces = maxIndexCount / 6;
-        sharedIb.resize((size_t)maxFaces * 6);
-        for (uint32_t f = 0; f < maxFaces; ++f) {
-            uint32_t base = f * 4;
-            uint32_t* o = sharedIb.data() + f * 6;
-            o[0] = base + 0; o[1] = base + 1; o[2] = base + 2;
-            o[3] = base + 0; o[4] = base + 2; o[5] = base + 3;
-        }
-        ibPtr = sharedIb.data();
-        ibCount = sharedIb.size();
-    } else {
-        ibPtr = scene.indices.data();
-        ibCount = scene.indices.size();
-    }
-
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    bd.ByteWidth = (UINT)(ibCount * sizeof(uint32_t));
-    sd.pSysMem = ibPtr;
-    if (FAILED(device_->CreateBuffer(&bd, &sd, ib_.GetAddressOf()))) return;
-
+    pointVb_.Reset();
+    pointSb_.Reset();
     pointSrv_.Reset();
     pointAo6Srv_.Reset();
     pointAo6Sb_.Reset();
-    if (!scene.pointVertices.empty()) {
-        // Vertex buffer (immutable, plain).
-        D3D11_BUFFER_DESC pbd = {};
-        pbd.Usage = D3D11_USAGE_IMMUTABLE;
-        pbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        pbd.ByteWidth = (UINT)(scene.pointVertices.size() * sizeof(Vertex));
-        D3D11_SUBRESOURCE_DATA psd = {};
-        psd.pSysMem = scene.pointVertices.data();
-        device_->CreateBuffer(&pbd, &psd, pointVb_.GetAddressOf());
+    polyVidIb_.Reset();
+    billboardIb_.Reset();
+    pointBytes_ = 0;
 
-        // Parallel StructuredBuffer for CS access (same data).
-        D3D11_BUFFER_DESC sbd = {};
-        sbd.Usage = D3D11_USAGE_IMMUTABLE;
-        sbd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        sbd.ByteWidth = pbd.ByteWidth;
-        sbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        sbd.StructureByteStride = sizeof(Vertex);
-        ComPtr<ID3D11Buffer> sb;
-        if (SUCCEEDED(device_->CreateBuffer(&sbd, &psd, sb.GetAddressOf()))) {
-            D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
-            srvd.Format = DXGI_FORMAT_UNKNOWN;
-            srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-            srvd.Buffer.NumElements = (UINT)scene.pointVertices.size();
-            device_->CreateShaderResourceView(sb.Get(), &srvd, pointSrv_.GetAddressOf());
-            pointSb_ = sb;
-        }
+    if (scene.pointVertices.empty()) return;
 
-        // Parallel per-voxel face-AO buffer for PolyAxis (24 bits packed).
-        if (!scene.pointAo6.empty()) {
-            D3D11_BUFFER_DESC abd = {};
-            abd.Usage = D3D11_USAGE_IMMUTABLE;
-            abd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            abd.ByteWidth = (UINT)(scene.pointAo6.size() * sizeof(uint32_t));
-            abd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-            abd.StructureByteStride = sizeof(uint32_t);
-            D3D11_SUBRESOURCE_DATA asd = {};
-            asd.pSysMem = scene.pointAo6.data();
-            ComPtr<ID3D11Buffer> aoSb;
-            if (SUCCEEDED(device_->CreateBuffer(&abd, &asd, aoSb.GetAddressOf()))) {
-                D3D11_SHADER_RESOURCE_VIEW_DESC asd2 = {};
-                asd2.Format = DXGI_FORMAT_UNKNOWN;
-                asd2.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-                asd2.Buffer.NumElements = (UINT)scene.pointAo6.size();
-                device_->CreateShaderResourceView(aoSb.Get(), &asd2, pointAo6Srv_.GetAddressOf());
-                pointAo6Sb_ = aoSb;
-            }
+    // Vertex buffer (immutable, plain).
+    D3D11_BUFFER_DESC pbd = {};
+    pbd.Usage = D3D11_USAGE_IMMUTABLE;
+    pbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    pbd.ByteWidth = (UINT)(scene.pointVertices.size() * sizeof(Vertex));
+    D3D11_SUBRESOURCE_DATA psd = {};
+    psd.pSysMem = scene.pointVertices.data();
+    device_->CreateBuffer(&pbd, &psd, pointVb_.GetAddressOf());
+
+    // Parallel StructuredBuffer for CS / VS access (same data).
+    D3D11_BUFFER_DESC sbd = {};
+    sbd.Usage = D3D11_USAGE_IMMUTABLE;
+    sbd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sbd.ByteWidth = pbd.ByteWidth;
+    sbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    sbd.StructureByteStride = sizeof(Vertex);
+    ComPtr<ID3D11Buffer> sb;
+    if (SUCCEEDED(device_->CreateBuffer(&sbd, &psd, sb.GetAddressOf()))) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+        srvd.Format = DXGI_FORMAT_UNKNOWN;
+        srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        srvd.Buffer.NumElements = (UINT)scene.pointVertices.size();
+        device_->CreateShaderResourceView(sb.Get(), &srvd, pointSrv_.GetAddressOf());
+        pointSb_ = sb;
+    }
+
+    // Parallel per-voxel face-AO buffer for PolyAxis (24 bits packed).
+    if (!scene.pointAo6.empty()) {
+        D3D11_BUFFER_DESC abd = {};
+        abd.Usage = D3D11_USAGE_IMMUTABLE;
+        abd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        abd.ByteWidth = (UINT)(scene.pointAo6.size() * sizeof(uint32_t));
+        abd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        abd.StructureByteStride = sizeof(uint32_t);
+        D3D11_SUBRESOURCE_DATA asd = {};
+        asd.pSysMem = scene.pointAo6.data();
+        ComPtr<ID3D11Buffer> aoSb;
+        if (SUCCEEDED(device_->CreateBuffer(&abd, &asd, aoSb.GetAddressOf()))) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC asd2 = {};
+            asd2.Format = DXGI_FORMAT_UNKNOWN;
+            asd2.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+            asd2.Buffer.NumElements = (UINT)scene.pointAo6.size();
+            device_->CreateShaderResourceView(aoSb.Get(), &asd2, pointAo6Srv_.GetAddressOf());
+            pointAo6Sb_ = aoSb;
         }
     }
 
     subs_.reserve(scene.subs.size());
     for (const auto& s : scene.subs) {
         GpuSubMesh gs;
-        gs.firstIndex = s.firstIndex;
-        gs.indexCount = s.indexCount;
-        gs.baseVertex = s.baseVertex;
         gs.pointFirst = s.pointFirst;
         gs.pointCount = s.pointCount;
         gs.pointFirstL1 = s.pointFirstL1;
@@ -873,9 +626,6 @@ void Renderer::UploadScene(const Scene& scene)
         gs.chunkBase[0] = s.chunkBase[0]; gs.chunkBase[1] = s.chunkBase[1]; gs.chunkBase[2] = s.chunkBase[2];
         subs_.push_back(gs);
     }
-    totalVertices_  = scene.vertices.size();
-    totalTriangles_ = 0;
-    for (const auto& s : scene.subs) totalTriangles_ += s.indexCount / 3;
     sceneOrigin_[0] = (float)scene.origin[0];
     sceneOrigin_[1] = (float)scene.origin[1];
     sceneOrigin_[2] = (float)scene.origin[2];
@@ -883,9 +633,7 @@ void Renderer::UploadScene(const Scene& scene)
     sceneSpan_[1] = scene.aabbMax[1] - scene.aabbMin[1];
     sceneSpan_[2] = scene.aabbMax[2] - scene.aabbMin[2];
 
-    // PolyVID shared IB: per voxel 24 unique vertex slots (6 faces * 4 corners),
-    // 36 indices = 6 faces * (3+3). IB[v*36+f*6+k] = v*24 + f*4 + cornerWithinFace[k]
-    // where cornerWithinFace pattern is (0,1,2,0,2,3).
+    // PolyVID + Billboard shared IBs sized to the largest chunk.
     {
         uint32_t maxVox = 0;
         for (const auto& s : scene.subs) {
@@ -908,30 +656,23 @@ void Renderer::UploadScene(const Scene& scene)
             ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
             ibd.ByteWidth = (UINT)(ib.size() * sizeof(uint32_t));
             D3D11_SUBRESOURCE_DATA isd = { ib.data(), 0, 0 };
-            polyVidIb_.Reset();
             device_->CreateBuffer(&ibd, &isd, polyVidIb_.GetAddressOf());
-        }
 
-        // Billboard IB: 6 indices per voxel, pattern v*4 + {0,1,2,0,2,3}.
-        if (maxVox > 0) {
+            // Billboard IB: 6 indices per voxel, pattern v*4 + {0,1,2,0,2,3}.
             std::vector<uint32_t> bib((size_t)maxVox * 6);
-            uint32_t* dst = bib.data();
-            static const uint8_t kQuadIdx[6] = { 0, 1, 2, 0, 2, 3 };
+            uint32_t* bdst = bib.data();
             for (uint32_t v = 0; v < maxVox; ++v) {
                 uint32_t base = v * 4;
-                for (int k = 0; k < 6; ++k) *dst++ = base + kQuadIdx[k];
+                for (int k = 0; k < 6; ++k) *bdst++ = base + kQuadIdx[k];
             }
             D3D11_BUFFER_DESC ibd2 = {};
             ibd2.Usage = D3D11_USAGE_IMMUTABLE;
             ibd2.BindFlags = D3D11_BIND_INDEX_BUFFER;
             ibd2.ByteWidth = (UINT)(bib.size() * sizeof(uint32_t));
             D3D11_SUBRESOURCE_DATA isd2 = { bib.data(), 0, 0 };
-            billboardIb_.Reset();
             device_->CreateBuffer(&ibd2, &isd2, billboardIb_.GetAddressOf());
         }
     }
-    vbBytes_ = scene.vertices.size() * sizeof(VoxelPolyVertex);
-    ibBytes_ = ibCount * sizeof(uint32_t);
     pointBytes_ = scene.pointVertices.size() * sizeof(Vertex)
                 + scene.pointAo6.size() * sizeof(uint32_t);
     pointCountL0_ = 0;
@@ -975,16 +716,12 @@ void Renderer::UploadScene(const Scene& scene)
                 const double pr = (double)p.second * invT;
                 if (pr > 0.0) colorEntropyBits_ -= pr * std::log2(pr);
             }
-            // Palette bits: ceil(log2(unique)).
             const size_t n = colorHistogram_.size();
             colorPaletteBits_ = (n <= 1) ? 1u
                 : (uint32_t)std::ceil(std::log2((double)n));
 
-            // Exact Huffman: build tree via min-heap on weights; sum of all
-            // internal-node weights = total code length in symbol-occurrences.
-            // avg bits = totalCodeLen / total.
             if (n == 1) {
-                colorHuffmanBits_ = 1.0; // degenerate: must emit something
+                colorHuffmanBits_ = 1.0;
             } else {
                 std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> pq;
                 for (const auto& p : colorHistogram_) pq.push(p.second);
@@ -1002,107 +739,6 @@ void Renderer::UploadScene(const Scene& scene)
     }
 }
 
-void Renderer::UploadMergedMesh(const MergedMesh& mesh)
-{
-    mergedVb_.Reset();
-    mergedIb_.Reset();
-    mergedIndexCount_ = 0;
-    mergedVbBytes_ = 0;
-    mergedIbBytes_ = 0;
-    if (mesh.vertices.empty() || mesh.indices.empty()) return;
-
-    D3D11_BUFFER_DESC bd = {};
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    D3D11_SUBRESOURCE_DATA sd = {};
-
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    bd.ByteWidth = (UINT)(mesh.vertices.size() * sizeof(MergedVertex));
-    sd.pSysMem = mesh.vertices.data();
-    if (FAILED(device_->CreateBuffer(&bd, &sd, mergedVb_.GetAddressOf()))) return;
-
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    bd.ByteWidth = (UINT)(mesh.indices.size() * sizeof(uint32_t));
-    sd.pSysMem = mesh.indices.data();
-    if (FAILED(device_->CreateBuffer(&bd, &sd, mergedIb_.GetAddressOf()))) return;
-
-    mergedIndexCount_ = (uint32_t)mesh.indices.size();
-    mergedVbBytes_ = mesh.vertices.size() * sizeof(MergedVertex);
-    mergedIbBytes_ = mesh.indices.size() * sizeof(uint32_t);
-}
-
-void Renderer::UploadAtlasMesh(const AtlasMesh& mesh)
-{
-    atlasVb_.Reset();
-    atlasIb_.Reset();
-    atlasTex_.Reset();
-    atlasSrv_.Reset();
-    atlasIndexCount_ = 0;
-    atlasVbBytes_  = 0;
-    atlasIbBytes_  = 0;
-    atlasTexBytes_ = 0;
-    if (mesh.vertices.empty() || mesh.indices.empty()
-        || mesh.atlasPixels.empty() || mesh.atlasW == 0 || mesh.atlasH == 0) return;
-
-    D3D11_BUFFER_DESC bd = {};
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    D3D11_SUBRESOURCE_DATA sd = {};
-
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    bd.ByteWidth = (UINT)(mesh.vertices.size() * sizeof(AtlasVertex));
-    sd.pSysMem = mesh.vertices.data();
-    if (FAILED(device_->CreateBuffer(&bd, &sd, atlasVb_.GetAddressOf()))) return;
-
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    bd.ByteWidth = (UINT)(mesh.indices.size() * sizeof(uint32_t));
-    sd.pSysMem = mesh.indices.data();
-    if (FAILED(device_->CreateBuffer(&bd, &sd, atlasIb_.GetAddressOf()))) return;
-
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = mesh.atlasW;
-    td.Height = mesh.atlasH;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_IMMUTABLE;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA tsd = {};
-    tsd.pSysMem = mesh.atlasPixels.data();
-    tsd.SysMemPitch = mesh.atlasW * 4;
-    if (FAILED(device_->CreateTexture2D(&td, &tsd, atlasTex_.GetAddressOf()))) return;
-    if (FAILED(device_->CreateShaderResourceView(atlasTex_.Get(), nullptr, atlasSrv_.GetAddressOf()))) return;
-
-    atlasIndexCount_ = (uint32_t)mesh.indices.size();
-    atlasVbBytes_  = mesh.vertices.size() * sizeof(AtlasVertex);
-    atlasIbBytes_  = mesh.indices.size() * sizeof(uint32_t);
-    atlasTexBytes_ = (uint64_t)mesh.atlasW * (uint64_t)mesh.atlasH * 4;
-    atlasOrigin_[0] = (float)mesh.origin[0];
-    atlasOrigin_[1] = (float)mesh.origin[1];
-    atlasOrigin_[2] = (float)mesh.origin[2];
-
-    atlasSubs_.clear();
-    atlasSubByChunk_.clear();
-    atlasSubs_.reserve(mesh.chunks.size());
-    for (const auto& c : mesh.chunks) {
-        GpuAtlasSub s;
-        s.cx = c.cx; s.cy = c.cy; s.cz = c.cz;
-        for (int d = 0; d < 3; ++d) {
-            s.aabbMin[d] = (float)c.aabbMin[d];
-            s.aabbMax[d] = (float)c.aabbMax[d];
-        }
-        s.firstIndex = c.firstIndex;
-        s.indexCount = c.indexCount;
-        uint64_t key = ((uint64_t)s.cx) | ((uint64_t)s.cy << 20) | ((uint64_t)s.cz << 40);
-        atlasSubByChunk_[key] = (uint32_t)atlasSubs_.size();
-        atlasSubs_.push_back(s);
-    }
-
-    // Use AABB span for grid replication (same convention as MergedMesh).
-    sceneSpan_[0] = mesh.aabbMax[0] - mesh.aabbMin[0] + 1.0f;
-    sceneSpan_[1] = mesh.aabbMax[1] - mesh.aabbMin[1] + 1.0f;
-    sceneSpan_[2] = mesh.aabbMax[2] - mesh.aabbMin[2] + 1.0f;
-}
-
 void Renderer::TryHotReloadShaders()
 {
     HANDLE h = CreateFileA("shaders/voxel.hlsl", GENERIC_READ, FILE_SHARE_READ,
@@ -1113,14 +749,10 @@ void Renderer::TryHotReloadShaders()
     CloseHandle(h);
     uint64_t mtime = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
     if (mtime == shaderMtime_) return;
-    if (shaderMtime_ == 0) {                      // first call -> just record
+    if (shaderMtime_ == 0) {
         shaderMtime_ = mtime;
         return;
     }
-    // File changed since last frame. Recompile + recreate. CreateShaders pops
-    // a message box on failure; the existing in-flight shaders survive the
-    // attempt because failure short-circuits before the destructive Create
-    // calls overwrite all comptrs.
     OutputDebugStringA("[HotReload] voxel.hlsl changed - recompiling\n");
     if (CreateShaders()) {
         OutputDebugStringA("[HotReload] success\n");
@@ -1137,10 +769,9 @@ void Renderer::BeginFrame(float clear[4])
     lastClear_[1] = clear[1];
     lastClear_[2] = clear[2];
     lastClear_[3] = clear[3];
-    ID3D11RenderTargetView* active = (msaaSamples_ > 1) ? msaaRtv_.Get() : rtv_.Get();
-    ID3D11RenderTargetView* rtvs[] = { active };
+    ID3D11RenderTargetView* rtvs[] = { rtv_.Get() };
     ctx_->OMSetRenderTargets(1, rtvs, dsv_.Get());
-    ctx_->ClearRenderTargetView(active, clear);
+    ctx_->ClearRenderTargetView(rtv_.Get(), clear);
     ctx_->ClearDepthStencilView(dsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
 
     D3D11_VIEWPORT vp = {};
@@ -1155,16 +786,12 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
 {
     MICROPROFILE_SCOPEI("CPU", "DrawScene", 0xff80c0ff);
     MICROPROFILE_SCOPEGPUI("DrawScene", 0xff80c0ff);
-    // Unpack args into locals — many spots in this function clamp/mutate
-    // values, and dragging const refs through ~1500 lines is verbose. Locals
-    // are cheaper than refactoring every reference.
     ShadingMode    mode             = args.mode;
     int            gridSize         = args.gridSize;
-    RenderTech     techClose        = args.techClose;
+    RenderTech     techClose        = args.tech;
     RenderTech     techFar          = args.techFar;
-    DataSet        dataset          = args.dataset;
-    bool           showChunkBounds  = args.showChunkBounds;
-    bool           zPrepass         = args.zPrepass;
+    bool           closeEnabled     = args.closeEnabled;
+    bool           farEnabled       = args.farEnabled;
     PointLighting  pointLight       = args.pointLight;
     PointLod       pointLod         = args.pointLod;
     float          pointLodScale    = args.pointLodScale;
@@ -1174,33 +801,11 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     float          heightFogDensity = args.heightFogDensity;
     float          heightFogFalloff = args.heightFogFalloff;
     float          heightFogStart   = args.heightFogStart;
-    float          hybridThreshold  = args.hybridThreshold;
-    bool           wireframe        = args.wireframe;
     int            splatRadius      = args.splatRadius;
     bool           taa              = args.taa;
     float          sunIntensity     = args.sunIntensity;
     float          exposure         = args.exposure;
     float          roughness        = args.roughness;
-
-    hybridThreshold = std::max(hybridThreshold, 0.01f);
-
-    // techClose is treated as `tech` for the existing single-tech code paths;
-    // techFar (if not None) picks a different tech for low-ppv chunks via the
-    // per-chunk dispatch below. Splat-RT pipeline triggers if either side
-    // uses Splat / SplatHybrid.
-    RenderTech tech = techClose;
-    const bool anySplat = (techClose == RenderTech::Splat) ||
-                          (techClose == RenderTech::SplatHybrid) ||
-                          (techFar   == RenderTech::Splat) ||
-                          (techFar   == RenderTech::SplatHybrid);
-    const bool anyPoly  = (techClose == RenderTech::PolygonBased) ||
-                          (techClose == RenderTech::Hybrid) ||
-                          (techFar   == RenderTech::PolygonBased) ||
-                          (techFar   == RenderTech::Hybrid);
-    (void)anyPoly;
-
-    // TAA disabled when MSAA on (composite reads non-MSAA depth/color).
-    if (msaaSamples_ > 1) taa = false;
 
     // Halton(2,3) sub-pixel jitter for this frame.
     auto halton = [](uint32_t i, uint32_t b) {
@@ -1218,14 +823,8 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     gridSize = std::clamp(gridSize, 1, 10);
     hlslpp::float4x4 v  = cam.view();
     hlslpp::float4x4 p  = cam.proj((float)width_ / (float)(height_ ? height_ : 1));
-    // Un-jittered VP is what gets stored as "prev" for next frame's TAA reproject:
-    // history is the merged output at pixel grid (jitter already undone in PS),
-    // so prev reproject must use unjittered.
     hlslpp::float4x4 vpUnjittered = hlslpp::mul(v, p);
     if (taa) {
-        // Inject sub-pixel jitter into proj. clip = view*proj, clip.w = view.z;
-        // adding (jitter * view.z) to clip.xy after divide gives NDC offset = jitter.
-        // Row index 2 (view.z multiplier) of row-major proj.
         float pStore[16];
         hlslpp::store(pStore, p);
         pStore[2*4 + 0] = jitterNdcX;
@@ -1240,16 +839,12 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
 
     D3D11_MAPPED_SUBRESOURCE m;
     ctx_->Map(cbPerFrame_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
-    // Post (sky + sharpen + tonemap) reads scene RT after main draws. TAA
-    // composite sits between when enabled. Sky pixels marked by alpha=0.
     const bool postEnabled = (taaSceneRtv_ && psPost_);
-    const bool useMsaa = (msaaSamples_ > 1);
     postWroteBackbuf_ = false;
     if (postEnabled) {
         float alpha0[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
-        ID3D11RenderTargetView* sceneRtv = useMsaa ? msaaRtv_.Get() : taaSceneRtv_.Get();
-        ctx_->ClearRenderTargetView(sceneRtv, alpha0);
-        ID3D11RenderTargetView* rtvs[] = { sceneRtv };
+        ctx_->ClearRenderTargetView(taaSceneRtv_.Get(), alpha0);
+        ID3D11RenderTargetView* rtvs[] = { taaSceneRtv_.Get() };
         ctx_->OMSetRenderTargets(1, rtvs, dsv_.Get());
     }
 
@@ -1257,9 +852,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         CBPerFrame cb;
         hlslpp::store(cb.viewProj, vp);
         hlslpp::store(cb.camPos, cam.position);
-        // Wireframe forces FlatColor shading so lines aren't black (the lit PS
-        // computes normals via ddx/ddy which degenerates on wireframe edges).
-        cb.mode = (float)(wireframe ? (int)ShadingMode::FlatColor : (int)mode);
+        cb.mode = (float)(int)mode;
         cb.lightDir[0] = args.sunDir[0]; cb.lightDir[1] = args.sunDir[1]; cb.lightDir[2] = args.sunDir[2];
         cb.ambient = 0.7f;
         hlslpp::float3 fwd = cam.forward();
@@ -1270,7 +863,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         hlslpp::store(cb.invViewProj, invVp);
         cb.screenW = (float)width_;
         cb.screenH = (float)height_;
-        cb._pad2[0] = (float)splatRadius;       // gSplatRadius (CS dilation R)
+        cb._pad2[0] = (float)splatRadius;
         cb._pad2[1] = 0;
         hlslpp::float3 right = cam.right();
         hlslpp::float3 upVec = hlslpp::cross(fwd, right);
@@ -1292,79 +885,10 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         for (int i = 0; i < 16; ++i) cb.prevViewProj[i] = taaPrevVP_[i];
         cb.jitter[0] = jitterNdcX; cb.jitter[1] = jitterNdcY;
         cb._pad7[0] = cb._pad7[1] = 0;
-        // Sun shadow: row-major LH ortho around scene AABB, reverse-Z. Camera
-        // at sceneCenter + sunDir * dist; looks toward sceneCenter.
-        {
-        float sd[3] = { args.sunDir[0], args.sunDir[1], args.sunDir[2] };
-        {
-            float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
-            if (sl < 1e-6f) sl = 1.0f;
-            sd[0] /= sl; sd[1] /= sl; sd[2] /= sl;
-        }
-        float center[3] = { sceneOrigin_[0] + sceneSpan_[0] * 0.5f,
-                            sceneOrigin_[1] + sceneSpan_[1] * 0.5f,
-                            sceneOrigin_[2] + sceneSpan_[2] * 0.5f };
-        float diag = 0.5f * sqrtf(sceneSpan_[0]*sceneSpan_[0]
-                                 + sceneSpan_[1]*sceneSpan_[1]
-                                 + sceneSpan_[2]*sceneSpan_[2]);
-        if (diag < 1.0f) diag = 1.0f;
-        float sdist = diag * 2.0f;
-        float eye[3] = { center[0] + sd[0] * sdist,
-                         center[1] + sd[1] * sdist,
-                         center[2] + sd[2] * sdist };
-        float fwd[3] = { center[0] - eye[0], center[1] - eye[1], center[2] - eye[2] };
-        {
-            float fl = sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]);
-            if (fl < 1e-6f) fl = 1.0f;
-            fwd[0] /= fl; fwd[1] /= fl; fwd[2] /= fl;
-        }
-        float upRef[3] = { 0.0f, 1.0f, 0.0f };
-        if (fabsf(fwd[1]) > 0.95f) { upRef[0] = 1.0f; upRef[1] = 0.0f; }
-        // right = normalize(cross(up, fwd)), up = cross(fwd, right) — LH
-        float right[3] = { upRef[1]*fwd[2] - upRef[2]*fwd[1],
-                           upRef[2]*fwd[0] - upRef[0]*fwd[2],
-                           upRef[0]*fwd[1] - upRef[1]*fwd[0] };
-        {
-            float rl = sqrtf(right[0]*right[0] + right[1]*right[1] + right[2]*right[2]);
-            if (rl < 1e-6f) rl = 1.0f;
-            right[0] /= rl; right[1] /= rl; right[2] /= rl;
-        }
-        float up[3] = { fwd[1]*right[2] - fwd[2]*right[1],
-                        fwd[2]*right[0] - fwd[0]*right[2],
-                        fwd[0]*right[1] - fwd[1]*right[0] };
-        // View matrix (row-major LH): rows = right/up/fwd; last col = -dot(axis, eye)
-        float view[16] = {
-            right[0], up[0], fwd[0], 0.0f,
-            right[1], up[1], fwd[1], 0.0f,
-            right[2], up[2], fwd[2], 0.0f,
-            -(right[0]*eye[0] + right[1]*eye[1] + right[2]*eye[2]),
-            -(up[0]   *eye[0] + up[1]   *eye[1] + up[2]   *eye[2]),
-            -(fwd[0]  *eye[0] + fwd[1]  *eye[1] + fwd[2]  *eye[2]),
-            1.0f };
-        // Reverse-Z ortho LH: z=near->1, z=far->0. depth' = (far - z)/(far - near)
-        float oNear = 0.0f;
-        float oFar  = 2.0f * sdist;
-        float ow = diag * 1.2f;       // half extent in X/Y
-        float oh = diag * 1.2f;
-        float proj[16] = {
-            1.0f / ow, 0.0f,      0.0f,                       0.0f,
-            0.0f,      1.0f / oh, 0.0f,                       0.0f,
-            0.0f,      0.0f,     -1.0f / (oFar - oNear),      0.0f,
-            0.0f,      0.0f,      oFar  / (oFar - oNear),     1.0f
-        };
-        // svp = view * proj (row-major LH composition).
-        float svp[16];
-        for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c) {
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) s += view[r*4 + k] * proj[k*4 + c];
-            svp[r*4 + c] = s;
-        }
-        for (int i = 0; i < 16; ++i) cb.sunViewProj[i] = svp[i];
-        }
-        cb.shadowBias    = 0.0005f;
-        cb.shadowMapSize = (float)shadowSize_;
-        cb.shadowEnable  = (args.sunShadows && shadowDsv_) ? 1.0f : 0.0f;
+        for (int i = 0; i < 16; ++i) cb.sunViewProj[i] = 0.0f;
+        cb.shadowBias    = 0.0f;
+        cb.shadowMapSize = 1.0f;
+        cb.shadowEnable  = 0.0f;
         cb.sunIntensity  = sunIntensity;
         cb.exposure      = exposure;
         cb.roughness     = roughness;
@@ -1378,143 +902,45 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     ID3D11Buffer* cbs[] = { cbPerFrame_.Get(), cbPerChunk_.Get() };
     ctx_->VSSetConstantBuffers(0, 2, cbs);
     ctx_->PSSetConstantBuffers(0, 2, cbs);
-    ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
+    ctx_->RSSetState(rsSolid_.Get());
     ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
-    if (!vb_ || !ib_) return;
-
-    // Sun shadow pass. Renders all polygonal chunks once (no grid replication;
-    // the scene AABB drives the ortho frustum). Binds vsShadow + null PS into
-    // the shadow DSV.
-    // Sun shadow map: cached. Only re-rendered when the sun direction
-    // changes (or geometry was reuploaded → shadowValid_ reset). One shadow
-    // map serves every grid replica: receivers wrap their world XZ back to
-    // the base scene cell before sampling shadow.
-    bool needShadowRebuild = false;
-    if (args.sunShadows && shadowDsv_ && vsShadow_ && vb_ && ib_) {
-        const float dx = args.sunDir[0] - shadowLastSunDir_[0];
-        const float dy = args.sunDir[1] - shadowLastSunDir_[1];
-        const float dz = args.sunDir[2] - shadowLastSunDir_[2];
-        const float sqLen = dx*dx + dy*dy + dz*dz;
-        if (!shadowValid_ || sqLen > 1e-7f) needShadowRebuild = true;
-    }
-    if (needShadowRebuild)
-    {
-        MICROPROFILE_SCOPEGPUI("ShadowMap", 0xff8080ff);
-        D3D11_VIEWPORT svp = { 0.0f, 0.0f, (float)shadowSize_, (float)shadowSize_, 0.0f, 1.0f };
-        ctx_->RSSetViewports(1, &svp);
-        ctx_->ClearDepthStencilView(shadowDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
-        ID3D11RenderTargetView* nullRtv[] = { nullptr };
-        ctx_->OMSetRenderTargets(1, nullRtv, shadowDsv_.Get());
-        ctx_->OMSetBlendState(bsNoColor_.Get(), nullptr, 0xFFFFFFFFu);
-        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-        ctx_->RSSetState(rsShadow_.Get());
-        ctx_->IASetInputLayout(inputLayoutPoly_.Get());
-        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx_->VSSetShader(vsShadow_.Get(), nullptr, 0);
-        ctx_->PSSetShader(nullptr, nullptr, 0);
-        UINT polyStride = sizeof(VoxelPolyVertex);
-        UINT polyOff = 0;
-        ID3D11Buffer* vbs[] = { vb_.Get() };
-        ctx_->IASetVertexBuffers(0, 1, vbs, &polyStride, &polyOff);
-        ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
-
-        // One chunkBase per group (chunks within a sub-list share scene origin).
-        auto setBase = [&](float ox, float oz) {
-            D3D11_MAPPED_SUBRESOURCE mm;
-            ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-            CBPerChunk cc = {};
-            cc.chunkBase[0] = sceneOrigin_[0] + ox;
-            cc.chunkBase[1] = sceneOrigin_[1];
-            cc.chunkBase[2] = sceneOrigin_[2] + oz;
-            memcpy(mm.pData, &cc, sizeof(cc));
-            ctx_->Unmap(cbPerChunk_.Get(), 0);
-        };
-        setBase(0.0f, 0.0f);
-        for (const auto& gs : subs_) {
-            ctx_->DrawIndexed(gs.indexCount, gs.firstIndex, 0);
-        }
-
-        // Restore main pass state.
-        D3D11_VIEWPORT mvp = { 0.0f, 0.0f, (float)width_, (float)height_, 0.0f, 1.0f };
-        ctx_->RSSetViewports(1, &mvp);
-        ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
-        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
-
-        ID3D11RenderTargetView* sceneRtv =
-            (msaaSamples_ > 1) ? msaaRtv_.Get()
-                               : (taaSceneRtv_ && psPost_) ? taaSceneRtv_.Get() : rtv_.Get();
-        ID3D11RenderTargetView* rtvs[] = { sceneRtv };
-        ctx_->OMSetRenderTargets(1, rtvs, dsv_.Get());
-        shadowLastSunDir_[0] = args.sunDir[0];
-        shadowLastSunDir_[1] = args.sunDir[1];
-        shadowLastSunDir_[2] = args.sunDir[2];
-        shadowValid_ = true;
-    }
-    // Bind shadow SRV+sampler every frame (cached pass already rendered or not).
-    if (args.sunShadows && shadowSrv_) {
-        ID3D11ShaderResourceView* shadowSrvs[] = { shadowSrv_.Get() };
-        ctx_->PSSetShaderResources(10, 1, shadowSrvs);
-        ID3D11SamplerState*       shadowSmps[] = { shadowSamp_.Get() };
-        ctx_->PSSetSamplers(2, 1, shadowSmps);
-        ctx_->CSSetShaderResources(10, 1, shadowSrvs);
-        ctx_->CSSetSamplers(2, 1, shadowSmps);
-    }
+    if (!pointVb_) return;
 
     // Extract 6 frustum planes from row-major viewProj.
-    // Plane equation: a*x + b*y + c*z + d >= 0 means inside.
     float M[16];
     hlslpp::store(M, vp);
     float planes[6][4];
-    // Left: clip.x + clip.w >= 0
     planes[0][0] = M[0] + M[3];  planes[0][1] = M[4] + M[7];
     planes[0][2] = M[8] + M[11]; planes[0][3] = M[12] + M[15];
-    // Right: clip.w - clip.x >= 0
     planes[1][0] = M[3] - M[0];  planes[1][1] = M[7] - M[4];
     planes[1][2] = M[11] - M[8]; planes[1][3] = M[15] - M[12];
-    // Bottom: clip.y + clip.w >= 0
     planes[2][0] = M[1] + M[3];  planes[2][1] = M[5] + M[7];
     planes[2][2] = M[9] + M[11]; planes[2][3] = M[13] + M[15];
-    // Top: clip.w - clip.y >= 0
     planes[3][0] = M[3] - M[1];  planes[3][1] = M[7] - M[5];
     planes[3][2] = M[11] - M[9]; planes[3][3] = M[15] - M[13];
-    // Near: clip.z >= 0 (DX zclip::zero)
     planes[4][0] = M[2];         planes[4][1] = M[6];
     planes[4][2] = M[10];        planes[4][3] = M[14];
-    // Far: clip.w - clip.z >= 0
     planes[5][0] = M[3] - M[2];  planes[5][1] = M[7] - M[6];
     planes[5][2] = M[11] - M[10];planes[5][3] = M[15] - M[14];
 
-    // Collect visible chunk instances + decide path per chunk (Hybrid).
     struct Job {
         const GpuSubMesh* gs;
         float ox, oz;
-        PointLod lod;     // effective LOD (resolved if Auto)
-        bool   isFar;     // routing kind for per-tech enable
+        PointLod lod;
     };
-    static thread_local std::vector<Job> polyJobs;
-    static thread_local std::vector<Job> pointJobs;
-    static thread_local std::vector<Job> hexJobs;
-    static thread_local std::vector<Job> csJobs;
-    static thread_local std::vector<Job> vidJobs;
-    static thread_local std::vector<Job> axisJobs;
-    static thread_local std::vector<Job> axisInstJobs;
-    static thread_local std::vector<Job> splatJobs;     // chunks routed to Splat tech
-    static thread_local std::vector<Job> billJobs;
-    static thread_local std::vector<Job> billTriJobs;
-    polyJobs.clear();
-    pointJobs.clear();
-    hexJobs.clear();
-    csJobs.clear();
-    vidJobs.clear();
-    axisJobs.clear();
-    axisInstJobs.clear();
-    splatJobs.clear();
-    billJobs.clear();
-    billTriJobs.clear();
+    // One job vector per RenderTech ordinal. Each chunk gets routed to either
+    // techClose or techFar based on its projected pixel-per-voxel size.
+    static constexpr int kTechCount = 13;
+    static thread_local std::vector<Job> jobsByTech[kTechCount];
+    for (int i = 0; i < kTechCount; ++i) jobsByTech[i].clear();
 
-    // For hybrid: voxel projects to pixelsPerVoxel = focalPx / distance.
-    // Use 1.0 px as cutoff.
+    // Near/far switch threshold (pixels-per-voxel). Heuristic: when a chunk's
+    // voxels project to fewer than splatRadius pixels, splat-class techs work
+    // well — use that as a generic boundary. Treat single-tech mode as "all
+    // chunks go to the enabled tech".
+    float switchPpv = (float)std::max(1, splatRadius);
+
     float fovRad = cam.fovDeg * 3.14159265358979f / 180.0f;
     float focalPx = (float)height_ / (2.0f * tanf(fovRad * 0.5f));
     hlslpp::float3 camPosHl = cam.position;
@@ -1522,13 +948,10 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
 
     lastDrawn_ = 0;
     lastDrawnTris_ = 0;
-    lastPolyTris_ = 0;
-    lastPolyVerts_ = 0;
     lastPointCount_ = 0;
     const float spanX = sceneSpan_[0];
     const float spanZ = sceneSpan_[2];
 
-    // Shared AABB-vs-camera distance: nearest point of [aMin..aMax] to camP.
     auto chunkDist = [&](const float aMin[3], const float aMax[3]) -> float {
         float dx = camP[0] < aMin[0] ? aMin[0] - camP[0]
                  : camP[0] > aMax[0] ? camP[0] - aMax[0] : 0.0f;
@@ -1539,7 +962,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         float d = sqrtf(dx*dx + dy*dy + dz*dz);
         return d < 1e-3f ? 1e-3f : d;
     };
-    // Shared 6-plane frustum cull of AABB.
     auto cullAabb = [&](const float aMin[3], const float aMax[3]) -> bool {
         for (int pi = 0; pi < 6; ++pi) {
             const float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
@@ -1550,8 +972,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         }
         return false;
     };
-    // True iff every corner of the AABB is on the inside of every frustum
-    // plane (lets the caller skip per-cluster cull when the whole mesh fits).
     auto aabbFullyInside = [&](const float aMin[3], const float aMax[3]) -> bool {
         for (int pi = 0; pi < 6; ++pi) {
             const float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
@@ -1567,8 +987,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             float ox = gx * spanX;
             float oz = gz * spanZ;
 
-            // Whole-mesh AABB tests first: skip the cell entirely if outside;
-            // skip per-cluster cull if the entire mesh fits inside the frustum.
             float wholeMin[3] = {
                 sceneOrigin_[0] + ox,
                 sceneOrigin_[1],
@@ -1587,12 +1005,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
                 float aMax[3] = { gs.aabbMax[0] + ox, gs.aabbMax[1], gs.aabbMax[2] + oz };
                 if (!wholeIn && cullAabb(aMin, aMax)) continue;
 
-                // Resolve LOD (Auto -> per-chunk by projected voxel size).
-                // Auto LOD: distance-based thresholds halved per step
-                // (S=1/2/4/8 voxel cluster sizes). pointLodScale biases:
-                // >1 keeps finer LODs at longer range. splatRadius is the CS
-                // dilate radius and intentionally NOT part of LOD selection
-                // (independent control: dilate sharpens / fills holes only).
                 PointLod effLod = pointLod;
                 float ppvHere = focalPx / chunkDist(aMin, aMax);
                 if (pointLod == PointLod::Auto) {
@@ -1604,72 +1016,13 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
                     else if (ppvHere >= t2) effLod = PointLod::L2;
                     else                    effLod = PointLod::L3;
                 }
-                Job j{ &gs, ox, oz, effLod, false };
-                // If a Far tech is set, pick Close vs Far per chunk by ppv.
-                // Splat-far switch derived from splatRadius/res/fov: when a
-                // single voxel covers fewer than ~1 pixel (after dilate), the
-                // splat tech kicks in for that chunk.
-                if (techFar != RenderTech::None) {
-                    float ppv = ppvHere;
-                    // Close vs far switch. For splat-far the threshold is the
-                    // splat dilate radius R: a chunk whose voxels project to
-                    // fewer than R pixels is a good fit for splat (CS dilate
-                    // can fill the gaps). Bigger R -> splat kicks in closer.
-                    // Otherwise use a fixed coverage threshold.
-                    float switchPpv = hybridThreshold;
-                    if (techFar == RenderTech::Splat) {
-                        switchPpv = (float)std::max(1, splatRadius);
-                    }
-                    RenderTech jt = (ppv >= switchPpv) ? techClose : techFar;
-                    j.isFar = (jt == techFar);
-                    if      (jt == RenderTech::Points)        pointJobs.push_back(j);
-                    else if (jt == RenderTech::PolygonBased)  polyJobs.push_back(j);
-                    else if (jt == RenderTech::HexSprite)     hexJobs.push_back(j);
-                    else if (jt == RenderTech::PointCS)       csJobs.push_back(j);
-                    else if (jt == RenderTech::PolyVID)       vidJobs.push_back(j);
-                    else if (jt == RenderTech::PolyAxis)      axisJobs.push_back(j);
-                    else if (jt == RenderTech::PolyAxisInstanced) axisInstJobs.push_back(j);
-                    else if (jt == RenderTech::Billboard)     billJobs.push_back(j);
-                    else if (jt == RenderTech::BillboardTri)  billTriJobs.push_back(j);
-                    else if (jt == RenderTech::Splat)         splatJobs.push_back(j);
-                    continue;
-                }
-                if (tech == RenderTech::Points) {
-                    pointJobs.push_back(j);
-                } else if (tech == RenderTech::PolygonBased) {
-                    polyJobs.push_back(j);
-                } else if (tech == RenderTech::HexSprite) {
-                    hexJobs.push_back(j);
-                } else if (tech == RenderTech::PointCS) {
-                    csJobs.push_back(j);
-                } else if (tech == RenderTech::PolyVID) {
-                    vidJobs.push_back(j);
-                } else if (tech == RenderTech::PolyAxis) {
-                    axisJobs.push_back(j);
-                } else if (tech == RenderTech::PolyAxisInstanced) {
-                    axisInstJobs.push_back(j);
-                } else if (tech == RenderTech::Billboard) {
-                    billJobs.push_back(j);
-                } else if (tech == RenderTech::BillboardTri) {
-                    billTriJobs.push_back(j);
-                } else if (tech == RenderTech::Splat) {
-                    splatJobs.push_back(j);
-                } else if (tech == RenderTech::SplatHybrid) {
-                    // Polygons close, splats far. Both consumed by the Splat block.
-                    float ppv = focalPx / chunkDist(aMin, aMax);
-                    if (ppv >= hybridThreshold) polyJobs.push_back(j);
-                    else                        splatJobs.push_back(j);
-                } else if (tech == RenderTech::Hybrid2) {
-                    // Polys close (dataset-driven), BillboardTri far.
-                    float ppv = focalPx / chunkDist(aMin, aMax);
-                    if (ppv >= hybridThreshold) polyJobs.push_back(j);
-                    else                        billTriJobs.push_back(j);
-                } else {
-                    // Hybrid: polys close (dataset-driven), points far.
-                    float ppv = focalPx / chunkDist(aMin, aMax);
-                    if (ppv < hybridThreshold) pointJobs.push_back(j);
-                    else                       polyJobs.push_back(j);
-                }
+                // Per-chunk near/far routing. Unchecked side culls those chunks
+                // entirely — they do NOT spill over to the other tech.
+                const bool isClose = (ppvHere >= switchPpv);
+                if (isClose && !closeEnabled) continue;
+                if (!isClose && !farEnabled)  continue;
+                RenderTech jt = isClose ? techClose : techFar;
+                jobsByTech[(int)jt].push_back({ &gs, ox, oz, effLod });
             }
         }
     }
@@ -1677,9 +1030,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     UINT stride = sizeof(Vertex);
     UINT offset = 0;
 
-    // Colorize-clusters debug: 1 green (close poly tech), 2/3/4 red/orange/yellow
-    // for L0/L1/L2 (points or splat). Lambdas below write `curTint` into the
-    // per-chunk CB; each draw block sets curTint before its loop.
     uint32_t curTint = 0;
     auto lodToIdx = [](PointLod l) -> uint32_t {
         if (l == PointLod::L3) return 3u;
@@ -1688,8 +1038,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         return 0u;
     };
     auto issueChunkCbEx = [&](const Job& j, float padVal, uint32_t voxelBase) {
-        // All vertex positions are scene-relative now; chunkBase = scene origin
-        // + grid offset (same for every chunk in a grid cell).
         D3D11_MAPPED_SUBRESOURCE mm;
         ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
         CBPerChunk cc = {};
@@ -1705,7 +1053,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     };
     auto issueChunkCb = [&](const Job& j) { issueChunkCbEx(j, 0.0f, 0u); };
 
-    // Per-job LOD resolution.
     auto lodToHalfExtent = [](PointLod l) -> float {
         if (l == PointLod::L3) return 4.0f;
         if (l == PointLod::L2) return 2.0f;
@@ -1719,200 +1066,10 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         else                            { first = j.gs->pointFirst;  count = j.gs->pointCount;  }
     };
 
-    const bool doPrepass = zPrepass &&
-        (tech == RenderTech::PolygonBased || tech == RenderTech::Hybrid) &&
-        !polyJobs.empty();
-
-    if (doPrepass) {
-        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx_->VSSetShader(vsDepth_.Get(), nullptr, 0);
-        ctx_->PSSetShader(nullptr, nullptr, 0);
-        ctx_->OMSetBlendState(bsNoColor_.Get(), nullptr, 0xFFFFFFFFu);
-        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-        ID3D11Buffer* vbs[] = { vb_.Get() };
-        ctx_->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
-        ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
-        for (const auto& j : polyJobs) {
-            issueChunkCb(j);
-            ctx_->DrawIndexed(j.gs->indexCount, j.gs->firstIndex, j.gs->baseVertex);
-        }
-        ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
-    }
-
-    // Per-tech enable: drop jobs whose role (close/far) is disabled. The
-    // dispatch already populated all lists with j.isFar set; this strips
-    // them so the draw blocks render only what the user asked for. All
-    // accounting (chunk count, ppv decisions, etc.) already happened.
-    auto filterByEnable = [&](std::vector<Job>& v) {
-        v.erase(std::remove_if(v.begin(), v.end(), [&](const Job& j) {
-            return j.isFar ? !args.farEnabled : !args.closeEnabled;
-        }), v.end());
-    };
-    filterByEnable(polyJobs);
-    filterByEnable(pointJobs);
-    filterByEnable(hexJobs);
-    filterByEnable(csJobs);
-    filterByEnable(vidJobs);
-    filterByEnable(axisJobs);
-    filterByEnable(axisInstJobs);
-    filterByEnable(billJobs);
-    filterByEnable(billTriJobs);
-    filterByEnable(splatJobs);
-
-    // Unified poly draw: route polyJobs through the dataset's polygon source.
-    // Used directly by PolygonBased / Hybrid / Hybrid2, and re-invoked inside
-    // the Splat block for SplatHybrid (into the splat RT).
-    // Set gChunkBase to scene-origin + grid offset (shared by all chunks in a
-    // grid cell since their vertices are scene-relative).
-    auto setSceneChunkBase = [&](float ox, float oz) {
-        D3D11_MAPPED_SUBRESOURCE mm;
-        ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-        CBPerChunk cc = {};
-        cc.chunkBase[0] = sceneOrigin_[0] + ox;
-        cc.chunkBase[1] = sceneOrigin_[1];
-        cc.chunkBase[2] = sceneOrigin_[2] + oz;
-        cc.chunkTint    = curTint;
-        memcpy(mm.pData, &cc, sizeof(cc));
-        ctx_->Unmap(cbPerChunk_.Get(), 0);
-    };
-
-    auto drawPolyJobs = [&](const std::vector<Job>& jobs) {
-        if (jobs.empty()) return;
-        MICROPROFILE_SCOPEGPUI("Poly", 0xff60d0ff);
-        curTint = 1;            // green: close poly tech
-        if (dataset == DataSet::Full) {
-            UINT polyStride = sizeof(VoxelPolyVertex);
-            UINT polyOff = 0;
-            ctx_->IASetInputLayout(inputLayoutPoly_.Get());
-            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx_->VSSetShader(vs_.Get(), nullptr, 0);
-            ctx_->PSSetShader(ps_.Get(), nullptr, 0);
-            ctx_->OMSetDepthStencilState(doPrepass ? dsEqual_.Get() : dsTest_.Get(), 0);
-            ID3D11Buffer* vbs[] = { vb_.Get() };
-            ctx_->IASetVertexBuffers(0, 1, vbs, &polyStride, &polyOff);
-            ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
-
-            // Jobs come in subs_ order, grouped per grid cell. Walk groups; in
-            // each group, merge contiguous-firstIndex jobs into single
-            // DrawIndexed (cluster span batching).
-            size_t i = 0;
-            while (i < jobs.size()) {
-                float ox = jobs[i].ox, oz = jobs[i].oz;
-                setSceneChunkBase(ox, oz);
-                while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz) {
-                    uint32_t spanFirst = jobs[i].gs->firstIndex;
-                    uint32_t spanEnd   = spanFirst + jobs[i].gs->indexCount;
-                    ++i;
-                    while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz
-                           && jobs[i].gs->firstIndex == spanEnd) {
-                        spanEnd += jobs[i].gs->indexCount;
-                        ++i;
-                    }
-                    uint32_t spanCount = spanEnd - spanFirst;
-                    ctx_->DrawIndexed(spanCount, spanFirst, 0);
-                    ++lastDrawn_;
-                    lastDrawnTris_ += spanCount / 3;
-                    lastPolyTris_  += spanCount / 3;
-                    lastPolyVerts_ += spanCount; // upper-bound on referenced verts
-                }
-            }
-            ctx_->IASetInputLayout(inputLayout_.Get());
-            if (doPrepass) ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-        } else if (dataset == DataSet::Merged && mergedVb_ && mergedIb_) {
-            // MSH1 is a single mesh; no per-chunk path. Draw once per grid cell.
-            ctx_->IASetInputLayout(mergedInputLayout_.Get());
-            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx_->VSSetShader(vsMerged_.Get(), nullptr, 0);
-            ctx_->PSSetShader(psMerged_.Get(), nullptr, 0);
-            ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-            UINT stridM = sizeof(MergedVertex);
-            UINT offsM = 0;
-            ID3D11Buffer* vbsM[] = { mergedVb_.Get() };
-            ctx_->IASetVertexBuffers(0, 1, vbsM, &stridM, &offsM);
-            ctx_->IASetIndexBuffer(mergedIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
-            for (int gz = 0; gz < gridSize; ++gz) {
-                for (int gx = 0; gx < gridSize; ++gx) {
-                    D3D11_MAPPED_SUBRESOURCE mm;
-                    ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-                    CBPerChunk cc = {};
-                    cc.chunkBase[0] = gx * sceneSpan_[0];
-                    cc.chunkBase[1] = 0.0f;
-                    cc.chunkBase[2] = gz * sceneSpan_[2];
-                    memcpy(mm.pData, &cc, sizeof(cc));
-                    ctx_->Unmap(cbPerChunk_.Get(), 0);
-                    ctx_->DrawIndexed(mergedIndexCount_, 0, 0);
-                    ++lastDrawn_;
-                    lastDrawnTris_ += mergedIndexCount_ / 3;
-                }
-            }
-            ctx_->IASetInputLayout(inputLayout_.Get());
-        } else if (dataset == DataSet::Reduced && atlasVb_ && atlasIb_ && atlasSrv_) {
-            // Per-chunk atlas mesh. Look up atlas sub for each polyJob, then
-            // batch contiguous (in atlas IB) visible subs into single DrawIndexed.
-            ctx_->IASetInputLayout(atlasInputLayout_.Get());
-            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx_->VSSetShader(vsAtlas_.Get(), nullptr, 0);
-            ctx_->PSSetShader(psAtlas_.Get(), nullptr, 0);
-            ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-            UINT stridA = sizeof(AtlasVertex);
-            UINT offsA = 0;
-            ID3D11Buffer* vbsA[] = { atlasVb_.Get() };
-            ctx_->IASetVertexBuffers(0, 1, vbsA, &stridA, &offsA);
-            ctx_->IASetIndexBuffer(atlasIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
-            ID3D11ShaderResourceView* srvs[] = { nullptr, nullptr, nullptr, atlasSrv_.Get() };
-            ctx_->PSSetShaderResources(0, 4, srvs);
-
-            auto subForJob = [&](const Job& j) -> const GpuAtlasSub* {
-                int cx = (int)((j.gs->chunkBase[0] - atlasOrigin_[0]) / (float)chunkDim_);
-                int cy = (int)((j.gs->chunkBase[1] - atlasOrigin_[1]) / (float)chunkDim_);
-                int cz = (int)((j.gs->chunkBase[2] - atlasOrigin_[2]) / (float)chunkDim_);
-                uint64_t key = ((uint64_t)(uint16_t)cx)
-                             | ((uint64_t)(uint16_t)cy << 20)
-                             | ((uint64_t)(uint16_t)cz << 40);
-                auto it = atlasSubByChunk_.find(key);
-                if (it == atlasSubByChunk_.end()) return nullptr;
-                const GpuAtlasSub& s = atlasSubs_[it->second];
-                return s.indexCount ? &s : nullptr;
-            };
-
-            size_t i = 0;
-            while (i < jobs.size()) {
-                float ox = jobs[i].ox, oz = jobs[i].oz;
-                D3D11_MAPPED_SUBRESOURCE mm;
-                ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-                CBPerChunk cc = {};
-                cc.chunkBase[0] = atlasOrigin_[0] + ox;
-                cc.chunkBase[1] = atlasOrigin_[1];
-                cc.chunkBase[2] = atlasOrigin_[2] + oz;
-                memcpy(mm.pData, &cc, sizeof(cc));
-                ctx_->Unmap(cbPerChunk_.Get(), 0);
-
-                while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz) {
-                    const GpuAtlasSub* s0 = subForJob(jobs[i]);
-                    if (!s0) { ++i; continue; }
-                    uint32_t spanFirst = s0->firstIndex;
-                    uint32_t spanEnd   = spanFirst + s0->indexCount;
-                    ++i;
-                    while (i < jobs.size() && jobs[i].ox == ox && jobs[i].oz == oz) {
-                        const GpuAtlasSub* sn = subForJob(jobs[i]);
-                        if (!sn || sn->firstIndex != spanEnd) break;
-                        spanEnd += sn->indexCount;
-                        ++i;
-                    }
-                    uint32_t spanCount = spanEnd - spanFirst;
-                    ctx_->DrawIndexed(spanCount, spanFirst, 0);
-                    ++lastDrawn_;
-                    lastDrawnTris_ += spanCount / 3;
-                }
-            }
-            ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr };
-            ctx_->PSSetShaderResources(0, 4, nullSrvs);
-            ctx_->IASetInputLayout(inputLayout_.Get());
-        }
-    };
-
-    if (anySplat && (!splatJobs.empty() || (tech == RenderTech::SplatHybrid && !polyJobs.empty()))
-        && pointVb_ && splatColorRtv_ && splatFinalUav_)
+    // -------------- Splat tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::Splat];
+    if (!jobs.empty() && pointVb_ && splatColorRtv_ && splatFinalUav_)
     {
         MICROPROFILE_SCOPEGPUI("Splat", 0xffffd060);
         float clr[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
@@ -1920,19 +1077,11 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         const float zeroClear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         ctx_->ClearRenderTargetView(splatMaskRtv_.Get(), zeroClear);
         ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
-        // Poly pre-pass (SplatHybrid only) writes color only — bind 1 RT.
-        ID3D11RenderTargetView* splatRtvsColorOnly[] = { splatColorRtv_.Get() };
-        ctx_->OMSetRenderTargets(1, splatRtvsColorOnly, splatDsv_.Get());
-        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-
-        if (tech == RenderTech::SplatHybrid) {
-            MICROPROFILE_SCOPEGPUI("Splat/Poly", 0xffffe080);
-            drawPolyJobs(polyJobs);
-        }
 
         // Point pass writes color (slot 0) + visMask (slot 1).
         ID3D11RenderTargetView* splatRtvs[] = { splatColorRtv_.Get(), splatMaskRtv_.Get() };
         ctx_->OMSetRenderTargets(2, splatRtvs, splatDsv_.Get());
+        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
         {
             MICROPROFILE_SCOPEGPUI("Splat/Points", 0xffffc040);
@@ -1948,30 +1097,29 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             UINT vbStride = sizeof(Vertex), vbOff = 0;
             ctx_->IASetVertexBuffers(0, 1, vbs, &vbStride, &vbOff);
             size_t i = 0;
-            while (i < splatJobs.size()) {
-                float ox = splatJobs[i].ox, oz = splatJobs[i].oz;
-                PointLod lod = splatJobs[i].lod;
+            while (i < jobs.size()) {
+                float ox = jobs[i].ox, oz = jobs[i].oz;
+                PointLod lod = jobs[i].lod;
                 curTint = 2u + lodToIdx(lod);
-                const Job firstInGroup = splatJobs[i];
-                while (i < splatJobs.size()
-                       && splatJobs[i].ox == ox && splatJobs[i].oz == oz
-                       && splatJobs[i].lod == lod) {
+                const Job firstInGroup = jobs[i];
+                while (i < jobs.size()
+                       && jobs[i].ox == ox && jobs[i].oz == oz
+                       && jobs[i].lod == lod) {
                     uint32_t spanFirst, count0;
-                    pointRangeForJob(splatJobs[i], spanFirst, count0);
+                    pointRangeForJob(jobs[i], spanFirst, count0);
                     if (count0 == 0) { ++i; continue; }
                     uint32_t spanEnd = spanFirst + count0;
                     ++i;
-                    while (i < splatJobs.size()
-                           && splatJobs[i].ox == ox && splatJobs[i].oz == oz
-                           && splatJobs[i].lod == lod) {
+                    while (i < jobs.size()
+                           && jobs[i].ox == ox && jobs[i].oz == oz
+                           && jobs[i].lod == lod) {
                         uint32_t f, c;
-                        pointRangeForJob(splatJobs[i], f, c);
+                        pointRangeForJob(jobs[i], f, c);
                         if (f != spanEnd) break;
                         spanEnd += c;
                         ++i;
                     }
                     uint32_t spanCount = spanEnd - spanFirst;
-                    // gVoxelBase = spanFirst so VS face-AO lookup works.
                     issueChunkCbEx(firstInGroup, lodToHalfExtent(lod), spanFirst);
                     ctx_->Draw(spanCount, spanFirst);
                     ++lastDrawn_;
@@ -2004,11 +1152,8 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->CSSetShader(nullptr, nullptr, 0);
         }
 
-        // Composite splat onto main scene RT discarding bg (alpha < 0.5).
-        // SV_Depth writes splatDepth into main DSV so TAA reprojection / post
-        // sky / close-tech depth-test downstream see valid Z at splat pixels.
-        ID3D11RenderTargetView* compositeRtv = postEnabled ? taaSceneRtv_.Get()
-                                              : ((msaaSamples_ > 1) ? msaaRtv_.Get() : rtv_.Get());
+        // Composite splat onto main scene RT.
+        ID3D11RenderTargetView* compositeRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
         ctx_->OMSetRenderTargets(1, &compositeRtv, dsv_.Get());
         ctx_->OMSetDepthStencilState(dsAlwaysWrite_.Get(), 0);
         ctx_->RSSetState(rsNoCull_.Get());
@@ -2030,32 +1175,21 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11ShaderResourceView* nullCSrv[] = { nullptr };
         ctx_->PSSetShaderResources(8, 1, nullCSrv);
         ctx_->PSSetShaderResources(7, 1, nullCSrv);
-        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
+        ctx_->RSSetState(rsSolid_.Get());
 
-        // Restore RT+DSV for any subsequent passes (bounds debug etc.).
-        ID3D11RenderTargetView* active = postEnabled ? taaSceneRtv_.Get()
-                                             : ((msaaSamples_ > 1) ? msaaRtv_.Get() : rtv_.Get());
+        ID3D11RenderTargetView* active = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
         ID3D11RenderTargetView* rrtvs[] = { active };
         ctx_->OMSetRenderTargets(1, rrtvs, dsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
     }
+    } // splat scope
 
-    // Compositor mode: close tech draws to main RT first; splat output is
-    // composited on top via alpha-mask PS (discards bg pixels), so close
-    // content (any tech — Poly, PolyAxis, PolyVID, etc.) is preserved.
-    const bool splatFarCompositor = (techFar == RenderTech::Splat
-                                  && techClose != RenderTech::Splat
-                                  && techClose != RenderTech::SplatHybrid);
-    if (tech != RenderTech::SplatHybrid) {
-        drawPolyJobs(polyJobs);
-    }
-    // Point pass: batch contiguous chunks within same (grid cell, LOD) into
-    // single Draw. Possible now that point positions are scene-relative and
-    // L0/L1/L2 are stored in contiguous blocks (so adjacent same-LOD chunks
-    // have adjacent first-vertex offsets).
-    if (!pointJobs.empty() && pointVb_ && tech != RenderTech::Splat && tech != RenderTech::SplatHybrid) {
+    // -------------- Points tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::Points];
+    if (!jobs.empty() && pointVb_) {
         MICROPROFILE_SCOPEGPUI("Points", 0xff80ff80);
-        curTint = 2;            // points are tinted per-LOD; overridden in span loop below
+        curTint = 2;
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
         ctx_->VSSetShader(vsPoints_.Get(), nullptr, 0);
         if (pointAo6Srv_) {
@@ -2069,31 +1203,29 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
 
         size_t i = 0;
-        while (i < pointJobs.size()) {
-            float ox = pointJobs[i].ox, oz = pointJobs[i].oz;
-            PointLod lod = pointJobs[i].lod;
+        while (i < jobs.size()) {
+            float ox = jobs[i].ox, oz = jobs[i].oz;
+            PointLod lod = jobs[i].lod;
             curTint = 2u + lodToIdx(lod);
-            const Job firstInGroup = pointJobs[i];
-            while (i < pointJobs.size()
-                   && pointJobs[i].ox == ox && pointJobs[i].oz == oz
-                   && pointJobs[i].lod == lod) {
+            const Job firstInGroup = jobs[i];
+            while (i < jobs.size()
+                   && jobs[i].ox == ox && jobs[i].oz == oz
+                   && jobs[i].lod == lod) {
                 uint32_t spanFirst, count0;
-                pointRangeForJob(pointJobs[i], spanFirst, count0);
+                pointRangeForJob(jobs[i], spanFirst, count0);
                 if (count0 == 0) { ++i; continue; }
                 uint32_t spanEnd = spanFirst + count0;
                 ++i;
-                while (i < pointJobs.size()
-                       && pointJobs[i].ox == ox && pointJobs[i].oz == oz
-                       && pointJobs[i].lod == lod) {
+                while (i < jobs.size()
+                       && jobs[i].ox == ox && jobs[i].oz == oz
+                       && jobs[i].lod == lod) {
                     uint32_t f, c;
-                    pointRangeForJob(pointJobs[i], f, c);
+                    pointRangeForJob(jobs[i], f, c);
                     if (f != spanEnd) break;
                     spanEnd += c;
                     ++i;
                 }
                 uint32_t spanCount = spanEnd - spanFirst;
-                // Set gVoxelBase = spanFirst so the VS can index gPolyAo6 via
-                // SV_VertexID + gVoxelBase (SV_VertexID is local to the draw).
                 issueChunkCbEx(firstInGroup, lodToHalfExtent(lod), spanFirst);
                 ctx_->Draw(spanCount, spanFirst);
                 ++lastDrawn_;
@@ -2102,15 +1234,18 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             }
         }
     }
-    if (!csJobs.empty() && pointVb_ && pointSrv_ && csColorUav_) {
+
+    } // points scope
+
+    // -------------- PointCS tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::PointCS];
+    if (!jobs.empty() && pointVb_ && pointSrv_ && csColorUav_) {
         MICROPROFILE_SCOPEGPUI("PointCS", 0xff80c0a0);
-        curTint = 2;            // tinted per LOD via CB writes inside dispatch loop
-        // Clear color UAV (packed RGBA little-endian).
-        // 0xFF291F1A = R=0x1A G=0x1F B=0x29 A=0xFF — dark blue-gray to match default bg.
+        curTint = 2;
         uint32_t clearC[4] = { 0xFF291F1Au, 0, 0, 0 };
         ctx_->ClearUnorderedAccessViewUint(csColorUav_.Get(), clearC);
 
-        // Unbind RTs so we can bind UAVs.
         ID3D11RenderTargetView* nullRtv[] = { nullptr };
         ctx_->OMSetRenderTargets(1, nullRtv, nullptr);
 
@@ -2123,7 +1258,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11Buffer* csCbs[] = { cbCS_.Get() };
         ctx_->CSSetConstantBuffers(2, 1, csCbs);
 
-        for (const auto& j : csJobs) {
+        for (const auto& j : jobs) {
             uint32_t pFirst, pCount;
             pointRangeForJob(j, pFirst, pCount);
             if (pCount == 0) continue;
@@ -2149,7 +1284,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             lastPointCount_ += pCount;
         }
 
-        // Unbind UAVs and SRVs from CS.
         ID3D11UnorderedAccessView* noUav[] = { nullptr };
         ctx_->CSSetUnorderedAccessViews(0, 1, noUav, initCounts);
         ID3D11ShaderResourceView* noSrv[] = { nullptr };
@@ -2157,7 +1291,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->CSSetShader(nullptr, nullptr, 0);
 
         // Blit UAV color back to whichever RT we render the rest of the scene to.
-        ID3D11RenderTargetView* active = (msaaSamples_ > 1) ? msaaRtv_.Get() : rtv_.Get();
+        ID3D11RenderTargetView* active = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
         ID3D11RenderTargetView* rtvs[] = { active };
         ctx_->OMSetRenderTargets(1, rtvs, nullptr);
         ctx_->OMSetDepthStencilState(dsAlways_.Get(), 0);
@@ -2172,7 +1306,6 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->PSSetShaderResources(0, 1, blitSrv);
         ctx_->Draw(3, 0);
 
-        // Restore.
         ID3D11ShaderResourceView* nullSrv[] = { nullptr };
         ctx_->PSSetShaderResources(0, 1, nullSrv);
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
@@ -2180,10 +1313,14 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
-    if (!vidJobs.empty() && pointSrv_ && ib_) {
+    } // pointcs scope
+
+    // -------------- PolyVID tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::PolyVID];
+    if (!jobs.empty() && pointSrv_ && polyVidIb_) {
         MICROPROFILE_SCOPEGPUI("PolyVID", 0xff70b0ff);
-        curTint = 1;            // PolyVID is a poly-class close tech
-        // Reuse polygon IB (visMask-culled chunk-local indices = 8*voxLocal + corner).
+        curTint = 1;
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx_->VSSetShader(vsPolyVid_.Get(), nullptr, 0);
@@ -2191,31 +1328,34 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11Buffer* nullVbs[] = { nullptr };
         UINT z = 0;
         ctx_->IASetVertexBuffers(0, 1, nullVbs, &z, &z);
-        ctx_->IASetIndexBuffer(ib_.Get(), DXGI_FORMAT_R32_UINT, 0);
+        ctx_->IASetIndexBuffer(polyVidIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
         ID3D11ShaderResourceView* srvs[] = { nullptr, pointSrv_.Get() };
         ctx_->VSSetShaderResources(0, 2, srvs);
-        for (const auto& j : vidJobs) {
+        for (const auto& j : jobs) {
             issueChunkCbEx(j, 0.0f, j.gs->pointFirst);
-            ctx_->DrawIndexed(j.gs->indexCount, j.gs->firstIndex, 0);
+            // 36 indices per voxel = 12 tris (6 faces x 2).
+            ctx_->DrawIndexed(j.gs->pointCount * 36, 0, 0);
             ++lastDrawn_;
-            lastDrawnTris_ += j.gs->indexCount / 3;
-            lastPolyTris_  += j.gs->indexCount / 3;
-            lastPolyVerts_ += j.gs->indexCount;
+            lastDrawnTris_ += (uint64_t)j.gs->pointCount * 12;
+            lastPointCount_ += j.gs->pointCount;
         }
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 2, nullSrvs);
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
-    if (!axisJobs.empty() && pointSrv_) {
+    } // polyvid scope
+
+    // -------------- PolyAxis tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::PolyAxis];
+    if (!jobs.empty() && pointSrv_) {
         MICROPROFILE_SCOPEGPUI("PolyAxis", 0xff60a0e0);
         curTint = 1;
-        // Bind per-voxel face-AO SB at t2 (PolyAxis VS samples by faceAxis+sgn).
         if (pointAo6Srv_) {
             ID3D11ShaderResourceView* aoSrvs[] = { pointAo6Srv_.Get() };
             ctx_->VSSetShaderResources(2, 1, aoSrvs);
         }
-        // Pure-math instanced cube: no VB / no IB. DrawInstanced(18, count).
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx_->VSSetShader(vsPolyAxis_.Get(), nullptr, 0);
@@ -2225,21 +1365,24 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->IASetVertexBuffers(0, 1, nullVbs, &z, &z);
         ID3D11ShaderResourceView* srvs[] = { nullptr, pointSrv_.Get() };
         ctx_->VSSetShaderResources(0, 2, srvs);
-        for (const auto& j : axisJobs) {
+        for (const auto& j : jobs) {
             issueChunkCbEx(j, 0.0f, j.gs->pointFirst);
-            // 18 verts per voxel, one non-instanced draw per chunk.
             ctx_->Draw(j.gs->pointCount * 18u, 0);
             ++lastDrawn_;
             lastDrawnTris_ += (uint64_t)j.gs->pointCount * 6;
-            lastPolyTris_  += (uint64_t)j.gs->pointCount * 6;
-            lastPolyVerts_ += (uint64_t)j.gs->pointCount * 18u;
+            lastPointCount_ += j.gs->pointCount;
         }
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 3, nullSrvs);
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
-    if (!axisInstJobs.empty() && pointSrv_) {
+    } // polyaxis scope
+
+    // -------------- PolyAxisInstanced tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::PolyAxisInstanced];
+    if (!jobs.empty() && pointSrv_) {
         MICROPROFILE_SCOPEGPUI("PolyAxisInst", 0xff5090d0);
         curTint = 1;
         ctx_->IASetInputLayout(nullptr);
@@ -2255,35 +1398,38 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             ID3D11ShaderResourceView* aoSrvs[] = { pointAo6Srv_.Get() };
             ctx_->VSSetShaderResources(2, 1, aoSrvs);
         }
-        for (const auto& j : axisInstJobs) {
+        for (const auto& j : jobs) {
             issueChunkCbEx(j, 0.0f, j.gs->pointFirst);
-            // 18 verts × pointCount instances. Each instance = 1 voxel.
             ctx_->DrawInstanced(18, j.gs->pointCount, 0, 0);
             ++lastDrawn_;
             lastDrawnTris_ += (uint64_t)j.gs->pointCount * 6;
-            lastPolyTris_  += (uint64_t)j.gs->pointCount * 6;
-            lastPolyVerts_ += (uint64_t)j.gs->pointCount * 18u;
+            lastPointCount_ += j.gs->pointCount;
         }
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 3, nullSrvs);
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
-    if (!billJobs.empty() && pointSrv_ && billboardIb_) {
+    } // polyaxisinstanced scope
+
+    // -------------- Billboard tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::Billboard];
+    if (!jobs.empty() && pointSrv_ && billboardIb_) {
         MICROPROFILE_SCOPEGPUI("Billboard", 0xffa0c060);
         curTint = 2;
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx_->VSSetShader(vsBillboard_.Get(), nullptr, 0);
         ctx_->PSSetShader(psBillboard_.Get(), nullptr, 0);
-        ctx_->RSSetState(rsNoCull_.Get());        // billboard quad
+        ctx_->RSSetState(rsNoCull_.Get());
         ID3D11Buffer* nullVbs[] = { nullptr };
         UINT z = 0;
         ctx_->IASetVertexBuffers(0, 1, nullVbs, &z, &z);
         ctx_->IASetIndexBuffer(billboardIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
         ID3D11ShaderResourceView* srvs[] = { nullptr, pointSrv_.Get() };
         ctx_->VSSetShaderResources(0, 2, srvs);
-        for (const auto& j : billJobs) {
+        for (const auto& j : jobs) {
             issueChunkCbEx(j, 0.0f, j.gs->pointFirst);
             ctx_->DrawIndexed(j.gs->pointCount * 6, 0, 0);
             ++lastDrawn_;
@@ -2292,11 +1438,16 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         }
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 2, nullSrvs);
-        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
+        ctx_->RSSetState(rsSolid_.Get());
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
-    if (!billTriJobs.empty() && pointSrv_) {
+    } // billboard scope
+
+    // -------------- BillboardTri tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::BillboardTri];
+    if (!jobs.empty() && pointSrv_) {
         MICROPROFILE_SCOPEGPUI("BillboardTri", 0xff90b050);
         curTint = 2;
         ctx_->IASetInputLayout(nullptr);
@@ -2309,7 +1460,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->IASetVertexBuffers(0, 1, nullVbs, &z, &z);
         ID3D11ShaderResourceView* srvs[] = { nullptr, pointSrv_.Get() };
         ctx_->VSSetShaderResources(0, 2, srvs);
-        for (const auto& j : billTriJobs) {
+        for (const auto& j : jobs) {
             issueChunkCbEx(j, 0.0f, j.gs->pointFirst);
             ctx_->Draw(j.gs->pointCount * 3, 0);
             ++lastDrawn_;
@@ -2318,11 +1469,16 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         }
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 2, nullSrvs);
-        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
+        ctx_->RSSetState(rsSolid_.Get());
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
 
-    if (!hexJobs.empty() && pointVb_) {
+    } // billboardtri scope
+
+    // -------------- HexSprite tech --------------
+    {
+    auto& jobs = jobsByTech[(int)RenderTech::HexSprite];
+    if (!jobs.empty() && pointVb_) {
         MICROPROFILE_SCOPEGPUI("HexSprite", 0xff80b070);
         curTint = 2;
         ctx_->IASetInputLayout(inputLayoutHex_.Get());
@@ -2332,81 +1488,21 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->RSSetState(rsNoCull_.Get());
         ID3D11Buffer* vbs[] = { pointVb_.Get() };
         ctx_->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
-        for (const auto& j : hexJobs) {
+        for (const auto& j : jobs) {
             issueChunkCb(j);
-            // 18 verts per voxel = 6 triangles fanning closest corner.
             ctx_->DrawInstanced(18, j.gs->pointCount, 0, j.gs->pointFirst);
             ++lastDrawn_;
             lastDrawnTris_ += j.gs->pointCount * 6;
             lastPointCount_ += j.gs->pointCount;
         }
-        // restore default culling for any subsequent draws this frame
-        ctx_->RSSetState(wireframe ? rsWire_.Get() : rsSolid_.Get());
+        ctx_->RSSetState(rsSolid_.Get());
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
-
-    // Splat block (CS-dilate flow).
-    // Order: this runs LATE in DrawScene � but the close geometry rendered
-    // by the blocks ABOVE was directed into the splat RT only when the user
-    // selected SplatHybrid. In the standard close/far setup we want close
-    // geometry to land on top of the splat composite, so the splat block
-    // composites first (alpha-discard preserving main RT), THEN re-runs the
-    // close-tech blocks. The reorder is handled below: this block draws into
-    // splatColorRtv_ (renders splat points + optional SplatHybrid polys),
-    // runs the CS dilate, and composites onto the main scene RT discarding
-    // bg pixels. Close geometry was already rendered into main RT above, so
-    // composite preserves it.
-
-    if (showChunkBounds && boundsVb_ && boundsIb_) {
-        ctx_->IASetInputLayout(inputLayoutBounds_.Get());
-        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-        ctx_->VSSetShader(vsBounds_.Get(), nullptr, 0);
-        ctx_->PSSetShader(psBounds_.Get(), nullptr, 0);
-        ctx_->OMSetDepthStencilState(dsAlways_.Get(), 0);
-        UINT bstride = sizeof(float) * 3;
-        UINT boff = 0;
-        ID3D11Buffer* bvbs[] = { boundsVb_.Get() };
-        ctx_->IASetVertexBuffers(0, 1, bvbs, &bstride, &boff);
-        ctx_->IASetIndexBuffer(boundsIb_.Get(), DXGI_FORMAT_R32_UINT, 0);
-
-        // Tight per-chunk AABB: chunkBase = world aabbMin, size = aabb extents.
-        auto drawJob = [&](const Job& j) {
-            float sizeX = j.gs->aabbMax[0] - j.gs->aabbMin[0];
-            float sizeY = j.gs->aabbMax[1] - j.gs->aabbMin[1];
-            float sizeZ = j.gs->aabbMax[2] - j.gs->aabbMin[2];
-            D3D11_MAPPED_SUBRESOURCE mm;
-            ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
-            CBPerChunk cc = {};
-            cc.chunkBase[0] = j.gs->aabbMin[0] + j.ox;
-            cc.chunkBase[1] = j.gs->aabbMin[1];
-            cc.chunkBase[2] = j.gs->aabbMin[2] + j.oz;
-            cc._pad = sizeX;
-            cc.voxelBase = 0;
-            cc.chunkLodIdx = 0;
-            memcpy(&cc._pad2[0], &sizeY, sizeof(float));
-            memcpy(&cc._pad2[1], &sizeZ, sizeof(float));
-            memcpy(mm.pData, &cc, sizeof(cc));
-            ctx_->Unmap(cbPerChunk_.Get(), 0);
-            ctx_->DrawIndexed(24, 0, 0);
-        };
-        for (const auto& j : polyJobs)  drawJob(j);
-        for (const auto& j : pointJobs) drawJob(j);
-        for (const auto& j : hexJobs)   drawJob(j);
-
-        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-        ctx_->IASetInputLayout(inputLayout_.Get());
-    }
+    } // hexsprite scope
 
     // ------------------- TAA composite (optional) -> post (always) -------------------
     ID3D11ShaderResourceView* postInput = nullptr;
     if (postEnabled) {
-        // MSAA: resolve scene MSAA color into non-MSAA taaSceneTex_ for post.
-        // Splat/SplatHybrid already wrote taaSceneTex_ via CopyResource.
-        const bool splatTech = (tech == RenderTech::Splat || tech == RenderTech::SplatHybrid);
-        if (useMsaa && !splatTech && msaaColorTex_ && taaSceneTex_) {
-            ctx_->ResolveSubresource(taaSceneTex_.Get(), 0, msaaColorTex_.Get(), 0,
-                                     DXGI_FORMAT_R8G8B8A8_UNORM);
-        }
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ID3D11Buffer* nullVb[] = { nullptr }; UINT zero = 0;
@@ -2442,7 +1538,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             postInput = taaSceneSrv_.Get();
         }
 
-        // Post pass: sky + sharpen + tonemap. Always runs.
+        // Post pass: sky + sharpen + tonemap.
         {
             MICROPROFILE_SCOPEGPUI("FinalPost", 0xffff8040);
             ID3D11RenderTargetView* bRtv = rtv_.Get();
@@ -2459,35 +1555,15 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11ShaderResourceView* nulls[] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
         ctx_->PSSetShaderResources(0, 8, nulls);
 
-        // ImGui writes to bound RTV -> already backbuffer.
-        // the backbuffer so the UI lands on screen.
         ID3D11RenderTargetView* backRtv = rtv_.Get();
         ctx_->OMSetRenderTargets(1, &backRtv, nullptr);
     }
 
     // Remember this frame's un-jittered view-proj for next frame's reprojection.
-    // History is at pixel grid (jitter undone in PS), so prev VP must be unjittered.
     hlslpp::store(taaPrevVP_, vpUnjittered);
 }
 
 void Renderer::EndFrame(bool vsync)
 {
-    if (msaaSamples_ > 1 && msaaColorTex_ && !postWroteBackbuf_) {
-        ComPtr<ID3D11Texture2D> backBuf;
-        swap_->GetBuffer(0, IID_PPV_ARGS(backBuf.GetAddressOf()));
-        if (backBuf) {
-            ctx_->ResolveSubresource(backBuf.Get(), 0, msaaColorTex_.Get(), 0,
-                                     DXGI_FORMAT_R8G8B8A8_UNORM);
-        }
-    }
     swap_->Present(vsync ? 1 : 0, 0);
-}
-
-void Renderer::SetMsaa(uint32_t samples)
-{
-    if (samples != 1 && samples != 2 && samples != 4 && samples != 8) samples = 1;
-    if (samples == msaaSamples_) return;
-    msaaSamples_ = samples;
-    ctx_->OMSetRenderTargets(0, nullptr, nullptr);
-    CreateRenderTargets();
 }
