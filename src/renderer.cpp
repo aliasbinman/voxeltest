@@ -348,13 +348,15 @@ bool Renderer::CreateShaders()
         return true;
     };
 
-    ComPtr<ID3DBlob> vsbp, psbp, vsbh, psbh;
+    ComPtr<ID3DBlob> vsbp, psbp;
     if (!compile("vsmain_points", "vs_5_0", vsbp)) return false;
     if (!compile("psmain_points", "ps_5_0", psbp)) return false;
     ComPtr<ID3DBlob> psbps;
     if (!compile("psmain_points_simple", "ps_5_0", psbps)) return false;
-    if (!compile("vsmain_hex", "vs_5_0", vsbh)) return false;
-    if (!compile("psmain_hex", "ps_5_0", psbh)) return false;
+    // HexSprite disabled — see comment block in shaders/voxel.hlsl.
+    // ComPtr<ID3DBlob> vsbh, psbh;
+    // if (!compile("vsmain_hex", "vs_5_0", vsbh)) return false;
+    // if (!compile("psmain_hex", "ps_5_0", psbh)) return false;
     ComPtr<ID3DBlob> vsbv, psbv;
     if (!compile("vsmain_polyvid", "vs_5_0", vsbv)) return false;
     ComPtr<ID3DBlob> vsbAx;
@@ -388,10 +390,11 @@ bool Renderer::CreateShaders()
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbps->GetBufferPointer(), psbps->GetBufferSize(), nullptr, psPointsSimple_.GetAddressOf());
     if (FAILED(hr)) return false;
-    hr = device_->CreateVertexShader(vsbh->GetBufferPointer(), vsbh->GetBufferSize(), nullptr, vsHex_.GetAddressOf());
-    if (FAILED(hr)) return false;
-    hr = device_->CreatePixelShader(psbh->GetBufferPointer(), psbh->GetBufferSize(), nullptr, psHex_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    // HexSprite disabled.
+    // hr = device_->CreateVertexShader(vsbh->GetBufferPointer(), vsbh->GetBufferSize(), nullptr, vsHex_.GetAddressOf());
+    // if (FAILED(hr)) return false;
+    // hr = device_->CreatePixelShader(psbh->GetBufferPointer(), psbh->GetBufferSize(), nullptr, psHex_.GetAddressOf());
+    // if (FAILED(hr)) return false;
     hr = device_->CreateVertexShader(vsbv->GetBufferPointer(), vsbv->GetBufferSize(), nullptr, vsPolyVid_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreateVertexShader(vsbAx->GetBufferPointer(), vsbAx->GetBufferSize(), nullptr, vsPolyAxis_.GetAddressOf());
@@ -445,15 +448,15 @@ bool Renderer::CreateShaders()
                                     inputLayout_.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // HexSprite: same vertex format, per-instance stepping.
-    D3D11_INPUT_ELEMENT_DESC ilHex[] = {
-        { "POSITION", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 0,                            D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UINT,     0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-    };
-    hr = device_->CreateInputLayout(ilHex, _countof(ilHex),
-                                    vsbh->GetBufferPointer(), vsbh->GetBufferSize(),
-                                    inputLayoutHex_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    // HexSprite disabled.
+    // D3D11_INPUT_ELEMENT_DESC ilHex[] = {
+    //     { "POSITION", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 0,                            D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+    //     { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UINT,     0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+    // };
+    // hr = device_->CreateInputLayout(ilHex, _countof(ilHex),
+    //                                 vsbh->GetBufferPointer(), vsbh->GetBufferSize(),
+    //                                 inputLayoutHex_.GetAddressOf());
+    // if (FAILED(hr)) return false;
 
     // PolyVID input layout: per-instance step on pointVb_.
     D3D11_INPUT_ELEMENT_DESC ilV[] = {
@@ -563,31 +566,38 @@ void Renderer::UploadScene(const Scene& scene)
 
     if (scene.pointVertices.empty()) return;
 
-    // Vertex buffer (immutable, plain).
-    D3D11_BUFFER_DESC pbd = {};
-    pbd.Usage = D3D11_USAGE_IMMUTABLE;
-    pbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    pbd.ByteWidth = (UINT)(scene.pointVertices.size() * sizeof(Vertex));
-    D3D11_SUBRESOURCE_DATA psd = {};
-    psd.pSysMem = scene.pointVertices.data();
-    device_->CreateBuffer(&pbd, &psd, pointVb_.GetAddressOf());
+    // Single structured-SRV buffer. All surviving point techs (Splat, Points,
+    // PolyVID, PolyAxis, PolyAxisInst, Billboard, BillboardTri, PointCS) read
+    // voxel data via SV_VertexID + gVoxelBase from this SRV — no VB binding.
+    // (HexSprite previously needed a separate VB; it's disabled now.)
+    const uint64_t pvBytes64 = (uint64_t)scene.pointVertices.size() * sizeof(Vertex);
+    if (pvBytes64 > 0xFFFFFFFFull) {
+        std::fprintf(stderr,
+            "[upload] FATAL: pointVertices = %llu bytes > 4 GB. D3D11 buffer max "
+            "is UINT bytes. Regenerate the .vox with a coarser --scale (try 4-6 m).\n",
+            (unsigned long long)pvBytes64);
+        return;
+    }
 
-    // Parallel StructuredBuffer for CS / VS access (same data).
     D3D11_BUFFER_DESC sbd = {};
     sbd.Usage = D3D11_USAGE_IMMUTABLE;
     sbd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    sbd.ByteWidth = pbd.ByteWidth;
+    sbd.ByteWidth = (UINT)pvBytes64;
     sbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     sbd.StructureByteStride = sizeof(Vertex);
-    ComPtr<ID3D11Buffer> sb;
-    if (SUCCEEDED(device_->CreateBuffer(&sbd, &psd, sb.GetAddressOf()))) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
-        srvd.Format = DXGI_FORMAT_UNKNOWN;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-        srvd.Buffer.NumElements = (UINT)scene.pointVertices.size();
-        device_->CreateShaderResourceView(sb.Get(), &srvd, pointSrv_.GetAddressOf());
-        pointSb_ = sb;
+    D3D11_SUBRESOURCE_DATA psd = {};
+    psd.pSysMem = scene.pointVertices.data();
+    if (FAILED(device_->CreateBuffer(&sbd, &psd, pointSb_.GetAddressOf()))) {
+        std::fprintf(stderr, "[upload] FATAL: CreateBuffer pointSb_ (%llu bytes) failed.\n",
+                     (unsigned long long)pvBytes64);
+        pointSb_.Reset();
+        return;
     }
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+    srvd.Format = DXGI_FORMAT_UNKNOWN;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    srvd.Buffer.NumElements = (UINT)scene.pointVertices.size();
+    device_->CreateShaderResourceView(pointSb_.Get(), &srvd, pointSrv_.GetAddressOf());
 
     // Parallel per-voxel face-AO buffer for PolyAxis (24 bits packed).
     if (!scene.pointAo6.empty()) {
@@ -610,8 +620,9 @@ void Renderer::UploadScene(const Scene& scene)
         }
     }
 
+    subs_.clear();
     subs_.reserve(scene.subs.size());
-    for (const auto& s : scene.subs) {
+    for (const auto& s : scene.subs) { 
         GpuSubMesh gs;
         gs.pointFirst = s.pointFirst;
         gs.pointCount = s.pointCount;
@@ -892,7 +903,8 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         cb.sunIntensity  = sunIntensity;
         cb.exposure      = exposure;
         cb.roughness     = roughness;
-        cb.colorizeClusters = args.colorizeClusters ? 1.0f : 0.0f;
+        // LodViz mode uses ClusterTint downstream; field repurposed as a flag.
+        cb.colorizeClusters = (args.mode == ShadingMode::LodViz) ? 1.0f : 0.0f;
         cb.gridSize = (float)std::max(1, gridSize);
         memcpy(m.pData, &cb, sizeof(cb));
     }
@@ -905,7 +917,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     ctx_->RSSetState(rsSolid_.Get());
     ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
-    if (!pointVb_) return;
+    if (!pointSb_) return;
 
     // Extract 6 frustum planes from row-major viewProj.
     float M[16];
@@ -1069,7 +1081,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     // -------------- Splat tech --------------
     {
     auto& jobs = jobsByTech[(int)RenderTech::Splat];
-    if (!jobs.empty() && pointVb_ && splatColorRtv_ && splatFinalUav_)
+    if (!jobs.empty() && pointSb_ && splatColorRtv_ && splatFinalUav_)
     {
         MICROPROFILE_SCOPEGPUI("Splat", 0xffffd060);
         float clr[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
@@ -1085,17 +1097,16 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
 
         {
             MICROPROFILE_SCOPEGPUI("Splat/Points", 0xffffc040);
-            ctx_->IASetInputLayout(inputLayout_.Get());
+            // No VB — vsmain_points reads vertex data from pointSrv_ (t1) via SV_VertexID.
+            ctx_->IASetInputLayout(nullptr);
             ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
             ctx_->VSSetShader(vsPoints_.Get(), nullptr, 0);
             ctx_->PSSetShader(psSplatAlbedo_.Get(), nullptr, 0);
-            if (pointAo6Srv_) {
-                ID3D11ShaderResourceView* aoSrvs[] = { pointAo6Srv_.Get() };
-                ctx_->VSSetShaderResources(2, 1, aoSrvs);
-            }
-            ID3D11Buffer* vbs[] = { pointVb_.Get() };
-            UINT vbStride = sizeof(Vertex), vbOff = 0;
-            ctx_->IASetVertexBuffers(0, 1, vbs, &vbStride, &vbOff);
+            ID3D11ShaderResourceView* vsSrvs[] = { nullptr, pointSrv_.Get(), pointAo6Srv_.Get() };
+            ctx_->VSSetShaderResources(0, 3, vsSrvs);
+            ID3D11Buffer* nullVbs[] = { nullptr };
+            UINT vbStride = 0, vbOff = 0;
+            ctx_->IASetVertexBuffers(0, 1, nullVbs, &vbStride, &vbOff);
             size_t i = 0;
             while (i < jobs.size()) {
                 float ox = jobs[i].ox, oz = jobs[i].oz;
@@ -1121,7 +1132,8 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
                     }
                     uint32_t spanCount = spanEnd - spanFirst;
                     issueChunkCbEx(firstInGroup, lodToHalfExtent(lod), spanFirst);
-                    ctx_->Draw(spanCount, spanFirst);
+                    // SRV path: SV_VertexID = 0..N-1; VS adds gVoxelBase = spanFirst.
+                    ctx_->Draw(spanCount, 0);
                     ++lastDrawn_;
                     lastDrawnTris_ += spanCount;
                     lastPointCount_ += spanCount;
@@ -1187,20 +1199,21 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     // -------------- Points tech --------------
     {
     auto& jobs = jobsByTech[(int)RenderTech::Points];
-    if (!jobs.empty() && pointVb_) {
+    if (!jobs.empty() && pointSb_) {
         MICROPROFILE_SCOPEGPUI("Points", 0xff80ff80);
         curTint = 2;
+        // No VB — VS pulls voxel data from pointSrv_ at t1 via SV_VertexID.
+        ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
         ctx_->VSSetShader(vsPoints_.Get(), nullptr, 0);
-        if (pointAo6Srv_) {
-            ID3D11ShaderResourceView* aoSrvs[] = { pointAo6Srv_.Get() };
-            ctx_->VSSetShaderResources(2, 1, aoSrvs);
-        }
         ctx_->PSSetShader(pointLight == PointLighting::Simple
                               ? psPointsSimple_.Get()
                               : psPoints_.Get(), nullptr, 0);
-        ID3D11Buffer* vbs[] = { pointVb_.Get() };
-        ctx_->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+        ID3D11ShaderResourceView* vsSrvs[] = { nullptr, pointSrv_.Get(), pointAo6Srv_.Get() };
+        ctx_->VSSetShaderResources(0, 3, vsSrvs);
+        ID3D11Buffer* nullVbs[] = { nullptr };
+        UINT vbS = 0, vbO = 0;
+        ctx_->IASetVertexBuffers(0, 1, nullVbs, &vbS, &vbO);
 
         size_t i = 0;
         while (i < jobs.size()) {
@@ -1227,7 +1240,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
                 }
                 uint32_t spanCount = spanEnd - spanFirst;
                 issueChunkCbEx(firstInGroup, lodToHalfExtent(lod), spanFirst);
-                ctx_->Draw(spanCount, spanFirst);
+                ctx_->Draw(spanCount, 0);
                 ++lastDrawn_;
                 lastDrawnTris_ += spanCount;
                 lastPointCount_ += spanCount;
@@ -1240,7 +1253,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     // -------------- PointCS tech --------------
     {
     auto& jobs = jobsByTech[(int)RenderTech::PointCS];
-    if (!jobs.empty() && pointVb_ && pointSrv_ && csColorUav_) {
+    if (!jobs.empty() && pointSb_ && pointSrv_ && csColorUav_) {
         MICROPROFILE_SCOPEGPUI("PointCS", 0xff80c0a0);
         curTint = 2;
         uint32_t clearC[4] = { 0xFF291F1Au, 0, 0, 0 };
@@ -1475,7 +1488,11 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
 
     } // billboardtri scope
 
-    // -------------- HexSprite tech --------------
+    // -------------- HexSprite tech (DISABLED) --------------
+    // Disabled so we can run all point techs through a single structured-SRV
+    // buffer (HexSprite needed a per-instance VB, forcing a duplicate copy).
+    // To revive: uncomment + re-enable the enum entry + restore vsHex_/psHex_.
+    #if 0
     {
     auto& jobs = jobsByTech[(int)RenderTech::HexSprite];
     if (!jobs.empty() && pointVb_) {
@@ -1499,6 +1516,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->IASetInputLayout(inputLayout_.Get());
     }
     } // hexsprite scope
+    #endif
 
     // ------------------- TAA composite (optional) -> post (always) -------------------
     ID3D11ShaderResourceView* postInput = nullptr;

@@ -17,14 +17,55 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <vector>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
+
+constexpr const char* kSettingsPath = "voxeltest.settings";
+
+// Read "lastVox=<path>\n" if present. Returns empty string on miss.
+std::string LoadLastVoxFromSettings()
+{
+    std::ifstream f(kSettingsPath);
+    if (!f) return {};
+    std::string line;
+    while (std::getline(f, line)) {
+        const char* prefix = "lastVox=";
+        if (line.rfind(prefix, 0) == 0) return line.substr(std::strlen(prefix));
+    }
+    return {};
+}
+void SaveLastVoxToSettings(const std::string& path)
+{
+    std::ofstream f(kSettingsPath, std::ios::trunc);
+    if (!f) return;
+    f << "lastVox=" << path << "\n";
+}
+
+// Enumerate assets/*.vox, sorted alphabetically.
+std::vector<std::string> DiscoverDatasets()
+{
+    std::vector<std::string> out;
+    std::error_code ec;
+    if (!std::filesystem::is_directory("assets", ec)) return out;
+    for (const auto& e : std::filesystem::directory_iterator("assets", ec)) {
+        if (!e.is_regular_file()) continue;
+        if (e.path().extension() == ".vox") {
+            out.push_back(e.path().generic_string());
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 void SetCwdToProjectRoot()
 {
@@ -52,7 +93,6 @@ struct AppState {
     float    sunIntensityEV = 0.0f;     // log2 stops; linear = 2^EV
     float    exposureEV     = 0.0f;     // log2 stops; linear = 2^EV
     float    roughness      = 0.6f;
-    bool     colorizeClusters = false;
     bool     vsync = false;
     int      gridSize = 1;
     bool     taa = true;
@@ -72,15 +112,16 @@ struct AppState {
     bool     keys[256] = {};
     bool     wantQuit = false;
     bool     sceneReady = false;
-    std::string loadStatus = "Loading kingslanding.vox...";
+    std::string loadStatus = "Loading...";
     std::string currentVoxPath;
+    std::vector<std::string> datasetPaths;   // discovered assets/*.vox at startup
+    int         datasetIdx = 0;              // index into datasetPaths
     Scene       pendingScene;
     // Snapshot kept after upload so on-demand compression analysis can run
     // without holding the full pointVertices/ao6 buffers.
     Scene       compScene;
     std::string compStatus;
     bool        everLoaded = false;
-    DataSet     dataset = DataSet::Reduced;
     std::atomic<bool> reloadRequested{ false };
     std::atomic<bool> loadDone{ false };
     std::atomic<bool> loadOk{ false };
@@ -387,19 +428,29 @@ void FrameControlsWindow()
     if (!g_app.showControls) return;
     if (!ImGui::Begin("Controls", &g_app.showControls)) { ImGui::End(); return; }
 
-    const char* datasets[] = { "Full", "Reduced" };
     {
-        int ds = (int)g_app.dataset;
-        if (ImGui::Combo("Dataset", &ds, datasets, IM_ARRAYSIZE(datasets))) {
-            g_app.dataset = (DataSet)ds;
-            g_app.reloadRequested.store(true);
+        // Dataset combo built from discovered assets/*.vox at startup.
+        std::vector<const char*> names;
+        names.reserve(g_app.datasetPaths.size());
+        for (const auto& p : g_app.datasetPaths) names.push_back(p.c_str());
+        if (names.empty()) {
+            ImGui::TextUnformatted("Dataset: (no .vox files in assets/)");
+        } else {
+            int idx = g_app.datasetIdx;
+            if (idx < 0 || idx >= (int)names.size()) idx = 0;
+            if (ImGui::Combo("Dataset", &idx, names.data(), (int)names.size())) {
+                g_app.datasetIdx = idx;
+                SaveLastVoxToSettings(g_app.datasetPaths[idx]);
+                g_app.reloadRequested.store(true);
+            }
         }
     }
     // Single tech combo: point-derived techniques only.
     struct TechEntry { const char* name; RenderTech val; };
     static const TechEntry kTechList[] = {
         { "Points",       RenderTech::Points       },
-        { "HexSprite",    RenderTech::HexSprite    },
+        // HexSprite disabled — dropped to allow single structured-SRV point buffer.
+        // { "HexSprite",    RenderTech::HexSprite    },
         { "PointCS",      RenderTech::PointCS      },
         { "PolyVID",      RenderTech::PolyVID      },
         { "Billboard",    RenderTech::Billboard    },
@@ -462,7 +513,7 @@ void FrameControlsWindow()
     if (ImGui::Combo("Point lighting", &pli, pls, IM_ARRAYSIZE(pls))) {
         g_app.pointLight = (PointLighting)pli;
     }
-    const char* modes[] = { "Lit", "Flat Color", "Normals", "AO" };
+    const char* modes[] = { "Lit", "Flat Color", "Normals", "AO", "AO+LODViz" };
     int m = (int)g_app.mode;
     if (ImGui::Combo("Shading", &m, modes, IM_ARRAYSIZE(modes))) {
         g_app.mode = (ShadingMode)m;
@@ -470,7 +521,6 @@ void FrameControlsWindow()
     ImGui::Checkbox("VSync", &g_app.vsync);
     ImGui::SliderInt("Grid size", &g_app.gridSize, 1, 10);
     ImGui::Checkbox("TAA", &g_app.taa);
-    ImGui::Checkbox("Colorize clusters", &g_app.colorizeClusters);
     ImGui::SliderFloat("Sun pitch",     &g_app.sunPitchDeg, 5.0f, 89.0f, "%.1f deg");
     ImGui::SliderFloat("Sun yaw",       &g_app.sunYawDeg, -180.0f, 180.0f, "%.1f deg");
     ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
@@ -532,15 +582,32 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_app.renderer.Device(), g_app.renderer.Context());
 
+    // Enumerate available datasets + restore last-used selection.
+    g_app.datasetPaths = DiscoverDatasets();
+    {
+        std::string last = LoadLastVoxFromSettings();
+        if (!last.empty()) {
+            for (int i = 0; i < (int)g_app.datasetPaths.size(); ++i) {
+                if (g_app.datasetPaths[i] == last) { g_app.datasetIdx = i; break; }
+            }
+        }
+    }
+
     auto kickLoader = []() {
         std::thread([] {
             std::string err;
-            const char* voxPath = (g_app.dataset == DataSet::Reduced)
-                ? "assets/kingslanding_culled.vox"
-                : "assets/kingslanding.vox";
+            if (g_app.datasetPaths.empty()) {
+                g_app.loadErr = "no .vox files found in assets/";
+                g_app.loadOk.store(false);
+                g_app.loadDone.store(true);
+                return;
+            }
+            int idx = g_app.datasetIdx;
+            if (idx < 0 || idx >= (int)g_app.datasetPaths.size()) idx = 0;
+            const std::string& voxPath = g_app.datasetPaths[idx];
             g_app.currentVoxPath = voxPath;
             g_app.loadStatus = std::string("Loading ") + voxPath + "...";
-            bool ok = LoadVoxScene(voxPath, g_app.pendingScene, err);
+            bool ok = LoadVoxScene(voxPath.c_str(), g_app.pendingScene, err);
             if (!ok && err.empty()) err = "vox load failed";
             g_app.loadErr = err;
             g_app.loadOk.store(ok);
@@ -634,7 +701,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         }
         g_app.renderer.BeginFrame(clear);
         if (g_app.sceneReady && g_app.loadOk.load()) {
-            float effFogDensity = (g_app.fogMode == 0) ? 0.0f : g_app.fogDensity;
+            // LodViz forces fog off so the per-LOD colors aren't dimmed/tinted.
+            const bool fogOff = (g_app.fogMode == 0) || (g_app.mode == ShadingMode::LodViz);
+            float effFogDensity   = fogOff ? 0.0f : g_app.fogDensity;
+            float effHeightFogDen = (g_app.mode == ShadingMode::LodViz) ? 0.0f : g_app.heightFogDensity;
             const float kDeg2Rad = 3.14159265358979f / 180.0f;
             float pr = g_app.sunPitchDeg * kDeg2Rad;
             float yr = g_app.sunYawDeg   * kDeg2Rad;
@@ -659,7 +729,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.fogColor[1]      = g_app.fogColor[1];
             ps.fogColor[2]      = g_app.fogColor[2];
             ps.fogDensity       = effFogDensity;
-            ps.heightFogDensity = g_app.heightFogDensity;
+            ps.heightFogDensity = effHeightFogDen;
             ps.heightFogFalloff = g_app.heightFogFalloff;
             ps.heightFogStart   = g_app.heightFogStart;
             ps.splatRadius      = g_app.splatRadius;
@@ -670,7 +740,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.sunIntensity     = exp2f(g_app.sunIntensityEV);
             ps.exposure         = exp2f(g_app.exposureEV);
             ps.roughness        = g_app.roughness;
-            ps.colorizeClusters = g_app.colorizeClusters;
             g_app.renderer.DrawScene(g_app.camera, ps);
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

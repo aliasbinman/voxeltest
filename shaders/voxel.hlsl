@@ -154,14 +154,15 @@ float3 ApplyShadowLighting(float3 amb, float3 sunDir, float3 n, float shadow)
     return amb + gAmbient * sun;
 }
 
-// Debug cluster tint: 1=green close, 2=red L0, 3=orange L1, 4=yellow L2, 5=cyan L3.
+// LodViz tint: 1=Poly green, 2=PointL0 blue, 3=PointL1 purple,
+// 4=PointL2 yellow, 5=PointL3 orange.
 float3 ClusterTint(uint t)
 {
-    if (t == 1u) return float3(0.4, 1.0, 0.4);
-    if (t == 2u) return float3(1.0, 0.4, 0.4);
-    if (t == 3u) return float3(1.0, 0.65, 0.2);
-    if (t == 4u) return float3(1.0, 1.0, 0.3);
-    if (t == 5u) return float3(0.3, 0.9, 1.0);
+    if (t == 1u) return float3(0.3, 1.0, 0.3);  // poly = green
+    if (t == 2u) return float3(0.3, 0.5, 1.0);  // L0 = blue
+    if (t == 3u) return float3(0.8, 0.3, 1.0);  // L1 = purple
+    if (t == 4u) return float3(1.0, 1.0, 0.3);  // L2 = yellow
+    if (t == 5u) return float3(1.0, 0.55, 0.1); // L3 = orange
     return float3(1.0, 1.0, 1.0);
 }
 float3 ApplyClusterTint(float3 c)
@@ -184,6 +185,17 @@ float3 TonemapTinted(float3 x) { return Tonemap(ApplyClusterTint(x)); }
 // by global vertex ID for point paths; by voxelIdx for PolyVID/PolyAxis.
 StructuredBuffer<uint> gPolyAo6 : register(t2);
 
+// Voxel record: 12 B, matches CPU `Vertex` struct in src/mesh.h.
+// pck.x = (x | y<<16), pck.y = (z | aux<<16). col = RGB low24 | visMask<<24.
+struct VoxelP { uint2 pck; uint col; };
+float3 UnpackVoxPosCS(uint2 p)
+{
+    return float3((float)(p.x & 0xFFFFu),
+                  (float)((p.x >> 16u) & 0xFFFFu),
+                  (float)(p.y & 0xFFFFu));
+}
+StructuredBuffer<VoxelP> gPolyVoxels : register(t1);
+
 // ---------------- Points technique ----------------
 // faceIdx field carries visMask (6 bits, one per cube face direction).
 struct VSPointOut {
@@ -195,16 +207,22 @@ struct VSPointOut {
     nointerpolation float ao : AO;
 };
 
-VSPointOut vsmain_points(VSIn i, uint vid : SV_VertexID)
+// Reads voxel data from the structured buffer (gPolyVoxels at t1) via
+// SV_VertexID + gVoxelBase — no VB input. Replaces the older VSIn-based path
+// so we no longer need a duplicate D3D11 vertex buffer alongside the SRV.
+VSPointOut vsmain_points(uint vid : SV_VertexID)
 {
     VSPointOut o;
+    VoxelP v = gPolyVoxels[vid + gVoxelBase];
     // _pad carries half-extent of the LOD voxel (0.5/1.0/2.0); scene-rel pos + pad = voxel center.
-    float3 local = UnpackVoxPos(i.pck) + _pad;
+    float3 local = UnpackVoxPosCS(v.pck) + _pad;
     float3 world = gChunkBase + local;
     o.svpos = mul(float4(world, 1.0), gViewProj);
-    o.col   = float3(i.col.rgb) / 255.0;
+    o.col   = float3((v.col & 0xFFu),
+                     (v.col >> 8u) & 0xFFu,
+                     (v.col >> 16u) & 0xFFu) / 255.0;
     o.wpos  = world;
-    o.mask  = i.col.a & 0x3Fu;       // visMask packed in color alpha
+    o.mask  = (v.col >> 24u) & 0x3Fu;     // visMask packed in color alpha byte
     o.shadowMask = 0xFFu;
     // Pick the visible face whose outward normal is most aligned with the
     // direction from voxel center toward the camera. Restricting to faces in
@@ -213,7 +231,6 @@ VSPointOut vsmain_points(VSIn i, uint vid : SV_VertexID)
     // > toCam.y and end up showing +X AO instead of +Y).
     uint ao6 = gPolyAo6[vid + gVoxelBase];
     float3 toCam = normalize(gCamPos - world);
-    uint visMask = i.col.a & 0x3Fu;
     float3 faceN[6] = {
         float3( 1, 0, 0), float3(-1, 0, 0),
         float3( 0, 1, 0), float3( 0,-1, 0),
@@ -222,7 +239,7 @@ VSPointOut vsmain_points(VSIn i, uint vid : SV_VertexID)
     float bestDot = -2.0;
     uint  bestFace = 0u;
     [unroll] for (uint f = 0u; f < 6u; ++f) {
-        if (((visMask >> f) & 1u) == 0u) continue;
+        if (((o.mask >> f) & 1u) == 0u) continue;
         float d = dot(faceN[f], toCam);
         if (d > bestDot) { bestDot = d; bestFace = f; }
     }
@@ -251,6 +268,7 @@ float4 psmain_points_simple(VSPointOut i) : SV_Target
     float fogDist = length(i.wpos - gCamPos);
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
+    if (mode == 4) return float4(i.ao * ClusterTint(gChunkTint), 1.0);
     float3 n = normalize(gCamPos - i.wpos);
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
@@ -264,6 +282,7 @@ float4 psmain_points(VSPointOut i) : SV_Target
     int mode = (int)gMode;
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
+    if (mode == 4) return float4(i.ao * ClusterTint(gChunkTint), 1.0);
 
     // Choose up to 3 candidate cardinal faces: the ones the camera could see.
     // Per axis: positive face if D.axis >= 0, else negative face.
@@ -324,18 +343,8 @@ cbuffer cbCS : register(b2)
     float    gCsLodHalfExtent;   // 0.5/1.0/2.0 (bit-cast from float in host)
 };
 
-// Packed voxel from existing point VB (8 bytes per entry):
-// pck = x | (y<<8) | (z<<16) | (faceIdx<<24)
-// col = RGBA8 packed
-// 12-byte structured-buffer entry. pck.x = (x | y<<16), pck.y = (z | aux<<16).
-struct VoxelP { uint2 pck; uint col; };
-float3 UnpackVoxPosCS(uint2 p)
-{
-    return float3((float)(p.x & 0xFFFFu),
-                  (float)((p.x >> 16u) & 0xFFFFu),
-                  (float)(p.y & 0xFFFFu));
-}
-
+// VoxelP + UnpackVoxPosCS hoisted above vsmain_points; only the CS-only
+// buffer alias stays here.
 StructuredBuffer<VoxelP> gVoxels  : register(t0);
 RWTexture2D<uint>        gColorUav : register(u0);
 
@@ -392,9 +401,7 @@ float4 psmain_blit(VBlitOut i) : SV_Target
 // ---------------- PolyVID technique ----------------
 // Shared IB has values = i*8 + corner (0..7) per voxel i. Per-chunk Draw uses
 // baseVertex = chunkVoxelBase*8 so SV_VertexID = (chunkVoxelBase + i)*8 + corner.
-// VS pulls voxel data from a StructuredBuffer; no VB needed.
-StructuredBuffer<VoxelP> gPolyVoxels : register(t1);
-// gPolyAo6 declared earlier (shared with the Points VS path).
+// VS pulls voxel data from gPolyVoxels (declared earlier with the Points VS).
 
 struct VSPolyVidOut {
     float4 svpos : SV_Position;
@@ -594,6 +601,7 @@ float4 psmain_polyvid(VSPolyVidOut i) : SV_Target
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
+    if (mode == 4) return float4(i.ao * ClusterTint(gChunkTint), 1.0);
     float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
     float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
     return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
@@ -1089,6 +1097,9 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             outRgb = ApplyFog(bestAlbedo, hit);
         } else if (mode == 3) {
             outRgb = ApplyFog(bestAo.xxx, hit);
+        } else if (mode == 4) {
+            // AO * per-LOD tint (Poly tint not reachable here — splats only).
+            outRgb = bestAo * ClusterTint(2u + bestLodIdx);
         } else {
             float3 amb = SampleAmbientCubeTriplanar(bestN) * bestAo;
             float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, SampleShadow(hit));
@@ -1264,13 +1275,20 @@ float4 psmain_billboard(VSBillOut i,
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, hit), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col, hit), 1.0);
     if (mode == 3) return float4(ApplyFog(i.ao.xxx, hit), 1.0);
+    if (mode == 4) return float4(i.ao * ClusterTint(gChunkTint), 1.0);
 
     float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
     float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(hit));
     return float4(TonemapTinted(ApplyFog(i.col * light, hit)), 1.0);
 }
 
-// ---------------- HexSprite technique ----------------
+// ---------------- HexSprite technique (DISABLED) ----------------
+// Kept commented out for reference. Removed from the active tech set because
+// it was the only path that needed a duplicate vertex buffer alongside the
+// structured SRV — dropping it lets us run all point-techs through one buffer.
+// To revive: uncomment this block, restore the HexSprite enum entry + draw
+// block in renderer.cpp, and re-add the inputLayoutHex_ path.
+#if 0
 // Per voxel: 18 vertices = 6 triangles fanning from closest-corner-to-camera.
 // Voxel data delivered as per-instance attributes; SV_VertexID 0..17 picks
 // the triangle (0..5) and the role (center, v1, v2).
@@ -1340,8 +1358,10 @@ float4 psmain_hex(VSHexOut i) : SV_Target
     if (mode == 2) return float4(ApplyFog(n * 0.5 + 0.5, i.wpos), 1.0);
     if (mode == 1) return float4(ApplyFog(i.col, i.wpos), 1.0);
     if (mode == 3) return float4(ApplyFog(i.ao.xxx, i.wpos), 1.0);
+    if (mode == 4) return float4(i.ao * ClusterTint(gChunkTint), 1.0);
 
     float3 amb  = SampleAmbientCubeTriplanar(n) * i.ao;
     float3 light = ApplyShadowLighting(amb, normalize(gLightDir), n, ShadowBitN(i.shadowMask, n) * SampleShadow(i.wpos));
     return float4(TonemapTinted(ApplyFog(i.col * light, i.wpos)), 1.0);
 }
+#endif // HexSprite disabled

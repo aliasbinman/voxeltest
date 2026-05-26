@@ -22,10 +22,11 @@ struct GpuSubMesh {
 };
 
 enum class ShadingMode : int {
-    Lit = 0,
+    Lit       = 0,
     FlatColor = 1,
-    Normals = 2,
-    Ao = 3,
+    Normals   = 2,
+    Ao        = 3,
+    LodViz    = 4,    // AO * per-LOD tint (Poly=green, L0=blue, L1=purple, L2=yellow, L3=orange). Fog off.
 };
 
 // Render path. Only point-data-derived techniques survive.
@@ -39,12 +40,6 @@ enum class RenderTech : int {
     Splat             = 9,   // points -> color RT (alpha=size); CS sphere reconstruct
     PolyAxis          = 11,  // pure-math instanced cube; VS picks the 3 camera-facing axis faces
     PolyAxisInstanced = 12,  // same math as PolyAxis but via DrawInstanced(18, count)
-};
-
-// Which baked dataset to draw from. Both are .vox; Reduced = pre-culled.
-enum class DataSet : int {
-    Full    = 0,
-    Reduced = 1,
 };
 
 enum class PointLighting : int {
@@ -82,7 +77,6 @@ struct DrawSceneParams {
     float          sunIntensity     = 1.0f;          // linear (2^EV)
     float          exposure         = 1.0f;          // linear (2^EV)
     float          roughness        = 0.6f;
-    bool           colorizeClusters = false;
 };
 
 class Renderer {
