@@ -143,8 +143,31 @@ uint FaceFromNormal(float3 n)
 float ShadowBit(uint mask, uint fi)         { return (float)((mask >> fi) & 1u); }
 float ShadowBitN(uint mask, float3 n)       { return ShadowBit(mask, FaceFromNormal(n)); }
 
-// Shadow map removed; keep stub so existing call sites compile unchanged.
-float SampleShadow(float3 wpos) { return 1.0; }
+// Sun shadow map (cascade 0). Single ortho-projected depth tex sampled with
+// a SamplerComparisonState for hardware PCF. gShadowEnable < 0.5 -> stub 1.0.
+Texture2D<float>          gShadowTex  : register(t6);
+SamplerComparisonState    gShadowSamp : register(s1);
+float SampleShadow(float3 wpos) {
+    if (gShadowEnable < 0.5) return 1.0;
+    float4 sp = mul(float4(wpos, 1.0), gSunViewProj);
+    float3 ndc = sp.xyz / sp.w;
+    // Outside frustum -> lit.
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 ||
+        ndc.z <  0.0 || ndc.z > 1.0) return 1.0;
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    // Reverse-Z: closer to sun = larger z. Sampler is GREATER_EQUAL:
+    // lit when (ref >= stored). Add bias (not subtract) so a receiver right
+    // on a caster surface stays just on the lit side.
+    float ref = ndc.z + gShadowBias;
+    // 3x3 PCF.
+    float texel = 1.0 / max(gShadowMapSize, 1.0);
+    float sum = 0.0;
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    [unroll] for (int dx = -1; dx <= 1; ++dx) {
+        sum += gShadowTex.SampleCmpLevelZero(gShadowSamp, uv + float2(dx, dy) * texel, ref);
+    }
+    return sum / 9.0;
+}
 
 // Combined lighting (no shadow map). shadow argument retained for call-site compat.
 float3 ApplyShadowLighting(float3 amb, float3 sunDir, float3 n, float shadow)
@@ -195,6 +218,54 @@ float3 UnpackVoxPosCS(uint2 p)
                   (float)(p.y & 0xFFFFu));
 }
 StructuredBuffer<VoxelP> gPolyVoxels : register(t1);
+
+// ---------------- Shadow map blur fill ----------------
+// Sparse point-splat casters leave many shadow texels at depth 0 (far). This
+// CS runs after the caster pass: each empty texel (depth ≈ 0) is replaced by
+// the average of its 8 non-empty neighbours. Already-written texels passthrough.
+// Reads gShadowSrcTex (raw shadow), writes gShadowDstUav (filled shadow).
+Texture2D<float>     gShadowSrcTex : register(t7);
+RWTexture2D<float>   gShadowDstUav : register(u3);
+[numthreads(8, 8, 1)]
+void csmain_shadow_blur(uint3 dt : SV_DispatchThreadID)
+{
+    int W = (int)gShadowMapSize;
+    int H = (int)gShadowMapSize;
+    int2 pix = (int2)dt.xy;
+    if (pix.x >= W || pix.y >= H) return;
+
+    float self = gShadowSrcTex.Load(int3(pix, 0));
+    if (self > 0.0001) {
+        gShadowDstUav[pix] = self;
+        return;
+    }
+    float sum = 0.0;
+    int   cnt = 0;
+    [unroll] for (int dy = -1; dy <= 1; ++dy) {
+        [unroll] for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int2 sp = pix + int2(dx, dy);
+            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
+            float v = gShadowSrcTex.Load(int3(sp, 0));
+            if (v > 0.0001) { sum += v; ++cnt; }
+        }
+    }
+    gShadowDstUav[pix] = (cnt > 0) ? (sum / (float)cnt) : 0.0;
+}
+
+// ---------------- Shadow caster (depth-only) ----------------
+// Reads from gPolyVoxels via SV_VertexID + gVoxelBase, transforms with
+// gSunViewProj. No PS bound -> just writes depth into the shadow map.
+struct VSShadowOut { float4 svpos : SV_Position; };
+VSShadowOut vsmain_shadow(uint vid : SV_VertexID)
+{
+    VSShadowOut o;
+    VoxelP v = gPolyVoxels[vid + gVoxelBase];
+    float3 local = UnpackVoxPosCS(v.pck) + _pad;
+    float3 world = gChunkBase + local;
+    o.svpos = mul(float4(world, 1.0), gSunViewProj);
+    return o;
+}
 
 // ---------------- Points technique ----------------
 // faceIdx field carries visMask (6 bits, one per cube face direction).
@@ -1132,6 +1203,52 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             gSplatFinalUav[pix] = float4(c0.rgb, 0.0);
             gSplatFinalDepthUav[pix] = fbHave ? fbZ : 0.0;
         }
+    }
+}
+
+// ---------------- Second-pass dilate (hole fill) ----------------
+// Reads pass-1 output (color in gSplatColorSrv, depth in gSplatDepth) and
+// fills any remaining holes (alpha == 0) by sampling the nearest filled
+// neighbour inside a small kernel. Already-filled pixels pass through.
+// Writes to gSplatFinalUav / gSplatFinalDepthUav (pass-2 ping-pong target).
+[numthreads(8, 8, 1)]
+void csmain_splat_fill(uint3 dt : SV_DispatchThreadID)
+{
+    int2 pix = (int2)dt.xy;
+    int W = (int)gScreenSize.x;
+    int H = (int)gScreenSize.y;
+    if (pix.x >= W || pix.y >= H) return;
+
+    float4 c0 = gSplatColorSrv.Load(int3(pix, 0));
+    float  z0 = gSplatDepth.Load(int3(pix, 0));
+    if (c0.a > 0.5) {
+        // Already filled by pass 1 — pass through unchanged.
+        gSplatFinalUav[pix]      = c0;
+        gSplatFinalDepthUav[pix] = z0;
+        return;
+    }
+
+    // Hole. Scan small kernel for nearest filled neighbour by reverse-Z.
+    int R = max(1, (int)_pad1.x);
+    float bestZ = -1.0;
+    float4 bestC = float4(0, 0, 0, 0);
+    [loop] for (int dy = -R; dy <= R; ++dy) {
+        [loop] for (int dx = -R; dx <= R; ++dx) {
+            int2 sp = pix + int2(dx, dy);
+            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
+            float4 sc = gSplatColorSrv.Load(int3(sp, 0));
+            if (sc.a <= 0.5) continue;
+            float sz = gSplatDepth.Load(int3(sp, 0));
+            if (sz > bestZ) { bestZ = sz; bestC = sc; }
+        }
+    }
+    if (bestZ <= 0.0) {
+        // Still nothing — leave as bg (alpha 0, depth 0). Composite skips.
+        gSplatFinalUav[pix]      = float4(0, 0, 0, 0);
+        gSplatFinalDepthUav[pix] = 0.0;
+    } else {
+        gSplatFinalUav[pix]      = bestC;
+        gSplatFinalDepthUav[pix] = bestZ;
     }
 }
 

@@ -77,6 +77,15 @@ struct DrawSceneParams {
     float          sunIntensity     = 1.0f;          // linear (2^EV)
     float          exposure         = 1.0f;          // linear (2^EV)
     float          roughness        = 0.6f;
+    bool           sunShadows       = false;
+    int            shadowCascades   = 1;       // 1..4 (only cascade 0 active for now)
+    int            shadowMapSize    = 2048;    // 512/1024/2048/4096
+    float          shadowBias       = 0.001f;
+    bool           shadowCullFront  = false;   // false = cull back faces (default)
+    bool           shadowForceRebuild = false; // skip cache (profiling)
+    int            shadowLod        = -1;      // -1 = auto, 0..3 = L0..L3
+    bool           splatDilate2Pass = false;   // run a second pass to fill leftover holes
+    bool           shadowBlur       = false;   // CS pass that fills empty shadow texels with neighbour avg
 };
 
 class Renderer {
@@ -121,6 +130,10 @@ public:
     uint64_t CompLz4ColorPalBytes()   const { return compLz4ColorPalBytes_; }
     uint64_t CompLz4TotalBytes()      const { return compLz4TotalBytes_; }
     size_t   DrawCount()      const { return subs_.size(); }
+    uint64_t SubsBytes()      const { return (uint64_t)subs_.size() * sizeof(GpuSubMesh); }
+    ID3D11ShaderResourceView* ShadowSrv()        const { return shadowSrv_.Get(); }
+    ID3D11ShaderResourceView* ShadowFilledSrv()  const { return shadowFilledSrv_.Get(); }
+    uint32_t                  ShadowMapSize()    const { return shadowSize_; }
     uint32_t LastDrawnCount() const { return lastDrawn_; }
     uint64_t LastDrawnTris()  const { return lastDrawnTris_; }
     uint64_t LastPointCount() const { return lastPointCount_; }
@@ -170,6 +183,14 @@ private:
     ComPtr<ID3D11Texture2D>            splatFinalDepthTex_;
     ComPtr<ID3D11UnorderedAccessView>  splatFinalDepthUav_;
     ComPtr<ID3D11ShaderResourceView>   splatFinalDepthSrv_;
+    // Second-pass dilate output (ping-pong target).
+    ComPtr<ID3D11Texture2D>            splatFinal2Tex_;
+    ComPtr<ID3D11UnorderedAccessView>  splatFinal2Uav_;
+    ComPtr<ID3D11ShaderResourceView>   splatFinal2Srv_;
+    ComPtr<ID3D11Texture2D>            splatFinal2DepthTex_;
+    ComPtr<ID3D11UnorderedAccessView>  splatFinal2DepthUav_;
+    ComPtr<ID3D11ShaderResourceView>   splatFinal2DepthSrv_;
+    ComPtr<ID3D11ComputeShader>        csSplatFill_;
     // Per-pixel visMask emitted by point PS (MRT slot 1), consumed by CS to
     // restrict the normal-pick to faces that actually exist on that voxel.
     ComPtr<ID3D11Texture2D>            splatMaskTex_;
@@ -182,6 +203,33 @@ private:
     ComPtr<ID3D11InputLayout>    inputLayout_;
     ComPtr<ID3D11InputLayout>    inputLayoutHex_;
     ComPtr<ID3D11RasterizerState> rsNoCull_;
+
+    // Sun shadow (cascade 0 only for now).
+    ComPtr<ID3D11VertexShader>         vsShadow_;
+    ComPtr<ID3D11Texture2D>            shadowTex_;
+    ComPtr<ID3D11DepthStencilView>     shadowDsv_;
+    ComPtr<ID3D11ShaderResourceView>   shadowSrv_;
+    ComPtr<ID3D11SamplerState>         shadowSamp_;
+    ComPtr<ID3D11RasterizerState>      rsShadowBack_;     // cull back (default)
+    ComPtr<ID3D11RasterizerState>      rsShadowFront_;    // cull front (peter-pan trade)
+    // Shadow blur fill (post-caster) — neighbour-average pass for empty texels.
+    ComPtr<ID3D11Texture2D>            shadowFilledTex_;
+    ComPtr<ID3D11UnorderedAccessView>  shadowFilledUav_;
+    ComPtr<ID3D11ShaderResourceView>   shadowFilledSrv_;
+    ComPtr<ID3D11ComputeShader>        csShadowBlur_;
+    bool                               lastShadowBlur_ = false;
+    uint32_t                           shadowSize_ = 0;     // current allocated size
+    float                              shadowVP_[16]  = {};
+    float                              shadowBias_    = 0.0f;
+    float                              shadowEnable_  = 0.0f;
+    // Cached state for skipping the shadow caster pass when nothing relevant
+    // changed (sun direction, shadow map size, scene). Set lastSunDir_[0]=NaN
+    // to force a rebuild (used on scene upload).
+    float                              lastSunDir_[3] = { 0, 0, 0 };
+    uint32_t                           lastShadowSize_ = 0;
+    bool                               lastShadowCullFront_ = false;
+    int                                lastShadowLod_       = -2;
+    bool                               shadowMapDirty_ = true;
 
     // PointCS compute path
     ComPtr<ID3D11ComputeShader>  csPoints_;

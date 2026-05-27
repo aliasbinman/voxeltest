@@ -166,6 +166,12 @@ bool Renderer::CreateRenderTargets()
     splatFinalDepthTex_.Reset();
     splatFinalDepthUav_.Reset();
     splatFinalDepthSrv_.Reset();
+    splatFinal2Tex_.Reset();
+    splatFinal2Uav_.Reset();
+    splatFinal2Srv_.Reset();
+    splatFinal2DepthTex_.Reset();
+    splatFinal2DepthUav_.Reset();
+    splatFinal2DepthSrv_.Reset();
     splatMaskTex_.Reset();
     splatMaskRtv_.Reset();
     splatMaskSrv_.Reset();
@@ -281,6 +287,14 @@ bool Renderer::CreateRenderTargets()
     if (FAILED(device_->CreateUnorderedAccessView(splatFinalDepthTex_.Get(), nullptr, splatFinalDepthUav_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateShaderResourceView(splatFinalDepthTex_.Get(), nullptr, splatFinalDepthSrv_.GetAddressOf()))) return false;
 
+    // Second-pass dilate output (ping-pong target for csmain_splat_fill).
+    if (FAILED(device_->CreateTexture2D(&sd2, nullptr, splatFinal2Tex_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateUnorderedAccessView(splatFinal2Tex_.Get(), nullptr, splatFinal2Uav_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateShaderResourceView(splatFinal2Tex_.Get(), nullptr, splatFinal2Srv_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateTexture2D(&sdf, nullptr, splatFinal2DepthTex_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateUnorderedAccessView(splatFinal2DepthTex_.Get(), nullptr, splatFinal2DepthUav_.GetAddressOf()))) return false;
+    if (FAILED(device_->CreateShaderResourceView(splatFinal2DepthTex_.Get(), nullptr, splatFinal2DepthSrv_.GetAddressOf()))) return false;
+
     // Dedicated depth for splat pass.
     D3D11_TEXTURE2D_DESC sdd = {};
     sdd.Width = width_;
@@ -348,9 +362,10 @@ bool Renderer::CreateShaders()
         return true;
     };
 
-    ComPtr<ID3DBlob> vsbp, psbp;
+    ComPtr<ID3DBlob> vsbp, psbp, vsbSh;
     if (!compile("vsmain_points", "vs_5_0", vsbp)) return false;
     if (!compile("psmain_points", "ps_5_0", psbp)) return false;
+    if (!compile("vsmain_shadow", "vs_5_0", vsbSh)) return false;
     ComPtr<ID3DBlob> psbps;
     if (!compile("psmain_points_simple", "ps_5_0", psbps)) return false;
     // HexSprite disabled — see comment block in shaders/voxel.hlsl.
@@ -368,8 +383,11 @@ bool Renderer::CreateShaders()
     if (!compile("vsmain_billboard", "vs_5_0", vsbB)) return false;
     if (!compile("psmain_billboard", "ps_5_0", psbB)) return false;
     if (!compile("vsmain_billboard_tri", "vs_5_0", vsbBT)) return false;
-    ComPtr<ID3DBlob> csbSp, psbSa, vsbTa, psbTa, psbPo;
+    ComPtr<ID3DBlob> csbSp, psbSa, vsbTa, psbTa, psbPo, csbSpFill;
     if (!compile("csmain_splat",        "cs_5_0", csbSp)) return false;
+    if (!compile("csmain_splat_fill",   "cs_5_0", csbSpFill)) return false;
+    ComPtr<ID3DBlob> csbShBlur;
+    if (!compile("csmain_shadow_blur",  "cs_5_0", csbShBlur)) return false;
     if (!compile("psmain_splat_albedo", "ps_5_0", psbSa)) return false;
     ComPtr<ID3DBlob> psbSc;
     if (!compile("psmain_splat_composite", "ps_5_0", psbSc)) return false;
@@ -384,6 +402,8 @@ bool Renderer::CreateShaders()
     if (!compile("psmain_blit",      "ps_5_0", psbl)) return false;
 
     HRESULT hr;
+    hr = device_->CreateVertexShader(vsbSh->GetBufferPointer(), vsbSh->GetBufferSize(), nullptr, vsShadow_.GetAddressOf());
+    if (FAILED(hr)) return false;
     hr = device_->CreateVertexShader(vsbp->GetBufferPointer(), vsbp->GetBufferSize(), nullptr, vsPoints_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbp->GetBufferPointer(), psbp->GetBufferSize(), nullptr, psPoints_.GetAddressOf());
@@ -410,6 +430,10 @@ bool Renderer::CreateShaders()
     hr = device_->CreateVertexShader(vsbBT->GetBufferPointer(), vsbBT->GetBufferSize(), nullptr, vsBillboardTri_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreateComputeShader(csbSp->GetBufferPointer(), csbSp->GetBufferSize(), nullptr, csSplat_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    hr = device_->CreateComputeShader(csbSpFill->GetBufferPointer(), csbSpFill->GetBufferSize(), nullptr, csSplatFill_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    hr = device_->CreateComputeShader(csbShBlur->GetBufferPointer(), csbShBlur->GetBufferSize(), nullptr, csShadowBlur_.GetAddressOf());
     if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader(psbSa->GetBufferPointer(), psbSa->GetBufferSize(), nullptr, psSplatAlbedo_.GetAddressOf());
     if (FAILED(hr)) return false;
@@ -495,6 +519,28 @@ bool Renderer::CreatePipelineState()
     D3D11_RASTERIZER_DESC rdNo = rd;
     rdNo.CullMode = D3D11_CULL_NONE;
     if (FAILED(device_->CreateRasterizerState(&rdNo, rsNoCull_.GetAddressOf()))) return false;
+
+    // Shadow rasterizer: depth bias + slope-scaled bias to kill acne. Two
+    // variants — toggle between cull-back (default) and cull-front from the UI.
+    // Point splats are 1-pixel primitives so the cull mode has no effect on
+    // them; the toggle exists for future polygon shadow casters.
+    D3D11_RASTERIZER_DESC rdShB = rd;
+    rdShB.CullMode = D3D11_CULL_BACK;
+    rdShB.DepthBias = 4;
+    rdShB.SlopeScaledDepthBias = 2.0f;
+    rdShB.DepthClipEnable = TRUE;
+    if (FAILED(device_->CreateRasterizerState(&rdShB, rsShadowBack_.GetAddressOf()))) return false;
+    D3D11_RASTERIZER_DESC rdShF = rdShB;
+    rdShF.CullMode = D3D11_CULL_FRONT;
+    if (FAILED(device_->CreateRasterizerState(&rdShF, rsShadowFront_.GetAddressOf()))) return false;
+
+    // Comparison sampler for hardware PCF.
+    D3D11_SAMPLER_DESC ssd = {};
+    ssd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    ssd.AddressU = ssd.AddressV = ssd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    ssd.ComparisonFunc = D3D11_COMPARISON_GREATER_EQUAL;   // reverse-Z shadow
+    ssd.MinLOD = 0; ssd.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(device_->CreateSamplerState(&ssd, shadowSamp_.GetAddressOf()))) return false;
 
     D3D11_DEPTH_STENCIL_DESC dd = {};
     dd.DepthEnable = TRUE;
@@ -622,7 +668,9 @@ void Renderer::UploadScene(const Scene& scene)
 
     subs_.clear();
     subs_.reserve(scene.subs.size());
-    for (const auto& s : scene.subs) { 
+    // Force shadow map rebuild next frame (new geometry).
+    shadowMapDirty_ = true;
+    for (const auto& s : scene.subs) {
         GpuSubMesh gs;
         gs.pointFirst = s.pointFirst;
         gs.pointCount = s.pointCount;
@@ -896,10 +944,80 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         for (int i = 0; i < 16; ++i) cb.prevViewProj[i] = taaPrevVP_[i];
         cb.jitter[0] = jitterNdcX; cb.jitter[1] = jitterNdcY;
         cb._pad7[0] = cb._pad7[1] = 0;
-        for (int i = 0; i < 16; ++i) cb.sunViewProj[i] = 0.0f;
-        cb.shadowBias    = 0.0f;
-        cb.shadowMapSize = 1.0f;
-        cb.shadowEnable  = 0.0f;
+        // Sun shadow setup (cascade 0 only). Build ortho fit to scene AABB.
+        hlslpp::float4x4 sunVP{};
+        float sunVPstore[16] = {};
+        bool sunShadowsOn = args.sunShadows && pointSb_ && !subs_.empty();
+        if (sunShadowsOn) {
+            const uint32_t reqSize = (uint32_t)std::max(64, args.shadowMapSize);
+            if (shadowSize_ != reqSize) {
+                shadowTex_.Reset(); shadowDsv_.Reset(); shadowSrv_.Reset();
+                shadowFilledTex_.Reset(); shadowFilledUav_.Reset(); shadowFilledSrv_.Reset();
+                D3D11_TEXTURE2D_DESC td = {};
+                td.Width = reqSize; td.Height = reqSize;
+                td.MipLevels = 1; td.ArraySize = 1;
+                td.Format = DXGI_FORMAT_R32_TYPELESS;
+                td.SampleDesc.Count = 1;
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+                if (FAILED(device_->CreateTexture2D(&td, nullptr, shadowTex_.GetAddressOf()))) sunShadowsOn = false;
+                if (sunShadowsOn) {
+                    D3D11_DEPTH_STENCIL_VIEW_DESC dvd = {};
+                    dvd.Format = DXGI_FORMAT_D32_FLOAT;
+                    dvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                    device_->CreateDepthStencilView(shadowTex_.Get(), &dvd, shadowDsv_.GetAddressOf());
+                    D3D11_SHADER_RESOURCE_VIEW_DESC svd = {};
+                    svd.Format = DXGI_FORMAT_R32_FLOAT;
+                    svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    svd.Texture2D.MipLevels = 1;
+                    device_->CreateShaderResourceView(shadowTex_.Get(), &svd, shadowSrv_.GetAddressOf());
+                    // Filled copy (CS hole-fill target). R32_FLOAT, UAV+SRV.
+                    D3D11_TEXTURE2D_DESC tdf = {};
+                    tdf.Width = reqSize; tdf.Height = reqSize;
+                    tdf.MipLevels = 1; tdf.ArraySize = 1;
+                    tdf.Format = DXGI_FORMAT_R32_FLOAT;
+                    tdf.SampleDesc.Count = 1;
+                    tdf.Usage = D3D11_USAGE_DEFAULT;
+                    tdf.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+                    device_->CreateTexture2D(&tdf, nullptr, shadowFilledTex_.GetAddressOf());
+                    device_->CreateUnorderedAccessView(shadowFilledTex_.Get(), nullptr, shadowFilledUav_.GetAddressOf());
+                    device_->CreateShaderResourceView(shadowFilledTex_.Get(), nullptr, shadowFilledSrv_.GetAddressOf());
+                    shadowSize_ = reqSize;
+                }
+            }
+        }
+        if (sunShadowsOn) {
+            hlslpp::float3 sceneMin  (sceneOrigin_[0], sceneOrigin_[1], sceneOrigin_[2]);
+            hlslpp::float3 sceneSpan3(sceneSpan_[0],   sceneSpan_[1],   sceneSpan_[2]);
+            hlslpp::float3 center = sceneMin + sceneSpan3 * 0.5f;
+            float radius = 0.5f * (float)hlslpp::length(sceneSpan3);
+            if (radius < 1.0f) radius = 1.0f;
+            hlslpp::float3 sd = hlslpp::normalize(
+                hlslpp::float3(args.sunDir[0], args.sunDir[1], args.sunDir[2]));
+            hlslpp::float3 eye = center + sd * (radius * 2.0f);
+            float sy = (float)sd.y;
+            hlslpp::float3 upRef = (std::fabs(sy) > 0.99f)
+                ? hlslpp::float3(0.0f, 0.0f, 1.0f)
+                : hlslpp::float3(0.0f, 1.0f, 0.0f);
+            hlslpp::float4x4 sunView = hlslpp::float4x4::look_at(eye, center, upRef);
+            const float wO = radius * 2.5f, hO = radius * 2.5f;
+            const float zn = 0.0f, zf = radius * 4.0f;
+            // LH reverse-Z ortho, row-major (vector * matrix).
+            hlslpp::float4x4 sunProj(
+                2.0f / wO, 0,          0,                0,
+                0,          2.0f / hO, 0,                0,
+                0,          0,          -1.0f / (zf - zn), 0,
+                0,          0,          zf / (zf - zn),    1);
+            sunVP = hlslpp::mul(sunView, sunProj);
+            hlslpp::store(sunVPstore, sunVP);
+        }
+        for (int i = 0; i < 16; ++i) cb.sunViewProj[i] = sunShadowsOn ? sunVPstore[i] : 0.0f;
+        for (int i = 0; i < 16; ++i) shadowVP_[i] = sunVPstore[i];
+        cb.shadowBias    = args.shadowBias;
+        cb.shadowMapSize = (float)shadowSize_;
+        cb.shadowEnable  = sunShadowsOn ? 1.0f : 0.0f;
+        shadowBias_   = args.shadowBias;
+        shadowEnable_ = cb.shadowEnable;
         cb.sunIntensity  = sunIntensity;
         cb.exposure      = exposure;
         cb.roughness     = roughness;
@@ -918,6 +1036,149 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
 
     if (!pointSb_) return;
+
+    // ---- Sun shadow caster pass (cascade 0) ----
+    // Skip if nothing relevant changed since the last bake.
+    if (shadowEnable_ > 0.5f && shadowDsv_ && pointSb_) {
+        const float epsDir = 1e-4f;
+        bool dirChanged =
+              std::fabs(args.sunDir[0] - lastSunDir_[0]) > epsDir
+           || std::fabs(args.sunDir[1] - lastSunDir_[1]) > epsDir
+           || std::fabs(args.sunDir[2] - lastSunDir_[2]) > epsDir;
+        bool sizeChanged    = (shadowSize_ != lastShadowSize_);
+        bool cullChanged    = (args.shadowCullFront != lastShadowCullFront_);
+        bool lodChanged     = (args.shadowLod != lastShadowLod_);
+        bool blurChanged    = (args.shadowBlur != lastShadowBlur_);
+        if (!args.shadowForceRebuild && !shadowMapDirty_ && !dirChanged && !sizeChanged && !cullChanged && !lodChanged && !blurChanged) {
+            // Reuse cached shadow tex from previous frame. Still bind SRV +
+            // sampler for downstream lit passes. Pick blurred copy if active.
+            ID3D11RenderTargetView* mainRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
+            ID3D11RenderTargetView* mainRtvs[] = { mainRtv };
+            ctx_->OMSetRenderTargets(1, mainRtvs, dsv_.Get());
+            ID3D11ShaderResourceView* shSrv[] = {
+                (lastShadowBlur_ && shadowFilledSrv_) ? shadowFilledSrv_.Get() : shadowSrv_.Get()
+            };
+            ctx_->PSSetShaderResources(6, 1, shSrv);
+            ID3D11SamplerState* shSm[] = { shadowSamp_.Get() };
+            ctx_->PSSetSamplers(1, 1, shSm);
+            goto shadowDone;
+        }
+        MICROPROFILE_SCOPEGPUI("Shadow", 0xff909090);
+        ID3D11RenderTargetView* nullRtv[] = { nullptr };
+        ctx_->OMSetRenderTargets(1, nullRtv, shadowDsv_.Get());
+        ctx_->ClearDepthStencilView(shadowDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        D3D11_VIEWPORT svp = { 0, 0, (float)shadowSize_, (float)shadowSize_, 0.0f, 1.0f };
+        ctx_->RSSetViewports(1, &svp);
+        ctx_->RSSetState(args.shadowCullFront ? rsShadowFront_.Get() : rsShadowBack_.Get());
+        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+        ctx_->IASetInputLayout(nullptr);
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+        ID3D11Buffer* nullVbs[] = { nullptr };
+        UINT zs = 0;
+        ctx_->IASetVertexBuffers(0, 1, nullVbs, &zs, &zs);
+        ctx_->VSSetShader(vsShadow_.Get(), nullptr, 0);
+        ctx_->PSSetShader(nullptr, nullptr, 0);
+        ID3D11ShaderResourceView* vsSrvs[] = { nullptr, pointSrv_.Get() };
+        ctx_->VSSetShaderResources(0, 2, vsSrvs);
+
+        // Auto-LOD: pick the coarsest LOD whose voxel size is still smaller
+        // than a shadow-map pixel. Eliminates per-pixel ROP contention from
+        // 100s of L0 voxels collapsing onto the same shadow texel.
+        int castLod = args.shadowLod;
+        if (castLod < 0) {
+            const float orthoWorldW = std::max(sceneSpan_[0], sceneSpan_[2]) * 1.25f;
+            const float pxWorld = orthoWorldW / std::max(1.0f, (float)shadowSize_);
+            if      (pxWorld >= 8.0f) castLod = 3;
+            else if (pxWorld >= 4.0f) castLod = 2;
+            else if (pxWorld >= 2.0f) castLod = 1;
+            else                      castLod = 0;
+        }
+        if (castLod < 0) castLod = 0; if (castLod > 3) castLod = 3;
+        const float halfExtArr[4] = { 0.5f, 1.0f, 2.0f, 4.0f };
+        float halfExtCast = halfExtArr[castLod];
+
+        // Render each chunk at the picked LOD; fall back to a finer LOD if the
+        // chunk has zero voxels at that level.
+        for (const auto& gs : subs_) {
+            uint32_t pf = 0, pc = 0;
+            int useLod = castLod;
+            while (useLod >= 0) {
+                if      (useLod == 0) { pf = gs.pointFirst;   pc = gs.pointCount;   }
+                else if (useLod == 1) { pf = gs.pointFirstL1; pc = gs.pointCountL1; }
+                else if (useLod == 2) { pf = gs.pointFirstL2; pc = gs.pointCountL2; }
+                else                  { pf = gs.pointFirstL3; pc = gs.pointCountL3; }
+                if (pc > 0) break;
+                --useLod;
+            }
+            if (pc == 0) continue;
+            float halfExtUse = halfExtArr[useLod < 0 ? 0 : useLod];
+            D3D11_MAPPED_SUBRESOURCE mm;
+            ctx_->Map(cbPerChunk_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+            CBPerChunk cc = {};
+            cc.chunkBase[0] = sceneOrigin_[0];
+            cc.chunkBase[1] = sceneOrigin_[1];
+            cc.chunkBase[2] = sceneOrigin_[2];
+            cc._pad        = halfExtUse;
+            cc.voxelBase   = pf;
+            cc.chunkLodIdx = (uint32_t)(useLod < 0 ? 0 : useLod);
+            cc.chunkTint   = 0;
+            memcpy(mm.pData, &cc, sizeof(cc));
+            ctx_->Unmap(cbPerChunk_.Get(), 0);
+            ctx_->Draw(pc, 0);
+        }
+        (void)halfExtCast;
+        // Detach DSV (the shadow tex needs to be SRV-bindable).
+        ID3D11RenderTargetView* nullRtv2[] = { nullptr };
+        ctx_->OMSetRenderTargets(1, nullRtv2, nullptr);
+
+        // ---- Optional blur fill pass (CS): replace empty texels with neighbour avg ----
+        if (args.shadowBlur && csShadowBlur_ && shadowFilledUav_) {
+            MICROPROFILE_SCOPEGPUI("ShadowBlur", 0xff80a0a0);
+            ctx_->CSSetShader(csShadowBlur_.Get(), nullptr, 0);
+            ID3D11Buffer* csCbs[] = { cbPerFrame_.Get() };
+            ctx_->CSSetConstantBuffers(0, 1, csCbs);
+            ID3D11ShaderResourceView* srcSrv[] = { shadowSrv_.Get() };
+            ctx_->CSSetShaderResources(7, 1, srcSrv);            // gShadowSrcTex
+            ID3D11UnorderedAccessView* dstUav[] = { shadowFilledUav_.Get() };
+            UINT initc[] = { 0 };
+            ctx_->CSSetUnorderedAccessViews(3, 1, dstUav, initc);
+            UINT gx = (shadowSize_ + 7) / 8;
+            UINT gy = (shadowSize_ + 7) / 8;
+            ctx_->Dispatch(gx, gy, 1);
+            ID3D11ShaderResourceView* nullSrv[] = { nullptr };
+            ctx_->CSSetShaderResources(7, 1, nullSrv);
+            ID3D11UnorderedAccessView* nullUav[] = { nullptr };
+            ctx_->CSSetUnorderedAccessViews(3, 1, nullUav, initc);
+            ctx_->CSSetShader(nullptr, nullptr, 0);
+        }
+
+        // Restore main RT + DSV. Without this, any tech that doesn't re-bind
+        // RTV itself (PolyAxis, Points, etc.) would draw into a null target.
+        ID3D11RenderTargetView* mainRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
+        ID3D11RenderTargetView* mainRtvs[] = { mainRtv };
+        ctx_->OMSetRenderTargets(1, mainRtvs, dsv_.Get());
+        D3D11_VIEWPORT mvp = { 0, 0, (float)width_, (float)height_, 0.0f, 1.0f };
+        ctx_->RSSetViewports(1, &mvp);
+        ctx_->RSSetState(rsSolid_.Get());
+        // Bind shadow SRV at t6 + comparison sampler at s1 for all lit passes.
+        // Choose filled copy if blur active.
+        ID3D11ShaderResourceView* shSrv[] = {
+            (args.shadowBlur && shadowFilledSrv_) ? shadowFilledSrv_.Get() : shadowSrv_.Get()
+        };
+        ctx_->PSSetShaderResources(6, 1, shSrv);
+        ID3D11SamplerState* shSm[] = { shadowSamp_.Get() };
+        ctx_->PSSetSamplers(1, 1, shSm);
+        // Update cache so subsequent frames can skip the caster pass.
+        lastSunDir_[0] = args.sunDir[0];
+        lastSunDir_[1] = args.sunDir[1];
+        lastSunDir_[2] = args.sunDir[2];
+        lastShadowSize_ = shadowSize_;
+        lastShadowCullFront_ = args.shadowCullFront;
+        lastShadowLod_       = args.shadowLod;
+        lastShadowBlur_      = args.shadowBlur;
+        shadowMapDirty_ = false;
+    }
+    shadowDone:;
 
     // Extract 6 frustum planes from row-major viewProj.
     float M[16];
@@ -994,6 +1255,8 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         }
         return true;
     };
+    {
+    MICROPROFILE_SCOPEI("CPU", "BuildJobs", 0xffffa0a0);
     for (int gz = 0; gz < gridSize; ++gz) {
         for (int gx = 0; gx < gridSize; ++gx) {
             float ox = gx * spanX;
@@ -1038,6 +1301,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             }
         }
     }
+    } // BuildJobs
 
     UINT stride = sizeof(Vertex);
     UINT offset = 0;
@@ -1084,6 +1348,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     if (!jobs.empty() && pointSb_ && splatColorRtv_ && splatFinalUav_)
     {
         MICROPROFILE_SCOPEGPUI("Splat", 0xffffd060);
+        MICROPROFILE_SCOPEI("CPU", "Splat", 0xffffd060);
         float clr[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
         ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clr);
         const float zeroClear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -1149,8 +1414,22 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->CSSetShader(csSplat_.Get(), nullptr, 0);
             ID3D11Buffer* csCbs[] = { cbPerFrame_.Get() };
             ctx_->CSSetConstantBuffers(0, 1, csCbs);
+            // t0..t3: splat dilation source. t6: sun shadow map (so the CS-side
+            // ApplyShadowLighting -> SampleShadow can sample).
             ID3D11ShaderResourceView* csSrvs[] = { nullptr, splatDepthSrv_.Get(), splatColorSrv_.Get(), splatMaskSrv_.Get() };
             ctx_->CSSetShaderResources(0, 4, csSrvs);
+            {
+                ID3D11ShaderResourceView* effectiveSrv =
+                    (args.shadowBlur && shadowFilledSrv_) ? shadowFilledSrv_.Get() : shadowSrv_.Get();
+                if (effectiveSrv) {
+                    ID3D11ShaderResourceView* shSrvCS[] = { effectiveSrv };
+                    ctx_->CSSetShaderResources(6, 1, shSrvCS);
+                }
+            }
+            if (shadowSamp_) {
+                ID3D11SamplerState* shSmCS[] = { shadowSamp_.Get() };
+                ctx_->CSSetSamplers(1, 1, shSmCS);
+            }
             ID3D11UnorderedAccessView* csUavs[] = { nullptr, splatFinalUav_.Get(), splatFinalDepthUav_.Get() };
             UINT initc[] = { 0, 0, 0 };
             ctx_->CSSetUnorderedAccessViews(0, 3, csUavs, initc);
@@ -1159,8 +1438,28 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->Dispatch(gx, gy, 1);
             ID3D11ShaderResourceView* nullCsSrvs[] = { nullptr, nullptr, nullptr, nullptr };
             ctx_->CSSetShaderResources(0, 4, nullCsSrvs);
+            ID3D11ShaderResourceView* nullShCS[] = { nullptr };
+            ctx_->CSSetShaderResources(6, 1, nullShCS);
             ID3D11UnorderedAccessView* nullCsUavs[] = { nullptr, nullptr, nullptr };
             ctx_->CSSetUnorderedAccessViews(0, 3, nullCsUavs, initc);
+
+            // ---- Pass 2: hole-fill on pass-1 output ----
+            // Reads pass-1 color/depth, fills alpha==0 pixels from nearest
+            // filled neighbour. Output ping-pongs into splatFinal2*.
+            if (args.splatDilate2Pass && csSplatFill_ && splatFinal2Uav_) {
+                MICROPROFILE_SCOPEGPUI("Splat/CS2", 0xffff8020);
+                ctx_->CSSetShader(csSplatFill_.Get(), nullptr, 0);
+                // Inputs (pass-1 output) at t1 (depth) + t2 (color).
+                ID3D11ShaderResourceView* csSrvs2[] = { nullptr, splatFinalDepthSrv_.Get(), splatFinalSrv_.Get() };
+                ctx_->CSSetShaderResources(0, 3, csSrvs2);
+                ID3D11UnorderedAccessView* csUavs2[] = { nullptr, splatFinal2Uav_.Get(), splatFinal2DepthUav_.Get() };
+                UINT initc2[] = { 0, 0, 0 };
+                ctx_->CSSetUnorderedAccessViews(0, 3, csUavs2, initc2);
+                ctx_->Dispatch(gx, gy, 1);
+                ID3D11ShaderResourceView* nullCsSrvs2[] = { nullptr, nullptr, nullptr };
+                ctx_->CSSetShaderResources(0, 3, nullCsSrvs2);
+                ctx_->CSSetUnorderedAccessViews(0, 3, nullCsUavs, initc2);
+            }
             ctx_->CSSetShader(nullptr, nullptr, 0);
         }
 
@@ -1175,10 +1474,16 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->IASetVertexBuffers(0, 1, nVb, &zz, &zz);
         ctx_->VSSetShader(vsBlit_.Get(), nullptr, 0);
         ctx_->PSSetShader(psSplatComposite_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* compSrv[] = { splatFilter ? splatFinalSrv_.Get() : splatColorSrv_.Get() };
+        // If 2-pass is enabled, sample from pass-2 ping-pong target.
+        const bool use2 = splatFilter && args.splatDilate2Pass && splatFinal2Srv_;
+        ID3D11ShaderResourceView* compSrv[] = {
+            !splatFilter ? splatColorSrv_.Get()
+                          : (use2 ? splatFinal2Srv_.Get() : splatFinalSrv_.Get())
+        };
         ctx_->PSSetShaderResources(8, 1, compSrv);
         ID3D11ShaderResourceView* compDepthSrv[] = {
-            splatFilter ? splatFinalDepthSrv_.Get() : splatDepthSrv_.Get()
+            !splatFilter ? splatDepthSrv_.Get()
+                          : (use2 ? splatFinal2DepthSrv_.Get() : splatFinalDepthSrv_.Get())
         };
         ctx_->PSSetShaderResources(7, 1, compDepthSrv);
         ctx_->OMSetBlendState(bsAlphaOver_.Get(), nullptr, 0xFFFFFFFFu);
@@ -1201,6 +1506,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     auto& jobs = jobsByTech[(int)RenderTech::Points];
     if (!jobs.empty() && pointSb_) {
         MICROPROFILE_SCOPEGPUI("Points", 0xff80ff80);
+        MICROPROFILE_SCOPEI("CPU", "Points", 0xff80ff80);
         curTint = 2;
         // No VB — VS pulls voxel data from pointSrv_ at t1 via SV_VertexID.
         ctx_->IASetInputLayout(nullptr);
@@ -1255,6 +1561,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     auto& jobs = jobsByTech[(int)RenderTech::PointCS];
     if (!jobs.empty() && pointSb_ && pointSrv_ && csColorUav_) {
         MICROPROFILE_SCOPEGPUI("PointCS", 0xff80c0a0);
+        MICROPROFILE_SCOPEI("CPU", "PointCS", 0xff80c0a0);
         curTint = 2;
         uint32_t clearC[4] = { 0xFF291F1Au, 0, 0, 0 };
         ctx_->ClearUnorderedAccessViewUint(csColorUav_.Get(), clearC);
@@ -1333,6 +1640,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     auto& jobs = jobsByTech[(int)RenderTech::PolyVID];
     if (!jobs.empty() && pointSrv_ && polyVidIb_) {
         MICROPROFILE_SCOPEGPUI("PolyVID", 0xff70b0ff);
+        MICROPROFILE_SCOPEI("CPU", "PolyVID", 0xff70b0ff);
         curTint = 1;
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1364,6 +1672,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     auto& jobs = jobsByTech[(int)RenderTech::PolyAxis];
     if (!jobs.empty() && pointSrv_) {
         MICROPROFILE_SCOPEGPUI("PolyAxis", 0xff60a0e0);
+        MICROPROFILE_SCOPEI("CPU", "PolyAxis", 0xff60a0e0);
         curTint = 1;
         if (pointAo6Srv_) {
             ID3D11ShaderResourceView* aoSrvs[] = { pointAo6Srv_.Get() };
@@ -1397,6 +1706,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     auto& jobs = jobsByTech[(int)RenderTech::PolyAxisInstanced];
     if (!jobs.empty() && pointSrv_) {
         MICROPROFILE_SCOPEGPUI("PolyAxisInst", 0xff5090d0);
+        MICROPROFILE_SCOPEI("CPU", "PolyAxisInst", 0xff5090d0);
         curTint = 1;
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1430,6 +1740,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     auto& jobs = jobsByTech[(int)RenderTech::Billboard];
     if (!jobs.empty() && pointSrv_ && billboardIb_) {
         MICROPROFILE_SCOPEGPUI("Billboard", 0xffa0c060);
+        MICROPROFILE_SCOPEI("CPU", "Billboard", 0xffa0c060);
         curTint = 2;
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1462,6 +1773,7 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     auto& jobs = jobsByTech[(int)RenderTech::BillboardTri];
     if (!jobs.empty() && pointSrv_) {
         MICROPROFILE_SCOPEGPUI("BillboardTri", 0xff90b050);
+        MICROPROFILE_SCOPEI("CPU", "BillboardTri", 0xff90b050);
         curTint = 2;
         ctx_->IASetInputLayout(nullptr);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

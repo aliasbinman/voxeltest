@@ -106,7 +106,126 @@ struct Field {
     }
 };
 
-// ---------------- Erosion (droplet hydraulic) ----------------
+// ---------------- Analytical erosion filter (Runevision style) ----------------
+// Per-cell, stateless, no simulation. Stacks oriented stripe noise across
+// octaves; each octave's stripes are perpendicular to the (modulated) gradient,
+// so they line up into dendritic gullies/ridges. Fast and embarrassingly
+// parallel; runs entirely from local data.
+//
+// Caveats from the source: gullies are interpolated sines, not traced flow,
+// so they can break partway down a slope. Run the depression-fill + river
+// tracer afterwards if you need continuous drainage.
+static inline float Hash01(int x, int z) {
+    uint32_t h = (uint32_t)(x * 73856093) ^ (uint32_t)(z * 19349663);
+    h = (h ^ (h >> 16)) * 2654435761u;
+    h ^= h >> 16;
+    return (float)(h & 0xFFFFFF) / (float)0x1000000;
+}
+static inline float Saturate(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+static inline float EaseOut(float t)  { float s = 1.0f - Saturate(t); return 1.0f - s * s; }
+static inline float PowInv(float t, float p) { return 1.0f - std::pow(1.0f - Saturate(t), p); }
+
+static void ErosionFilter(Field& H, int octaves,
+                          float baseCellSize,    // largest cell side in voxels
+                          float gullyWeight,     // 0..1, ridge sharpness
+                          float erosionAmp,      // scales gully height contribution
+                          float detail)          // mask compounding exponent
+{
+    const int W = H.W, Z = H.H;
+    // Sample h range for fadeTarget normalisation.
+    float hMin = 1e30f, hMax = -1e30f;
+    for (float v : H.data) { if (v < hMin) hMin = v; if (v > hMax) hMax = v; }
+    const float hRange = std::max(1.0f, hMax - hMin);
+
+    Field out(W, Z);
+
+    auto computeGrad = [&](int x, int z, float& gx, float& gz) {
+        int xm = std::max(0, x - 1), xp = std::min(W - 1, x + 1);
+        int zm = std::max(0, z - 1), zp = std::min(Z - 1, z + 1);
+        gx = (H.at(xp, z) - H.at(xm, z)) * 0.5f;
+        gz = (H.at(x, zp) - H.at(x, zm)) * 0.5f;
+    };
+
+    const float twoPi = 6.28318530718f;
+
+    #pragma omp parallel for schedule(dynamic, 32)
+    for (int z = 0; z < Z; ++z) {
+        for (int x = 0; x < W; ++x) {
+            float h = H.at(x, z);
+            float gx, gz; computeGrad(x, z, gx, gz);
+            float fadeTarget = ((h - hMin) / hRange) * 2.0f - 1.0f;
+            float combiMask  = 1.0f;
+            float gradX = gx, gradZ = gz;
+            float heightOut = h;
+            float cellSize = baseCellSize;
+
+            for (int n = 0; n < octaves; ++n) {
+                // Anti-gradient direction (downhill).
+                float gl = std::sqrt(gradX * gradX + gradZ * gradZ);
+                if (gl < 1e-5f) gl = 1e-5f;
+                float ngx = -gradX / gl, ngz = -gradZ / gl;
+                // Perpendicular axis (along stripe).
+                float perpX = -ngz, perpZ = ngx;
+
+                // Worley cell for this point.
+                float cx = x / cellSize, cz = z / cellSize;
+                int icx = (int)std::floor(cx), icz = (int)std::floor(cz);
+
+                // Accumulate stripe (cos, sin) from 3×3 neighbour cells.
+                float accCos = 0.0f, accSin = 0.0f, accW = 0.0f;
+                for (int dzi = -1; dzi <= 1; ++dzi) {
+                    for (int dxi = -1; dxi <= 1; ++dxi) {
+                        int nx = icx + dxi, nz = icz + dzi;
+                        float px = (nx + Hash01(nx, nz)) * cellSize;
+                        float pz = (nz + Hash01(nx + 977, nz + 31)) * cellSize;
+                        float vx = (float)x - px, vz = (float)z - pz;
+                        // Along-gradient distance -> stripe phase.
+                        float d  = vx * ngx + vz * ngz;
+                        // Perpendicular distance -> blend weight (further off the
+                        // pivot's centreline contributes less).
+                        float perpD = vx * perpX + vz * perpZ;
+                        float w = std::exp(-(perpD * perpD) / (cellSize * cellSize));
+                        float phase = d * twoPi / cellSize;
+                        accCos += std::cos(phase) * w;
+                        accSin += std::sin(phase) * w;
+                        accW   += w;
+                    }
+                }
+                if (accW > 1e-6f) { accCos /= accW; accSin /= accW; }
+
+                // Magnitude clamp: prevent spikes when stripes constructively pile up.
+                float m = std::sqrt(accCos * accCos + accSin * accSin);
+                if (m > 0.5f) { float k = 0.5f / m; accCos *= k; accSin *= k; }
+
+                // Straight-gully trick: use sign(sin) so branch angles don't curl.
+                float slopeSign = accSin >= 0.0f ? 1.0f : -1.0f;
+
+                // Slope magnitude estimate (driving the mask).
+                float slopeMag = std::fabs(accSin);
+                float newMask  = EaseOut(slopeMag * 2.0f);
+                combiMask = PowInv(combiMask, detail) * newMask;
+
+                // Mix toward fade target on flats, gully on ridges/creases.
+                float gullyFaded = fadeTarget * (1.0f - combiMask) + accCos * combiMask;
+                fadeTarget = gullyFaded;
+
+                // Add to height. Erosion strength scales with cell size so big
+                // ridges shape the silhouette more than fine ridges.
+                heightOut += gullyFaded * erosionAmp * (cellSize / baseCellSize);
+
+                // Bend gradient for next octave so finer gullies trace coarse ones.
+                gradX += slopeSign * (-gradZ) * gullyWeight;
+                gradZ += slopeSign * ( gradX) * gullyWeight;
+
+                cellSize *= 0.5f;
+            }
+            out.at(x, z) = heightOut;
+        }
+    }
+    H = std::move(out);
+}
+
+// ---------------- Erosion (droplet hydraulic) — kept for reference ----------------
 static void ErodeHeightmap(Field& H, int numDroplets, std::mt19937& rng) {
     const int   maxLifetime    = 30;
     const float inertia        = 0.05f;
@@ -220,8 +339,13 @@ int main(int argc, char** argv)
     float  worldM = 8192.0f;
     float  metersPerVoxel = 1.5f;
     int    chunkDim = 64;
-    int    numDroplets = 200000;
-    int    aoReach = 8;          // top-face AO sampling radius in voxels
+    int    numDroplets = 200000;     // legacy, droplet erosion disabled by default
+    int    filterOctaves = 6;
+    float  filterCellSize = 120.0f;  // largest stripe cell, in voxels
+    float  filterGullyWeight = 0.5f;
+    float  filterErosionAmp  = 8.0f;
+    float  filterDetail      = 1.6f;
+    int    aoReach = 8;
     std::string outPath = "assets/landscape.vox";
 
     for (int i = 1; i < argc; ++i) {
@@ -230,6 +354,11 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--scale")    && i + 1 < argc) metersPerVoxel = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--chunk")    && i + 1 < argc) chunkDim = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--droplets") && i + 1 < argc) numDroplets = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--foct")     && i + 1 < argc) filterOctaves = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--fcell")    && i + 1 < argc) filterCellSize = (float)std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--fgully")   && i + 1 < argc) filterGullyWeight = (float)std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--famp")     && i + 1 < argc) filterErosionAmp = (float)std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--fdetail")  && i + 1 < argc) filterDetail = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--aoreach")  && i + 1 < argc) aoReach = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--out")      && i + 1 < argc) outPath = argv[++i];
         else { std::fprintf(stderr, "unknown arg: %s\n", argv[i]); return 1; }
@@ -311,12 +440,12 @@ int main(int argc, char** argv)
         }
     }
 
-    // ---- 4. Erosion ----
-    std::printf("Eroding with %d droplets...\n", numDroplets);
-    {
-        std::mt19937 rng((uint32_t)seed);
-        ErodeHeightmap(Hm, numDroplets, rng);
-    }
+    // ---- 4. Erosion (Runevision analytical filter) ----
+    std::printf("Erosion filter: %d octaves, cellSize=%.1f, gullyW=%.2f, amp=%.2f, detail=%.2f\n",
+                filterOctaves, filterCellSize, filterGullyWeight, filterErosionAmp, filterDetail);
+    ErosionFilter(Hm, filterOctaves, filterCellSize,
+                  filterGullyWeight, filterErosionAmp, filterDetail);
+    (void)numDroplets;
 
     // ---- 5. Depression fill (lakes) ----
     // Priority flood from the boundary: each cell's water level = max of its

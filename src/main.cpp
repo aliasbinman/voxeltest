@@ -84,13 +84,21 @@ struct AppState {
     Renderer renderer;
     Camera   camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech  tech    = RenderTech::Splat;     // close tech
+    RenderTech  tech    = RenderTech::PolyAxis;  // close tech
     RenderTech  techFar = RenderTech::Splat;     // far tech
     bool        closeEnabled = true;
     bool        farEnabled   = true;
     float    sunPitchDeg = 60.0f;
     float    sunYawDeg   = 63.0f;
     float    sunIntensityEV = 0.0f;     // log2 stops; linear = 2^EV
+    bool     sunShadows  = true;
+    int      shadowCascades  = 1;       // 1..4 (only cascade 0 active)
+    int      shadowMapSizeIdx = 2;      // index into {512,1024,2048,4096}
+    float    shadowBias  = 0.00015f;
+    bool     shadowCullFront = false;
+    bool     shadowForceRebuild = false;
+    int      shadowLodIdx = 0;  // 0=Auto, 1..4 = L0..L3
+    bool     shadowBlur = false;
     float    exposureEV     = 0.0f;     // log2 stops; linear = 2^EV
     float    roughness      = 0.6f;
     bool     vsync = false;
@@ -100,6 +108,7 @@ struct AppState {
     PointLod pointLod = PointLod::Auto;
     float    pointLodScale = 1.0f;
     bool     splatFilter = true;
+    bool     splatDilate2Pass = false;
     int      splatRadius = 3;       // CS dilation half-window in pixels
     int      fogMode = 1;        // 0 = off, 1 = depth (drives effFogDensity gating)
     float    fogDensity = 0.0004f;
@@ -294,6 +303,22 @@ void FrameStatsWindow()
         ImGui::Text("  Point VB + AO6:   %7.2f MB", mb(pb));
         ImGui::Text("  Splat RTs/UAVs:   %7.2f MB", mb(rt));
         ImGui::Text("  TOTAL:            %7.2f MB", mb(pb + rt));
+    }
+
+    ImGui::Separator();
+    ImGui::Text("CPU Memory (world)");
+    {
+        const uint64_t subsB = g_app.renderer.SubsBytes();
+        const uint64_t compSubsB = g_app.compScene.subs.size() * sizeof(SubMesh);
+        const uint64_t compHistB = g_app.compScene.colorHistogram.size()
+                                 * sizeof(std::pair<uint32_t, uint64_t>);
+        const uint64_t total = subsB + compSubsB + compHistB;
+        ImGui::Text("  Renderer subs_:        %7.2f MB  (%zu chunks)",
+                    mb(subsB), (size_t)g_app.renderer.DrawCount());
+        ImGui::Text("  Compress-scene mirror: %7.2f MB  (subs %zu + hist %zu)",
+                    mb(compSubsB + compHistB),
+                    g_app.compScene.subs.size(), g_app.compScene.colorHistogram.size());
+        ImGui::Text("  TOTAL:                 %7.2f MB", mb(total));
     }
 
     ImGui::Separator();
@@ -495,6 +520,7 @@ void FrameControlsWindow()
     }
     ImGui::SliderFloat("LOD distance", &g_app.pointLodScale, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
     ImGui::Checkbox("Splat CS filter", &g_app.splatFilter);
+    ImGui::Checkbox("Splat 2-pass dilate", &g_app.splatDilate2Pass);
     ImGui::SliderInt("Splat radius", &g_app.splatRadius, 1, 16);
     if (ImGui::CollapsingHeader("Fog")) {
         const char* fogModes[] = { "Off", "Depth" };
@@ -521,20 +547,62 @@ void FrameControlsWindow()
     ImGui::Checkbox("VSync", &g_app.vsync);
     ImGui::SliderInt("Grid size", &g_app.gridSize, 1, 10);
     ImGui::Checkbox("TAA", &g_app.taa);
-    ImGui::SliderFloat("Sun pitch",     &g_app.sunPitchDeg, 5.0f, 89.0f, "%.1f deg");
-    ImGui::SliderFloat("Sun yaw",       &g_app.sunYawDeg, -180.0f, 180.0f, "%.1f deg");
-    ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
-    ImGui::SliderFloat("Exposure",      &g_app.exposureEV,     -3.0f, 3.0f, "%.2f EV");
-    ImGui::SliderFloat("Roughness",     &g_app.roughness,       0.05f, 1.0f, "%.2f");
-    ImGui::ColorEdit3("Clear color", g_app.bgColor);
 
-    ImGui::Separator();
-    ImGui::Text("Camera");
-    ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-    ImGui::SliderFloat("FOV", &g_app.camera.fovDeg, 30.0f, 110.0f, "%.0f");
+    if (ImGui::BeginTabBar("##controlTabs")) {
+        if (ImGui::BeginTabItem("Render")) {
+            ImGui::SliderFloat("Sun pitch",     &g_app.sunPitchDeg, 5.0f, 89.0f, "%.1f deg");
+            ImGui::SliderFloat("Sun yaw",       &g_app.sunYawDeg, -180.0f, 180.0f, "%.1f deg");
+            ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
+            ImGui::SliderFloat("Exposure",      &g_app.exposureEV,     -3.0f, 3.0f, "%.2f EV");
+            ImGui::SliderFloat("Roughness",     &g_app.roughness,       0.05f, 1.0f, "%.2f");
+            ImGui::ColorEdit3("Clear color", g_app.bgColor);
+            ImGui::Separator();
+            ImGui::Text("Camera");
+            ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("FOV", &g_app.camera.fovDeg, 30.0f, 110.0f, "%.0f");
+            ImGui::Separator();
+            ImGui::TextUnformatted("RMB drag: look | WASD: move | Wheel: speed | Q/E or Ctrl/Space: down/up");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Shadow")) {
+            ImGui::Checkbox("Sun shadows",  &g_app.sunShadows);
+            ImGui::SliderInt("Cascades",    &g_app.shadowCascades, 1, 4, "%d (only 1 wired)");
+            {
+                const char* sizes[] = { "512", "1024", "2048", "4096" };
+                int idx = std::clamp(g_app.shadowMapSizeIdx, 0, 3);
+                if (ImGui::Combo("Shadow map", &idx, sizes, IM_ARRAYSIZE(sizes))) {
+                    g_app.shadowMapSizeIdx = idx;
+                }
+            }
+            ImGui::SliderFloat("Shadow bias", &g_app.shadowBias, 0.0f, 0.01f, "%.4f");
+            ImGui::Checkbox("Shadow cull front (else back)", &g_app.shadowCullFront);
+            ImGui::Checkbox("Force shadow rebuild (profiling)", &g_app.shadowForceRebuild);
+            {
+                const char* slods[] = { "Auto", "L0", "L1", "L2", "L3" };
+                ImGui::Combo("Shadow LOD", &g_app.shadowLodIdx, slods, IM_ARRAYSIZE(slods));
+            }
+            ImGui::Checkbox("Shadow blur fill (empty texels = neighbour avg)", &g_app.shadowBlur);
 
-    ImGui::Separator();
-    ImGui::TextUnformatted("RMB drag: look | WASD: move | Wheel: speed | Q/E or Ctrl/Space: down/up");
+            ImGui::Separator();
+            ImGui::Text("Shadow map preview");
+            ID3D11ShaderResourceView* srv = g_app.shadowBlur
+                ? g_app.renderer.ShadowFilledSrv()
+                : g_app.renderer.ShadowSrv();
+            const uint32_t smSize = g_app.renderer.ShadowMapSize();
+            if (srv && smSize > 0) {
+                float avail = ImGui::GetContentRegionAvail().x;
+                float side  = std::max(64.0f, std::min(avail, 512.0f));
+                ImGui::Image((ImTextureID)srv, ImVec2(side, side));
+                ImGui::Text("source: %s  size: %u x %u",
+                            g_app.shadowBlur ? "filled (blurred)" : "raw caster",
+                            smSize, smSize);
+            } else {
+                ImGui::TextUnformatted("(no shadow map — enable Sun shadows)");
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 
     ImGui::End();
 }
@@ -725,6 +793,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.pointLod         = g_app.pointLod;
             ps.pointLodScale    = g_app.pointLodScale;
             ps.splatFilter      = g_app.splatFilter;
+            ps.splatDilate2Pass = g_app.splatDilate2Pass;
             ps.fogColor[0]      = g_app.fogColor[0];
             ps.fogColor[1]      = g_app.fogColor[1];
             ps.fogColor[2]      = g_app.fogColor[2];
@@ -738,6 +807,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.sunDir[1]        = sunDir[1];
             ps.sunDir[2]        = sunDir[2];
             ps.sunIntensity     = exp2f(g_app.sunIntensityEV);
+            ps.sunShadows       = g_app.sunShadows;
+            ps.shadowCascades   = g_app.shadowCascades;
+            {
+                const int sizes[] = { 512, 1024, 2048, 4096 };
+                ps.shadowMapSize  = sizes[std::clamp(g_app.shadowMapSizeIdx, 0, 3)];
+            }
+            ps.shadowBias       = g_app.shadowBias;
+            ps.shadowCullFront  = g_app.shadowCullFront;
+            ps.shadowForceRebuild = g_app.shadowForceRebuild;
+            ps.shadowLod          = g_app.shadowLodIdx - 1;   // 0 -> Auto (-1)
+            ps.shadowBlur         = g_app.shadowBlur;
             ps.exposure         = exp2f(g_app.exposureEV);
             ps.roughness        = g_app.roughness;
             g_app.renderer.DrawScene(g_app.camera, ps);
