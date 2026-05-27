@@ -5,6 +5,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <vector>
+#include <string>
 #include <cstdint>
 #include <wrl/client.h>
 
@@ -90,8 +91,13 @@ struct DrawSceneParams {
 
 class Renderer {
 public:
-    bool Init(HWND hwnd);
+    // adapterIdx: -1 = system default; otherwise index into EnumerateAdapters().
+    bool Init(HWND hwnd, int adapterIdx = -1);
     void Shutdown();
+
+    // List names of available DXGI adapters (high-perf first per OS pref).
+    // Cheap; can be called before Init.
+    static std::vector<std::string> EnumerateAdapters();
     void Resize(uint32_t w, uint32_t h);
     void UploadScene(const Scene& scene);
     void BeginFrame(float clear[4]);
@@ -139,7 +145,7 @@ public:
     uint64_t LastPointCount() const { return lastPointCount_; }
 
 private:
-    bool CreateDeviceAndSwap(HWND hwnd);
+    bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
     bool CreateRenderTargets();
     bool CreateShaders();
     bool CreatePipelineState();

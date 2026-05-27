@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "renderer.h"
 #include "microprofile.h"
+#include <dxgi1_6.h>
 
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -82,9 +83,9 @@ static std::string ReadTextFile(const char* path)
     return ss.str();
 }
 
-bool Renderer::Init(HWND hwnd)
+bool Renderer::Init(HWND hwnd, int adapterIdx)
 {
-    if (!CreateDeviceAndSwap(hwnd)) return false;
+    if (!CreateDeviceAndSwap(hwnd, adapterIdx)) return false;
 
     RECT rc; GetClientRect(hwnd, &rc);
     width_  = (uint32_t)(rc.right  - rc.left);
@@ -101,7 +102,45 @@ void Renderer::Shutdown()
     subs_.clear();
 }
 
-bool Renderer::CreateDeviceAndSwap(HWND hwnd)
+std::vector<std::string> Renderer::EnumerateAdapters()
+{
+    std::vector<std::string> out;
+    ComPtr<IDXGIFactory6> f6;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(f6.GetAddressOf()));
+    if (SUCCEEDED(hr)) {
+        // Factory6 path: enumerate in performance-preferred order so idx 0 is
+        // typically the discrete GPU on a laptop.
+        for (UINT i = 0; ; ++i) {
+            ComPtr<IDXGIAdapter1> a;
+            if (f6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                               IID_PPV_ARGS(a.GetAddressOf())) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 d{};
+            a->GetDesc1(&d);
+            if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            char buf[256];
+            size_t cv = 0;
+            wcstombs_s(&cv, buf, sizeof(buf), d.Description, _TRUNCATE);
+            out.emplace_back(buf);
+        }
+        return out;
+    }
+    ComPtr<IDXGIFactory1> f1;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(f1.GetAddressOf())))) return out;
+    for (UINT i = 0; ; ++i) {
+        ComPtr<IDXGIAdapter1> a;
+        if (f1->EnumAdapters1(i, a.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 d{};
+        a->GetDesc1(&d);
+        if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        char buf[256];
+        size_t cv = 0;
+        wcstombs_s(&cv, buf, sizeof(buf), d.Description, _TRUNCATE);
+        out.emplace_back(buf);
+    }
+    return out;
+}
+
+bool Renderer::CreateDeviceAndSwap(HWND hwnd, int adapterIdx)
 {
     UINT flags = 0;
 #ifdef _DEBUG
@@ -110,15 +149,54 @@ bool Renderer::CreateDeviceAndSwap(HWND hwnd)
     D3D_FEATURE_LEVEL flvl;
     D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0 };
 
+    // Resolve adapter: explicit index uses DXGI enumeration matching
+    // EnumerateAdapters() order (high-perf first on Factory6). idx < 0 = system default.
+    ComPtr<IDXGIAdapter1> chosen;
+    if (adapterIdx >= 0) {
+        ComPtr<IDXGIFactory6> f6;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(f6.GetAddressOf())))) {
+            int seen = 0;
+            for (UINT i = 0; ; ++i) {
+                ComPtr<IDXGIAdapter1> a;
+                if (f6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                   IID_PPV_ARGS(a.GetAddressOf())) == DXGI_ERROR_NOT_FOUND) break;
+                DXGI_ADAPTER_DESC1 d{};
+                a->GetDesc1(&d);
+                if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+                if (seen == adapterIdx) { chosen = a; break; }
+                ++seen;
+            }
+        }
+        if (!chosen) {
+            ComPtr<IDXGIFactory1> f1;
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(f1.GetAddressOf())))) {
+                int seen = 0;
+                for (UINT i = 0; ; ++i) {
+                    ComPtr<IDXGIAdapter1> a;
+                    if (f1->EnumAdapters1(i, a.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) break;
+                    DXGI_ADAPTER_DESC1 d{};
+                    a->GetDesc1(&d);
+                    if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+                    if (seen == adapterIdx) { chosen = a; break; }
+                    ++seen;
+                }
+            }
+        }
+    }
+
+    // Note: when chosen is non-null, driver type MUST be UNKNOWN.
+    D3D_DRIVER_TYPE drvType = chosen ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+    IDXGIAdapter* adp = chosen.Get();
+
     HRESULT hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+        adp, drvType, nullptr, flags,
         want, _countof(want), D3D11_SDK_VERSION,
         device_.GetAddressOf(), &flvl, ctx_.GetAddressOf());
 #ifdef _DEBUG
     if (FAILED(hr)) {
         flags &= ~D3D11_CREATE_DEVICE_DEBUG;
         hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+            adp, drvType, nullptr, flags,
             want, _countof(want), D3D11_SDK_VERSION,
             device_.GetAddressOf(), &flvl, ctx_.GetAddressOf());
     }

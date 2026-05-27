@@ -32,23 +32,38 @@ namespace {
 
 constexpr const char* kSettingsPath = "voxeltest.settings";
 
-// Read "lastVox=<path>\n" if present. Returns empty string on miss.
-std::string LoadLastVoxFromSettings()
+struct Settings {
+    std::string lastVox;
+    int         adapterIdx = -1;     // -1 = system default
+};
+
+Settings LoadSettings()
 {
+    Settings s;
     std::ifstream f(kSettingsPath);
-    if (!f) return {};
+    if (!f) return s;
     std::string line;
     while (std::getline(f, line)) {
-        const char* prefix = "lastVox=";
-        if (line.rfind(prefix, 0) == 0) return line.substr(std::strlen(prefix));
+        if (line.rfind("lastVox=", 0) == 0) s.lastVox = line.substr(8);
+        else if (line.rfind("adapter=", 0) == 0) s.adapterIdx = std::atoi(line.c_str() + 8);
     }
-    return {};
+    return s;
 }
-void SaveLastVoxToSettings(const std::string& path)
+void SaveSettings(const Settings& s)
 {
     std::ofstream f(kSettingsPath, std::ios::trunc);
     if (!f) return;
-    f << "lastVox=" << path << "\n";
+    f << "lastVox=" << s.lastVox << "\n";
+    f << "adapter=" << s.adapterIdx << "\n";
+}
+
+// Compat wrappers — call sites pass a path-only or want the path only.
+std::string LoadLastVoxFromSettings() { return LoadSettings().lastVox; }
+void SaveLastVoxToSettings(const std::string& path)
+{
+    Settings s = LoadSettings();
+    s.lastVox = path;
+    SaveSettings(s);
 }
 
 // Enumerate assets/*.vox, sorted alphabetically.
@@ -122,6 +137,9 @@ struct AppState {
     bool     wantQuit = false;
     bool     sceneReady = false;
     std::string loadStatus = "Loading...";
+    std::vector<std::string> graphicsAdapters;  // populated at startup
+    int      adapterIdx = -1;                   // selected adapter idx (-1=default)
+    int      activeAdapterIdx = -1;             // adapter actually in use this run
     std::string currentVoxPath;
     std::vector<std::string> datasetPaths;   // discovered assets/*.vox at startup
     int         datasetIdx = 0;              // index into datasetPaths
@@ -550,6 +568,23 @@ void FrameControlsWindow()
 
     if (ImGui::BeginTabBar("##controlTabs")) {
         if (ImGui::BeginTabItem("Render")) {
+            if (g_app.graphicsAdapters.size() > 1) {
+                std::vector<const char*> names;
+                names.reserve(g_app.graphicsAdapters.size() + 1);
+                names.push_back("(system default)");
+                for (auto& n : g_app.graphicsAdapters) names.push_back(n.c_str());
+                int sel = (g_app.adapterIdx < 0) ? 0 : (g_app.adapterIdx + 1);
+                if (sel >= (int)names.size()) sel = 0;
+                if (ImGui::Combo("GPU adapter", &sel, names.data(), (int)names.size())) {
+                    g_app.adapterIdx = (sel == 0) ? -1 : (sel - 1);
+                    Settings st = LoadSettings();
+                    st.adapterIdx = g_app.adapterIdx;
+                    SaveSettings(st);
+                }
+                if (g_app.adapterIdx != g_app.activeAdapterIdx) {
+                    ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1), "Restart to apply");
+                }
+            }
             ImGui::SliderFloat("Sun pitch",     &g_app.sunPitchDeg, 5.0f, 89.0f, "%.1f deg");
             ImGui::SliderFloat("Sun yaw",       &g_app.sunYawDeg, -180.0f, 180.0f, "%.1f deg");
             ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
@@ -630,7 +665,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
-    if (!g_app.renderer.Init(hwnd)) {
+    g_app.graphicsAdapters = Renderer::EnumerateAdapters();
+    {
+        Settings st = LoadSettings();
+        g_app.adapterIdx = st.adapterIdx;
+    }
+    g_app.activeAdapterIdx = g_app.adapterIdx;
+    if (!g_app.renderer.Init(hwnd, g_app.adapterIdx)) {
         MessageBoxA(nullptr, "Renderer init failed", "VoxelTest", MB_ICONERROR);
         return 1;
     }
