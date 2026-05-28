@@ -9,7 +9,13 @@ cbuffer CBLwFrame : register(b0)
 {
     row_major float4x4 gViewProj;
     float3   gCamPos;
-    float    gNearZ;          // for any future reconstruction maths
+    float    gNearZ;
+    float3   gLightDir;       // sun direction (world-space, normalized)
+    float    gSunIntensity;
+    float3   gAmbientColor;
+    float    gExposure;
+    float3   gFogColor;
+    float    gFogDensity;
 };
 cbuffer CBLwLod : register(b1)
 {
@@ -92,22 +98,80 @@ VSOut vsmain_lw_points(uint vid : SV_VertexID)
                    (float)((colPck >>  8) & 0xFFu),
                    (float)((colPck >> 16) & 0xFFu)) / 255.0;
 
-    // Pick AO face whose outward normal best aligns with toCam, restricted to
-    // visible faces (matches the legacy vsmain_points heuristic).
-    float3 toCam = normalize(gCamPos - world);
-    float3 faceN[6] = {
-        float3( 1, 0, 0), float3(-1, 0, 0),
-        float3( 0, 1, 0), float3( 0,-1, 0),
-        float3( 0, 0, 1), float3( 0, 0,-1),
-    };
-    float bestDot = -2.0;
-    uint  bestF = 0u;
+    // Splat AO = average of visible face AOs. Camera-direction face pick
+    // would flicker when camera angle crosses an octant boundary; averaging
+    // gives one stable value per voxel.
+    float sumAo = 0.0;
+    int   cntAo = 0;
     [unroll] for (uint f = 0u; f < 6u; ++f) {
         if (((mask >> f) & 1u) == 0u) continue;
-        float d = dot(faceN[f], toCam);
-        if (d > bestDot) { bestDot = d; bestF = f; }
+        sumAo += (float)((aoPck >> (f * 4u)) & 0xFu);
+        ++cntAo;
     }
-    uint nib = (aoPck >> (bestF * 4u)) & 0xFu;
+    o.ao = (cntAo > 0) ? (sumAo / (15.0 * (float)cntAo)) : 1.0;
+    return o;
+}
+
+// ---- PolyAxis: 6 quads per voxel (36 verts). Per-face AO direct. ----
+//   vid layout: vid/36 = voxel index in chunk, (vid%36)/6 = face, vid%6 = vert
+//   Hidden faces emit NaN positions (discarded by raster).
+static const float3 kFaceVerts[6][6] = {
+    // +X face (normal +X): vertices on x=1 plane
+    { float3(1,0,0), float3(1,0,1), float3(1,1,0), float3(1,1,0), float3(1,0,1), float3(1,1,1) },
+    // -X face (x=0)
+    { float3(0,0,0), float3(0,1,0), float3(0,0,1), float3(0,0,1), float3(0,1,0), float3(0,1,1) },
+    // +Y face (y=1)
+    { float3(0,1,0), float3(1,1,0), float3(0,1,1), float3(0,1,1), float3(1,1,0), float3(1,1,1) },
+    // -Y face (y=0)
+    { float3(0,0,0), float3(0,0,1), float3(1,0,0), float3(1,0,0), float3(0,0,1), float3(1,0,1) },
+    // +Z face (z=1)
+    { float3(0,0,1), float3(0,1,1), float3(1,0,1), float3(1,0,1), float3(0,1,1), float3(1,1,1) },
+    // -Z face (z=0)
+    { float3(0,0,0), float3(1,0,0), float3(0,1,0), float3(0,1,0), float3(1,0,0), float3(1,1,0) },
+};
+
+VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
+{
+    uint voxelIdx = vid / 36u;
+    uint face     = (vid % 36u) / 6u;
+    uint vertIn   = vid % 6u;
+
+    uint slot = gLwSlot;
+    LwChunkInfo ci = gLwChunkInfos[slot];
+    LwPoint     p  = gLwPoints[ci.poolBase + voxelIdx + gLwDrawBase];
+
+    uint px = (p.pack0 >>  0) & 0xFFu;
+    uint py = (p.pack0 >>  8) & 0xFFu;
+    uint pz = (p.pack0 >> 16) & 0xFFu;
+    uint palIdx = (p.pack0 >> 24) & 0xFFu;
+    uint mask   = (p.pack1 >>  0) & 0x3Fu;
+    uint aoPck  = (p.pack1 >>  8);
+
+    VSOut o;
+    if (((mask >> face) & 1u) == 0u) {
+        // Hidden face: emit clip pos with w=0 → guaranteed clip-discarded.
+        o.svpos = float4(0, 0, 0, 0);
+        o.col = float3(0,0,0); o.ao = 0; o.mask = 0; o.parity = 0; o.wpos = float3(0,0,0);
+        return o;
+    }
+
+    float3 voxOrigin = float3((float)px, (float)py, (float)pz);
+    float3 corner    = voxOrigin + kFaceVerts[face][vertIn];
+    float3 world     = ci.worldOrigin + corner * ci.lodScale;
+    o.svpos = mul(float4(world, 1.0), gViewProj);
+    o.wpos  = world;
+    o.mask  = mask;
+    uint cx = px >> 5;
+    uint cy = py >> 5;
+    uint cz = pz >> 5;
+    o.parity = (cx + cy + cz) & 1u;
+
+    uint colPck = gLwPalette[ci.paletteBase + palIdx];
+    o.col = float3((float)( colPck         & 0xFFu),
+                   (float)((colPck >>  8u) & 0xFFu),
+                   (float)((colPck >> 16u) & 0xFFu)) / 255.0;
+
+    uint nib = (aoPck >> (face * 4u)) & 0xFu;
     o.ao = (float)nib / 15.0;
     return o;
 }
@@ -130,6 +194,29 @@ SplatOut psmain_lw_splat_albedo(VSOut i)
 float4 psmain_lw_debug(VSOut i) : SV_Target
 {
     return float4(i.col, 1.0);
+}
+
+// ---- PS: PolyAxis lit (post-dilate, direct to scene RT) ----
+// Face normal via ddx/ddy of wpos. AO modulates ambient; sun adds N·L.
+// Fog + exposure + Reinhard tonemap to match splat path roughly.
+float4 psmain_lw_polyaxis_lit(VSOut i) : SV_Target
+{
+    float3 N = normalize(cross(ddx(i.wpos), ddy(i.wpos)));
+    float3 toCam = normalize(gCamPos - i.wpos);
+    if (dot(N, toCam) < 0.0) N = -N;
+    float3 amb = gAmbientColor * i.ao;
+    float3 L   = normalize(gLightDir);
+    float  nDl = saturate(dot(N, L));
+    float3 sun = float3(1.0, 0.96, 0.90) * (nDl * gSunIntensity);
+    float3 lit = i.col * (amb + sun);
+    // Depth fog (matches ApplyFog rough behaviour).
+    float dist = length(i.wpos - gCamPos);
+    float fog = exp(-dist * gFogDensity);
+    lit = lerp(gFogColor, lit, fog);
+    // Exposure + Reinhard tonemap.
+    lit *= gExposure;
+    lit = lit / (lit + 1.0);
+    return float4(lit, 1.0);
 }
 
 // ---- PS: AO + per-LOD tint + per-cluster checker ----

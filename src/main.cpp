@@ -146,6 +146,7 @@ struct AppState {
     int      adapterIdx = -1;                   // selected adapter idx (-1=default)
     int      activeAdapterIdx = -1;             // adapter actually in use this run
     bool     lwShowBounds = false;              // debug: draw per-chunk AABBs
+    bool     lwPolyAxis   = false;              // render cube faces instead of splats
     std::string currentVoxPath;
     std::vector<std::string> datasetPaths;   // discovered assets/*.vox at startup
     int         datasetIdx = 0;              // index into datasetPaths
@@ -619,6 +620,7 @@ void FrameControlsWindow()
             ImGui::SliderFloat("Roughness",     &g_app.roughness,       0.05f, 1.0f, "%.2f");
             ImGui::ColorEdit3("Clear color", g_app.bgColor);
             ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
+            ImGui::Checkbox("LW: PolyAxis (cube faces, per-face AO)", &g_app.lwPolyAxis);
             ImGui::Separator();
             ImGui::Text("Camera");
             ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -923,6 +925,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.shadowLod          = g_app.shadowLodIdx - 1;   // 0 -> Auto (-1)
             ps.shadowBlur         = g_app.shadowBlur;
             ps.lwShowBounds       = g_app.lwShowBounds;
+            ps.lwPolyAxis         = g_app.lwPolyAxis;
             ps.exposure         = exp2f(g_app.exposureEV);
             ps.roughness        = g_app.roughness;
             if (g_app.renderer.HasLwWorld()) {

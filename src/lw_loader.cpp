@@ -124,55 +124,163 @@ bool LoadWorld(const char* path, World& out, std::string& err)
             rc.slotIdx = i;
 
             if (ce.flags & kFlagBitGrid) {
-                // Compressed: cluster mask + per-cluster (orderMode, leb128 nP,
-                // leb128 bgSize, bgBytes, colorBytes). Reconstruct
-                // rc.clusters[] + DiskPoint pool entries.
                 if ((size_t)(end - p) < 16) { fclose(f); err = "blob short for clusterMask"; return false; }
                 uint8_t clusterMask[16];
                 memcpy(clusterMask, p, 16); p += 16;
 
                 memset(rc.clusters, 0, sizeof(rc.clusters));
                 lw.pointPool.resize(rc.poolBase + dch.totalPoints);
-                uint32_t writePos = rc.poolBase;
-                uint8_t bits[kClusterCellCount];
+
+                // Pass 1: parse all sub-blobs, decode bit-grids, fill chunk-wide bit-grid.
+                struct ClusterDec {
+                    uint8_t  orderMode;
+                    uint32_t nP;
+                    uint8_t  bits[kClusterCellCount];
+                    const uint8_t* colors;
+                    const uint8_t* cellAo;
+                    uint32_t cellAoCount;
+                    int oX, oY, oZ;
+                };
+                std::vector<ClusterDec> cds(kClustersPerChunk);
+                const int CW = kChunkVoxX, CH = kChunkVoxY, CD = kChunkVoxZ;
+                std::vector<uint8_t> chunkBits((size_t)((CW * CH * CD + 7) / 8), 0);
+                auto cbSet = [&](int x, int y, int z) {
+                    size_t idx = (size_t)((y * CD + z) * CW + x);
+                    chunkBits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+                };
+                auto cbGet = [&](int x, int y, int z) -> bool {
+                    if (x < 0 || y < 0 || z < 0 || x >= CW || y >= CH || z >= CD) return false;
+                    size_t idx = (size_t)((y * CD + z) * CW + x);
+                    return (chunkBits[idx >> 3] >> (idx & 7)) & 1u;
+                };
 
                 for (int s = 0; s < kClustersPerChunk; ++s) {
                     if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
-                    if (p >= end) { fclose(f); err = "blob short in cluster stream"; return false; }
-                    uint8_t orderMode = *p++;
-                    uint32_t nP = Leb128GetU32(p);
+                    if (p >= end) { fclose(f); err = "blob short cluster stream"; return false; }
+                    ClusterDec& cd = cds[s];
+                    cd.orderMode = *p++;
+                    cd.nP = Leb128GetU32(p);
                     uint32_t bgSize = Leb128GetU32(p);
-                    if (bgSize > (uint32_t)(end - p)) { fclose(f); err = "bgSize > remaining"; return false; }
-                    RleDecodeBitGrid(p, bgSize, bits);
+                    if (bgSize > (uint32_t)(end - p)) { fclose(f); err = "bgSize remaining"; return false; }
+                    RleDecodeBitGrid(p, bgSize, cd.bits);
                     p += bgSize;
-                    if (nP > (uint32_t)(end - p)) { fclose(f); err = "colors > remaining"; return false; }
-                    const uint8_t* colors = p;
-                    p += nP;
+                    if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "colors remaining"; return false; }
+                    cd.colors = p; p += cd.nP;
+                    if (ce.flags & kFlagAo) {
+                        size_t aoBytes = (size_t)cd.nP * 3;
+                        if (aoBytes > (size_t)(end - p)) { fclose(f); err = "ao remaining"; return false; }
+                        p += aoBytes;
+                    }
+                    if (ce.flags & kFlagVisMask) {
+                        if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "vm remaining"; return false; }
+                        p += cd.nP;
+                    }
+                    if (ce.flags & kFlagCellAo) {
+                        cd.cellAoCount = Leb128GetU32(p);
+                        uint32_t cellAoBytes = (cd.cellAoCount + 1) / 2;
+                        if (cellAoBytes > (uint32_t)(end - p)) { fclose(f); err = "cellao remaining"; return false; }
+                        cd.cellAo = p;
+                        p += cellAoBytes;
+                    } else {
+                        cd.cellAo = nullptr;
+                        cd.cellAoCount = 0;
+                    }
+                    cd.oZ = (s / (kClustersX * kClustersY)) * kClusterVoxZ;
+                    cd.oY = ((s / kClustersX) % kClustersY) * kClusterVoxY;
+                    cd.oX = (s % kClustersX) * kClusterVoxX;
+                    // Fill chunk-wide bit-grid.
+                    for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
+                        if (!cd.bits[cidx]) continue;
+                        uint32_t lx, ly, lz;
+                        LwCellCoord((LwOrderMode)cd.orderMode, cidx, lx, ly, lz);
+                        cbSet(cd.oX + lx, cd.oY + ly, cd.oZ + lz);
+                    }
+                }
 
-                    int cz_g = s / (kClustersX * kClustersY);
-                    int cy_g = (s / kClustersX) % kClustersY;
-                    int cx_g = s % kClustersX;
+                // Pass 2: build chunk-wide cell-AO grid from per-cluster cellAo streams.
+                std::vector<uint8_t> chunkCellAo;
+                if (ce.flags & kFlagCellAo) {
+                    chunkCellAo.assign((size_t)((CW * CH * CD + 1) / 2), 0);
+                    auto caSet = [&](int x, int y, int z, uint8_t ao4) {
+                        size_t idx = (size_t)((y * CD + z) * CW + x);
+                        uint8_t& byte = chunkCellAo[idx >> 1];
+                        if (idx & 1) byte = (byte & 0x0F) | (uint8_t)(ao4 << 4);
+                        else         byte = (byte & 0xF0) | (uint8_t)(ao4 & 0x0F);
+                    };
+                    for (int s = 0; s < kClustersPerChunk; ++s) {
+                        if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
+                        const ClusterDec& cd = cds[s];
+                        if (!cd.cellAo) continue;
+                        uint32_t consumed = 0;
+                        for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
+                            if (cd.bits[cidx]) continue;
+                            uint32_t lx, ly, lz;
+                            LwCellCoord((LwOrderMode)cd.orderMode, cidx, lx, ly, lz);
+                            int wx = cd.oX + lx, wy = cd.oY + ly, wz = cd.oZ + lz;
+                            if (!(cbGet(wx+1,wy,wz) || cbGet(wx-1,wy,wz) ||
+                                  cbGet(wx,wy+1,wz) || cbGet(wx,wy-1,wz) ||
+                                  cbGet(wx,wy,wz+1) || cbGet(wx,wy,wz-1))) continue;
+                            if (consumed >= cd.cellAoCount) break;
+                            uint8_t b = cd.cellAo[consumed >> 1];
+                            uint8_t ao4 = (consumed & 1) ? (b >> 4) : (b & 0x0F);
+                            caSet(wx, wy, wz, ao4);
+                            ++consumed;
+                        }
+                    }
+                }
+                bool haveCellAo = (ce.flags & kFlagCellAo) != 0;
+                auto caGet = [&](int x, int y, int z) -> uint8_t {
+                    if (!haveCellAo) return 0xF;
+                    if (x < 0 || y < 0 || z < 0 || x >= CW || y >= CH || z >= CD) return 0xF;
+                    size_t idx = (size_t)((y * CD + z) * CW + x);
+                    uint8_t byte = chunkCellAo[idx >> 1];
+                    return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+                };
+
+                // Pass 3: emit DiskPoints with visMask + per-face AO from neighbour cells.
+                uint32_t writePos = rc.poolBase;
+                for (int s = 0; s < kClustersPerChunk; ++s) {
+                    if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
+                    const ClusterDec& cd = cds[s];
                     uint8_t clMn[3] = { 31, 31, 31 };
                     uint8_t clMx[3] = { 0, 0, 0 };
-
                     rc.clusters[s].pointFirst = writePos - rc.poolBase;
-                    rc.clusters[s].numPoints  = (uint16_t)nP;
+                    rc.clusters[s].numPoints  = (uint16_t)cd.nP;
                     rc.clusters[s]._pad = 0;
-
                     uint32_t emitted = 0;
                     for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
-                        if (!bits[cidx]) continue;
+                        if (!cd.bits[cidx]) continue;
                         uint32_t lx, ly, lz;
-                        LwCellCoord((LwOrderMode)orderMode, cidx, lx, ly, lz);
+                        LwCellCoord((LwOrderMode)cd.orderMode, cidx, lx, ly, lz);
+                        int wx = cd.oX + lx, wy = cd.oY + ly, wz = cd.oZ + lz;
                         DiskPoint dp;
-                        dp.posX = (uint8_t)(cx_g * kClusterVoxX + lx);
-                        dp.posY = (uint8_t)(cy_g * kClusterVoxY + ly);
-                        dp.posZ = (uint8_t)(cz_g * kClusterVoxZ + lz);
-                        dp.palIdx = colors[emitted];
-                        dp.visMask = 0x3F;          // AO/visMask not stored in compressed v0
-                        dp.aoPacked[0] = 0xFF;
-                        dp.aoPacked[1] = 0xFF;
-                        dp.aoPacked[2] = 0xFF;
+                        dp.posX = (uint8_t)wx;
+                        dp.posY = (uint8_t)wy;
+                        dp.posZ = (uint8_t)wz;
+                        dp.palIdx = cd.colors[emitted];
+                        // visMask: face f visible iff neighbour cell empty.
+                        // visMask bit order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
+                        uint8_t mask = 0;
+                        if (!cbGet(wx+1,wy,wz)) mask |= 0x01;
+                        if (!cbGet(wx-1,wy,wz)) mask |= 0x02;
+                        if (!cbGet(wx,wy+1,wz)) mask |= 0x04;
+                        if (!cbGet(wx,wy-1,wz)) mask |= 0x08;
+                        if (!cbGet(wx,wy,wz+1)) mask |= 0x10;
+                        if (!cbGet(wx,wy,wz-1)) mask |= 0x20;
+                        dp.visMask = mask;
+                        // Per-face AO from neighbour cell's stored cellAO.
+                        // Splat shader averages visible faces in HLSL for
+                        // stability; PolyAxis uses per-face directly.
+                        uint8_t ao[6] = {
+                            caGet(wx+1,wy,wz), caGet(wx-1,wy,wz),
+                            caGet(wx,wy+1,wz), caGet(wx,wy-1,wz),
+                            caGet(wx,wy,wz+1), caGet(wx,wy,wz-1),
+                        };
+                        uint32_t aoPacked = 0;
+                        for (int fi = 0; fi < 6; ++fi) aoPacked |= (uint32_t)(ao[fi] & 0xF) << (fi * 4);
+                        dp.aoPacked[0] = (uint8_t)(aoPacked & 0xFF);
+                        dp.aoPacked[1] = (uint8_t)((aoPacked >> 8) & 0xFF);
+                        dp.aoPacked[2] = (uint8_t)((aoPacked >> 16) & 0xFF);
                         lw.pointPool[writePos + emitted] = dp;
                         if (lx < clMn[0]) clMn[0] = (uint8_t)lx;
                         if (ly < clMn[1]) clMn[1] = (uint8_t)ly;

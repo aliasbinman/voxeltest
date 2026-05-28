@@ -89,6 +89,7 @@ struct DrawSceneParams {
     bool           splatDilate2Pass = false;   // run a second pass to fill leftover holes
     bool           shadowBlur       = false;   // CS pass that fills empty shadow texels with neighbour avg
     bool           lwShowBounds     = false;   // overlay per-chunk AABB wireframe, LOD-coloured
+    bool           lwPolyAxis       = false;   // render as cube faces instead of point splats
 };
 
 class Renderer {
@@ -318,6 +319,8 @@ private:
     ComPtr<ID3D11PixelShader>  psLwSplatAlbedo_;
     ComPtr<ID3D11PixelShader>  psLwDebug_;
     ComPtr<ID3D11PixelShader>  psLwLodViz_;
+    ComPtr<ID3D11VertexShader> vsLwPolyAxis_;
+    ComPtr<ID3D11PixelShader>  psLwPolyAxisLit_;
     ComPtr<ID3D11VertexShader> vsLwBounds_;
     ComPtr<ID3D11PixelShader>  psLwBounds_;
     ComPtr<ID3D11Buffer>       cbLwFrame_;   // b0

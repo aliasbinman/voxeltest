@@ -168,6 +168,10 @@ inline constexpr uint32_t kFileVersion = 1u;
 
 inline constexpr uint32_t kFlagLz4         = 1u << 0;
 inline constexpr uint32_t kFlagBitGrid     = 1u << 1;   // per-cluster bit-grid + color stream
+inline constexpr uint32_t kFlagAo          = 1u << 2;   // per-cluster appends 3 bytes AO per occupied cell
+inline constexpr uint32_t kFlagVisMask     = 1u << 3;   // per-cluster appends 1 byte visMask per occupied cell
+inline constexpr uint32_t kFlagCellAo      = 1u << 4;   // per-cluster appends 4-bit AO per "AO cell"
+                                                        // (empty cell adjacent to solid voxel in chunk grid)
 
 // =====================================================================
 // Per-cluster ordering modes. Selected per-cluster at bake time; encoder
