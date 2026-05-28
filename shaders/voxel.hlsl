@@ -1083,6 +1083,7 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
 
     float bestAo = 1.0;
     uint  bestLodIdx = 0u;
+    uint  bestParity = 0u;
     // Depth-only fallback: nearest-Z valid neighbor. Doesn't pollute color
     // (no color is taken from this), only fills depth at pixels whose ray
     // missed every AABB. Keeps depth buffer contiguous for TAA / sky / DOF.
@@ -1098,6 +1099,7 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             if ((a8 & 0x80u) == 0u) continue;
             uint lodIdx = (a8 >> 5) & 3u;
             uint ao4    = (a8 >> 1) & 0xFu;
+            uint parityN = a8 & 1u;
             float aoN   = (float)ao4 / 15.0;
             float halfExt = (lodIdx == 0u) ? 0.5
                           : (lodIdx == 1u) ? 1.0
@@ -1153,6 +1155,7 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                 bestMask   = visMaskN;
                 bestAo     = aoN;
                 bestLodIdx = lodIdx;
+                bestParity = parityN;
                 anyHit     = true;
             }
         }
@@ -1169,8 +1172,9 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
         } else if (mode == 3) {
             outRgb = ApplyFog(bestAo.xxx, hit);
         } else if (mode == 4) {
-            // AO * per-LOD tint (Poly tint not reachable here — splats only).
-            outRgb = bestAo * ClusterTint(2u + bestLodIdx);
+            // AO * per-LOD tint, with per-cluster checker (parity bit from alpha).
+            float check = (bestParity == 0u) ? 0.55 : 1.00;
+            outRgb = bestAo * ClusterTint(2u + bestLodIdx) * check;
         } else {
             float3 amb = SampleAmbientCubeTriplanar(bestN) * bestAo;
             float3 light = ApplyShadowLighting(amb, normalize(gLightDir), bestN, SampleShadow(hit));

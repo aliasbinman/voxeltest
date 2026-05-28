@@ -66,7 +66,7 @@ void SaveLastVoxToSettings(const std::string& path)
     SaveSettings(s);
 }
 
-// Enumerate assets/*.vox, sorted alphabetically.
+// Enumerate assets/*.vox + assets/*.lw, sorted alphabetically.
 std::vector<std::string> DiscoverDatasets()
 {
     std::vector<std::string> out;
@@ -74,12 +74,17 @@ std::vector<std::string> DiscoverDatasets()
     if (!std::filesystem::is_directory("assets", ec)) return out;
     for (const auto& e : std::filesystem::directory_iterator("assets", ec)) {
         if (!e.is_regular_file()) continue;
-        if (e.path().extension() == ".vox") {
+        auto ext = e.path().extension();
+        if (ext == ".vox" || ext == ".lw") {
             out.push_back(e.path().generic_string());
         }
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+static inline bool IsLwPath(const std::string& p)
+{
+    return p.size() >= 3 && p.compare(p.size() - 3, 3, ".lw") == 0;
 }
 
 void SetCwdToProjectRoot()
@@ -140,10 +145,13 @@ struct AppState {
     std::vector<std::string> graphicsAdapters;  // populated at startup
     int      adapterIdx = -1;                   // selected adapter idx (-1=default)
     int      activeAdapterIdx = -1;             // adapter actually in use this run
+    bool     lwShowBounds = false;              // debug: draw per-chunk AABBs
     std::string currentVoxPath;
     std::vector<std::string> datasetPaths;   // discovered assets/*.vox at startup
     int         datasetIdx = 0;              // index into datasetPaths
     Scene       pendingScene;
+    lw::World   pendingLwWorld;
+    bool        pendingIsLw = false;
     // Snapshot kept after upload so on-demand compression analysis can run
     // without holding the full pointVertices/ao6 buffers.
     Scene       compScene;
@@ -591,6 +599,7 @@ void FrameControlsWindow()
             ImGui::SliderFloat("Exposure",      &g_app.exposureEV,     -3.0f, 3.0f, "%.2f EV");
             ImGui::SliderFloat("Roughness",     &g_app.roughness,       0.05f, 1.0f, "%.2f");
             ImGui::ColorEdit3("Clear color", g_app.bgColor);
+            ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
             ImGui::Separator();
             ImGui::Text("Camera");
             ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -716,8 +725,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             const std::string& voxPath = g_app.datasetPaths[idx];
             g_app.currentVoxPath = voxPath;
             g_app.loadStatus = std::string("Loading ") + voxPath + "...";
-            bool ok = LoadVoxScene(voxPath.c_str(), g_app.pendingScene, err);
-            if (!ok && err.empty()) err = "vox load failed";
+            bool ok;
+            if (IsLwPath(voxPath)) {
+                g_app.pendingIsLw = true;
+                ok = lw::LoadWorld(voxPath.c_str(), g_app.pendingLwWorld, err);
+                if (!ok && err.empty()) err = "lw load failed";
+            } else {
+                g_app.pendingIsLw = false;
+                ok = LoadVoxScene(voxPath.c_str(), g_app.pendingScene, err);
+                if (!ok && err.empty()) err = "vox load failed";
+            }
             g_app.loadErr = err;
             g_app.loadOk.store(ok);
             g_app.loadDone.store(true);
@@ -754,19 +771,46 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         if (g_app.loadDone.load() && !g_app.sceneReady) {
             if (g_app.loadOk.load()) {
                 bool firstUpload = !g_app.everLoaded;
-                g_app.renderer.UploadScene(g_app.pendingScene);
-                if (firstUpload) {
-                    float cx = 0.5f * (g_app.pendingScene.aabbMin[0] + g_app.pendingScene.aabbMax[0]);
-                    float cz = 0.5f * (g_app.pendingScene.aabbMin[2] + g_app.pendingScene.aabbMax[2]);
-                    float topY = g_app.pendingScene.aabbMax[1];
-                    float dx = g_app.pendingScene.aabbMax[0] - g_app.pendingScene.aabbMin[0];
-                    float dz = g_app.pendingScene.aabbMax[2] - g_app.pendingScene.aabbMin[2];
-                    float ext = (dx > dz ? dx : dz);
-                    g_app.camera.position = hlslpp::float3(cx, topY, cz);
-                    g_app.camera.yaw = 0.0f;
-                    g_app.camera.pitch = 0.0f;
-                    g_app.camera.moveSpeed = ext * 0.05f;
-                    g_app.camera.farZ = ext * 4.0f + 1000.0f;
+                if (g_app.pendingIsLw) {
+                    // Free legacy Scene side; upload the LW world.
+                    g_app.renderer.UploadScene(Scene{});  // clear legacy SRVs
+                    g_app.renderer.UploadLwWorld(g_app.pendingLwWorld);
+                    // Always re-center on LW load (legacy path only re-centers
+                    // on first-ever upload, but switching format wants a reset).
+                    {
+                        const auto& w = g_app.pendingLwWorld;
+                        float cx = 0.5f * (float)(w.worldAabbMin[0] + w.worldAabbMax[0]);
+                        float cz = 0.5f * (float)(w.worldAabbMin[2] + w.worldAabbMax[2]);
+                        float topY = (float)w.worldAabbMax[1];
+                        float dx = (float)(w.worldAabbMax[0] - w.worldAabbMin[0]);
+                        float dz = (float)(w.worldAabbMax[2] - w.worldAabbMin[2]);
+                        float ext = (dx > dz ? dx : dz);
+                        // Pull back + up + tilt down so the whole footprint is
+                        // visible from the off-bat (vs the legacy default which
+                        // skylines you over the model).
+                        g_app.camera.position = hlslpp::float3(cx, topY + ext * 0.5f, cz - ext * 0.5f);
+                        g_app.camera.yaw   = 0.0f;
+                        g_app.camera.pitch = -0.5f;          // ~ -28 deg
+                        g_app.camera.moveSpeed = ext * 0.05f;
+                        g_app.camera.farZ = ext * 4.0f + 1000.0f;
+                    }
+                    g_app.pendingLwWorld = lw::World{};
+                } else {
+                    g_app.renderer.ClearLwWorld();
+                    g_app.renderer.UploadScene(g_app.pendingScene);
+                    if (firstUpload) {
+                        float cx = 0.5f * (g_app.pendingScene.aabbMin[0] + g_app.pendingScene.aabbMax[0]);
+                        float cz = 0.5f * (g_app.pendingScene.aabbMin[2] + g_app.pendingScene.aabbMax[2]);
+                        float topY = g_app.pendingScene.aabbMax[1];
+                        float dx = g_app.pendingScene.aabbMax[0] - g_app.pendingScene.aabbMin[0];
+                        float dz = g_app.pendingScene.aabbMax[2] - g_app.pendingScene.aabbMin[2];
+                        float ext = (dx > dz ? dx : dz);
+                        g_app.camera.position = hlslpp::float3(cx, topY, cz);
+                        g_app.camera.yaw = 0.0f;
+                        g_app.camera.pitch = 0.0f;
+                        g_app.camera.moveSpeed = ext * 0.05f;
+                        g_app.camera.farZ = ext * 4.0f + 1000.0f;
+                    }
                 }
                 g_app.everLoaded = true;
                 // Snapshot lightweight bits for on-demand compression analysis
@@ -859,9 +903,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.shadowForceRebuild = g_app.shadowForceRebuild;
             ps.shadowLod          = g_app.shadowLodIdx - 1;   // 0 -> Auto (-1)
             ps.shadowBlur         = g_app.shadowBlur;
+            ps.lwShowBounds       = g_app.lwShowBounds;
             ps.exposure         = exp2f(g_app.exposureEV);
             ps.roughness        = g_app.roughness;
-            g_app.renderer.DrawScene(g_app.camera, ps);
+            if (g_app.renderer.HasLwWorld()) {
+                g_app.renderer.DrawLwScene(g_app.camera, ps);
+            } else {
+                g_app.renderer.DrawScene(g_app.camera, ps);
+            }
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_app.renderer.EndFrame(g_app.vsync);

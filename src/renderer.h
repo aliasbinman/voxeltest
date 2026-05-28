@@ -1,6 +1,7 @@
 #pragma once
 #include "mesh.h"
 #include "camera.h"
+#include "lodworld.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -87,6 +88,7 @@ struct DrawSceneParams {
     int            shadowLod        = -1;      // -1 = auto, 0..3 = L0..L3
     bool           splatDilate2Pass = false;   // run a second pass to fill leftover holes
     bool           shadowBlur       = false;   // CS pass that fills empty shadow texels with neighbour avg
+    bool           lwShowBounds     = false;   // overlay per-chunk AABB wireframe, LOD-coloured
 };
 
 class Renderer {
@@ -98,6 +100,12 @@ public:
     // List names of available DXGI adapters (high-perf first per OS pref).
     // Cheap; can be called before Init.
     static std::vector<std::string> EnumerateAdapters();
+
+    // ---- LODWorld (.lw) path. Coexists with the legacy Scene path. ----
+    bool UploadLwWorld(const lw::World& w);
+    void ClearLwWorld();
+    bool HasLwWorld() const { return lwHasWorld_; }
+    void DrawLwScene(const Camera& cam, const DrawSceneParams& args);
     void Resize(uint32_t w, uint32_t h);
     void UploadScene(const Scene& scene);
     void BeginFrame(float clear[4]);
@@ -149,6 +157,20 @@ private:
     bool CreateRenderTargets();
     bool CreateShaders();
     bool CreatePipelineState();
+    // Map cbPerFrame_, populate from supplied state, Unmap.
+    // sunVPstore16OrNull: pointer to 16-float row-major sun viewProj, or null if
+    // shadows off; sunShadowsOn drives gShadowEnable + sunViewProj zeroing.
+    void FillCbPerFrame(const Camera& cam,
+                        const DrawSceneParams& args,
+                        const hlslpp::float4x4& vp,
+                        float jitterNdcX, float jitterNdcY,
+                        const float sceneOrigin[3],
+                        const float sceneSpan[3],
+                        float colorizeClusters,
+                        int gridSize,
+                        const float* sunVPstore16OrNull,
+                        bool sunShadowsOn,
+                        uint32_t shadowMapSize);
 
     ComPtr<ID3D11Device>         device_;
     ComPtr<ID3D11DeviceContext>  ctx_;
@@ -261,6 +283,41 @@ private:
     ComPtr<ID3D11Buffer>         pointVb_;
     ComPtr<ID3D11Buffer>         pointSb_;
     std::vector<GpuSubMesh>      subs_;
+
+    // -------- LODWorld GPU resources (one set per LOD) --------
+    struct LwGpu {
+        ComPtr<ID3D11Buffer>             pointSb;       // StructuredBuffer<DiskPoint> stride 8
+        ComPtr<ID3D11ShaderResourceView> pointSrv;
+        ComPtr<ID3D11Buffer>             chunkInfoSb;   // StructuredBuffer<GpuChunkInfo> stride 32
+        ComPtr<ID3D11ShaderResourceView> chunkInfoSrv;
+        ComPtr<ID3D11Buffer>             paletteSb;     // StructuredBuffer<uint> stride 4
+        ComPtr<ID3D11ShaderResourceView> paletteSrv;
+        uint32_t slotCount = 0;
+        uint32_t pointCount = 0;
+        uint64_t bytes = 0;
+    };
+    LwGpu lwGpu_[lw::kLodCount];
+    bool   lwHasWorld_ = false;
+    // CPU-side LW data kept resident for frustum cull + chunk metadata. Loader
+    // populates LODWorld::pointPool too; renderer can clear those after upload
+    // (handled in UploadLwWorld) since GPU pool now owns the data.
+    lw::World lwWorld_;
+
+    // LW shader pipeline (shared across LODs; per-LOD CB switches).
+    ComPtr<ID3D11VertexShader> vsLwPoints_;
+    ComPtr<ID3D11PixelShader>  psLwSplatAlbedo_;
+    ComPtr<ID3D11PixelShader>  psLwDebug_;
+    ComPtr<ID3D11PixelShader>  psLwLodViz_;
+    ComPtr<ID3D11VertexShader> vsLwBounds_;
+    ComPtr<ID3D11PixelShader>  psLwBounds_;
+    ComPtr<ID3D11Buffer>       cbLwFrame_;   // b0
+    ComPtr<ID3D11Buffer>       cbLwLod_;     // b1
+    ComPtr<ID3D11Buffer>       cbLwBounds_;  // b2
+    // Identity index buffer (0,1,2,...,N-1). BaseVertexLocation is added to
+    // SV_VertexID for indexed draws (StartVertexLocation is NOT for plain
+    // Draw), so we use DrawIndexed to encode (slotIdx<<24) in BaseVertexLocation.
+    ComPtr<ID3D11Buffer>       lwIdentityIb_;
+    uint32_t                   lwIdentityIbCount_ = 0;
     uint32_t width_ = 0, height_ = 0;
     uint64_t pointBytes_     = 0;
     uint64_t pointCountL0_   = 0;

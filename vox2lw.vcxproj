@@ -12,8 +12,8 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
-    <ProjectGuid>{4F5C9A8B-1F2C-4D6A-9C7B-1E0A2D3F4B11}</ProjectGuid>
-    <RootNamespace>voxeltest</RootNamespace>
+    <ProjectGuid>{B2C44E11-77A9-4DDC-B355-AB99CC22DD33}</ProjectGuid>
+    <RootNamespace>vox2lw</RootNamespace>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
@@ -34,7 +34,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
     <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\$(Configuration)\obj\</IntDir>
+    <IntDir>$(SolutionDir)build\$(Configuration)\obj\vox2lw\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -42,13 +42,12 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;$(ProjectDir)third_party\hlslpp\include;$(ProjectDir)third_party\microprofile;$(ProjectDir)third_party\lz4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;MICROPROFILE_ENABLED=1;MICROPROFILE_WEBSERVER=1;MICROPROFILE_GPU_TIMERS_D3D11=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)third_party\lz4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_CONSOLE;UNICODE;_UNICODE;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level3</WarningLevel>
     </ClCompile>
     <Link>
-      <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Console</SubSystem>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -71,39 +70,13 @@
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <OptimizeReferences>true</OptimizeReferences>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\main.cpp" />
-    <ClCompile Include="src\renderer.cpp" />
-    <ClCompile Include="src\vox_loader.cpp" />
-    <ClCompile Include="src\lw_loader.cpp" />
-    <ClCompile Include="third_party\imgui\imgui.cpp" />
-    <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
-    <ClCompile Include="third_party\imgui\imgui_tables.cpp" />
-    <ClCompile Include="third_party\imgui\imgui_widgets.cpp" />
-    <ClCompile Include="third_party\imgui\imgui_demo.cpp" />
-    <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp" />
-    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp" />
-    <ClCompile Include="third_party\microprofile\microprofile_impl.cpp" />
+    <ClCompile Include="tools\vox2lw\vox2lw.cpp" />
     <ClCompile Include="third_party\lz4\lz4.c">
       <CompileAs>CompileAsC</CompileAs>
     </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="src\camera.h" />
-    <ClInclude Include="src\lodworld.h" />
-    <ClInclude Include="src\mesh.h" />
-    <ClInclude Include="src\vox_loader.h" />
-    <ClInclude Include="src\renderer.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="shaders\common.hlsli" />
-    <None Include="shaders\voxel.hlsl" />
-    <None Include="shaders\postfx.hlsl" />
-    <None Include="voxeltest.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

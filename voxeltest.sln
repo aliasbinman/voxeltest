@@ -16,6 +16,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "box_stats", "box_stats.vcxp
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "voxtile", "voxtile.vcxproj", "{F1A23C77-8A11-4B22-9912-AC55667788DD}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "vox2lw", "vox2lw.vcxproj", "{B2C44E11-77A9-4DDC-B355-AB99CC22DD33}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -50,6 +52,10 @@ Global
 		{F1A23C77-8A11-4B22-9912-AC55667788DD}.Debug|x64.Build.0 = Debug|x64
 		{F1A23C77-8A11-4B22-9912-AC55667788DD}.Release|x64.ActiveCfg = Release|x64
 		{F1A23C77-8A11-4B22-9912-AC55667788DD}.Release|x64.Build.0 = Release|x64
+		{B2C44E11-77A9-4DDC-B355-AB99CC22DD33}.Debug|x64.ActiveCfg = Debug|x64
+		{B2C44E11-77A9-4DDC-B355-AB99CC22DD33}.Debug|x64.Build.0 = Debug|x64
+		{B2C44E11-77A9-4DDC-B355-AB99CC22DD33}.Release|x64.ActiveCfg = Release|x64
+		{B2C44E11-77A9-4DDC-B355-AB99CC22DD33}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
