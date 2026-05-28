@@ -1,0 +1,168 @@
+================================================================================
+code_Archive.txt — removed code reference
+================================================================================
+
+Engine is now LW-only (lodworld format `.lw`). This file documents removed
+legacy code in case any of it is wanted again. Full content of removed files
+is preserved via git history (use `git log -- <path>` + `git show <sha>:<path>`).
+
+--------------------------------------------------------------------------------
+SECTION 1 — fully removed source files
+--------------------------------------------------------------------------------
+
+src/vox_loader.cpp + vox_loader.h
+    Legacy VXL3 reader. Produced `Scene` struct with pointVertices, palette,
+    chunkMetas, baked AO + visMask per voxel. Also wrote/read .vxb sidecar
+    cache. Replaced by vox2lw (.vox → .lw) + lw_loader runtime.
+
+src/obj_loader.cpp + obj_loader.h + obj_scene.h
+    Wavefront .obj mesh loader. Unused in LW path.
+
+src/mesh.h
+    Legacy `Vertex` struct (12B: 3×uint16 pos + uint16 aux + uint32 color).
+    Used by GpuSubMesh + all per-tech legacy VS. LW uses DiskPoint (8B).
+
+src/vxw.h
+    Earlier clustered streamable format (Region + Cluster, 32³ clusters).
+    Superseded by lodworld.h (.lw format).
+
+--------------------------------------------------------------------------------
+SECTION 2 — removed tools
+--------------------------------------------------------------------------------
+
+tools/terrain_gen + terrain_gen.vcxproj
+    AWS Terrain Tiles → .vox heightmap baker. Producer-only.
+
+tools/city_gen + city_gen.vcxproj
+    OSM Overpass query → .vox city footprint baker.
+
+tools/landscape_gen + landscape_gen.vcxproj
+    Kidney-island procedural landscape with biomes, lakes, rivers, Runevision
+    analytical erosion.
+
+tools/voxtile + voxtile.vcxproj
+    Replicates a .vox in XZ with skirt-fill at chunk perimeters. Made
+    kingslanding25.vox (5×5 tile of kingslanding).
+
+tools/vox2vxw + vox2vxw.vcxproj
+    Converted .vox to old .vxw clustered format. Superseded by vox2lw.
+
+tools/box_stats + box_stats.vcxproj
+    Bucket-stats analyser: voxels per N³ box across LODs. Generated
+    docs/box_stats_*.md tables.
+
+--------------------------------------------------------------------------------
+SECTION 3 — removed renderer fields / methods (renderer.cpp/h)
+--------------------------------------------------------------------------------
+
+Removed (legacy Scene/Vertex path):
+  - Renderer::UploadScene(const Scene&)            // populated pointSb_, subs_
+  - Renderer::DrawScene(cam, args)                 // 1000-line legacy tech dispatcher
+  - Renderer::FillCbPerFrame(...)                  // (kept — still used by LW)
+  - GpuSubMesh struct (mesh.h dep)
+  - Fields: pointVb_, pointSb_, pointSrv_, pointAo6Sb_, pointAo6Srv_, subs_,
+            sceneOrigin_, sceneSpan_, pointCountL0..L3_, pointBytes_,
+            colorHistogram_, compRawBytes_/posBytes_/... (all stats fields),
+            polyVidIb_, billboardIb_, inputLayoutPolyVid_, inputLayout_,
+            vsPoints_, psPoints_, psPointsSimple_, vsShadow_, vsPolyVid_,
+            psPolyVid_, vsPolyAxis_, vsPolyAxisInst_, vsBillboard_, psBillboard_,
+            vsBillboardTri_, csPoints_, dsTest_/dsAlways_/dsAlwaysWrite_ (kept
+            — also used by LW path)
+  - All legacy shader compile/create blocks in CreateShaders()
+
+Kept (shared by LW):
+  - cbPerFrame_ (used by csmain_splat / composite / TAA / post)
+  - cbPerChunk_ (legacy — actually unused after removal; can drop)
+  - csSplat_, csSplatFill_, csShadowBlur_   (LW dilate pipeline)
+  - psSplatComposite_                       (LW composite)
+  - vsBlit_, vsTaa_, psTaa_, psPost_        (LW post pipeline)
+  - shadowTex_/Dsv_/Srv_ + shadowFilledTex_/Uav_/Srv_  (LW shadows reuse these)
+  - splatColorTex_/Rtv_/Srv_, splatDepthTex_/Dsv_/Srv_,
+    splatMaskTex_/Rtv_/Srv_, splatFinalTex_/Uav_/Srv_/DepthTex_/Uav_/Srv_,
+    splatFinal2*                            (LW draws to these)
+  - taaSceneTex_/Rtv_/Srv_, taaHist*        (LW TAA)
+  - rsSolid_, rsNoCull_, rsShadowFront_/Back_, dsTest_, dsAlways_,
+    dsAlwaysWrite_, bsAlphaOver_, linearClampSampler_, shadowSamp_
+
+--------------------------------------------------------------------------------
+SECTION 4 — removed shader entry points (shaders/voxel.hlsl)
+--------------------------------------------------------------------------------
+
+Legacy per-voxel VS/PS (operated on Scene/Vertex data, removed):
+  - vsmain_points / psmain_points / psmain_points_simple   (Points tech)
+  - vsmain_shadow                                          (legacy shadow caster)
+  - vsmain_polyvid + psmain_polyvid                        (PolyVID tech)
+  - vsmain_polyaxis                                        (PolyAxis classic VS)
+  - vsmain_polyaxis_instanced                              (PolyAxisInst VS)
+  - vsmain_billboard + psmain_billboard                    (Billboard tech)
+  - vsmain_billboard_tri                                   (BillboardTri tech)
+  - csmain_points_cs                                       (PointCS compute path)
+  - psmain_splat_albedo                                    (legacy splat PS;
+                                                            LW uses psmain_lw_splat_albedo)
+  - psmain_splat_reconstruct                               (alt splat output)
+  - psmain_blit                                            (unused)
+
+Kept in voxel.hlsl (LW reuses):
+  - cbPerFrame layout
+  - SplatEncodeAlpha
+  - ClusterTint
+  - ApplyFog
+  - SampleAmbientCubeTriplanar
+  - ApplyShadowLighting
+  - SampleShadow / shadow sampler
+  - Tonemap
+  - csmain_splat        (dilate)
+  - csmain_splat_fill   (2-pass dilate)
+  - csmain_shadow_blur
+  - psmain_splat_composite
+  - vsmain_blit, vsmain_taa, psmain_taa, psmain_post
+
+--------------------------------------------------------------------------------
+SECTION 5 — reference shader snippets (kept for future LW ports)
+--------------------------------------------------------------------------------
+
+# Per user: keep PolyAxis, PolyAxisInst, HexSprite shader signatures as
+# reference for porting more LW techs later. Full source preserved in git.
+# These were the LEGACY (Scene/Vertex) shader entry points.
+
+vsmain_polyaxis:
+    Input: voxel from gPolyVoxels via SV_VertexID + gVoxelBase. Emits 18
+    vertices per voxel (6 triangles forming 3 axis-aligned quads). Reads
+    aoPacked from gPolyAo6 for per-face AO. Uses gChunkBase + voxel pos
+    encoded uint16 px/py/pz. PS = psmain_polyvid (shared).
+
+vsmain_polyaxis_instanced:
+    Same geometry as vsmain_polyaxis but uses DrawInstanced(18, voxelCount,
+    0, pointFirst). SV_InstanceID picks voxel. PS = psmain_polyvid.
+
+vsmain_hex / psmain_hex (DISABLED in source):
+    Hex sprite path. 18 verts per voxel forming a hexagonal billboard with
+    triplanar shading. Was disabled (#if 0) because it needed a per-instance
+    vertex buffer which broke the single-SRV pool consolidation.
+
+--------------------------------------------------------------------------------
+SECTION 6 — main.cpp removed bits
+--------------------------------------------------------------------------------
+
+  - AppState fields: pendingScene (Scene), compScene, compStatus,
+                     everLoaded gate logic split, currentVoxPath rename
+                     (lwPath now)
+  - Legacy load branch: LoadVoxScene(...) — only LW path remains
+  - Legacy upload branch: renderer.UploadScene(...) — only UploadLwWorld
+  - Legacy draw branch: renderer.DrawScene(...) — only DrawLwScene
+  - Dataset discovery: now only *.lw (was *.vox + *.lw)
+  - Stats panel: removed legacy "Points (per LOD)" / "GPU Memory" / "CPU
+    Memory" sections that referenced PointCountL*/PointBytes/SubsBytes/
+    compScene. LW Stats section remains.
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+
+Restore any chunk via:
+    git log --all -- src/vox_loader.cpp        # find last commit
+    git show <sha>:src/vox_loader.cpp > vox_loader.cpp
+
+After this cleanup the engine builds + runs .lw files only. Open issues
+(visible per-face AO problems, polyaxis lighting tune) remain to address
+on the clean code base.

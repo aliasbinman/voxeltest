@@ -6,7 +6,6 @@
 
 #include "renderer.h"
 #include "camera.h"
-#include "vox_loader.h"
 #include "asset_version.h"
 
 #include "imgui.h"
@@ -150,13 +149,7 @@ struct AppState {
     std::string currentVoxPath;
     std::vector<std::string> datasetPaths;   // discovered assets/*.vox at startup
     int         datasetIdx = 0;              // index into datasetPaths
-    Scene       pendingScene;
     lw::World   pendingLwWorld;
-    bool        pendingIsLw = false;
-    // Snapshot kept after upload so on-demand compression analysis can run
-    // without holding the full pointVertices/ao6 buffers.
-    Scene       compScene;
-    std::string compStatus;
     bool        everLoaded = false;
     std::atomic<bool> reloadRequested{ false };
     std::atomic<bool> loadDone{ false };
@@ -297,40 +290,8 @@ void FrameStatsWindow()
     auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
 
     ImGui::Text("Scene");
-    {
-        size_t totalChunks = g_app.renderer.DrawCount() * (size_t)g_app.gridSize * (size_t)g_app.gridSize;
-        ImGui::Text("  Chunks: %zu  drawn: %u  (%.1f%%)",
-                    totalChunks,
-                    g_app.renderer.LastDrawnCount(),
-                    totalChunks ? 100.0f * g_app.renderer.LastDrawnCount() / (float)totalChunks : 0.0f);
-    }
+    ImGui::Text("  Drawn chunks: %u", g_app.renderer.LastDrawnCount());
     ImGui::Text("  Points drawn: %llu", (unsigned long long)g_app.renderer.LastPointCount());
-
-    ImGui::Separator();
-    ImGui::Text("Points (per LOD)");
-    {
-        const uint64_t bpp = sizeof(Vertex) + sizeof(uint32_t); // 12 + 4 = 16 B/pt
-        const uint64_t l0 = g_app.renderer.PointCountL0();
-        const uint64_t l1 = g_app.renderer.PointCountL1();
-        const uint64_t l2 = g_app.renderer.PointCountL2();
-        const uint64_t l3 = g_app.renderer.PointCountL3();
-        const uint64_t tot = l0 + l1 + l2 + l3;
-        ImGui::Text("  L0 (1 per voxel): %10llu  (%.2f MB)", (unsigned long long)l0, mb(l0 * bpp));
-        ImGui::Text("  L1 (2x2x2):       %10llu  (%.2f MB)", (unsigned long long)l1, mb(l1 * bpp));
-        ImGui::Text("  L2 (4x4x4):       %10llu  (%.2f MB)", (unsigned long long)l2, mb(l2 * bpp));
-        ImGui::Text("  L3 (8x8x8):       %10llu  (%.2f MB)", (unsigned long long)l3, mb(l3 * bpp));
-        ImGui::Text("  TOTAL:            %10llu  (%.2f MB)", (unsigned long long)tot, mb(g_app.renderer.PointBytes()));
-    }
-
-    ImGui::Separator();
-    ImGui::Text("GPU Memory");
-    {
-        const uint64_t pb = g_app.renderer.PointBytes();
-        const uint64_t rt = g_app.renderer.SplatRtBytes();
-        ImGui::Text("  Point VB + AO6:   %7.2f MB", mb(pb));
-        ImGui::Text("  Splat RTs/UAVs:   %7.2f MB", mb(rt));
-        ImGui::Text("  TOTAL:            %7.2f MB", mb(pb + rt));
-    }
 
     if (g_app.renderer.HasLwWorld()) {
         ImGui::Separator();
@@ -352,131 +313,8 @@ void FrameStatsWindow()
     }
 
     ImGui::Separator();
-    ImGui::Text("CPU Memory (world)");
-    {
-        const uint64_t subsB = g_app.renderer.SubsBytes();
-        const uint64_t compSubsB = g_app.compScene.subs.size() * sizeof(SubMesh);
-        const uint64_t compHistB = g_app.compScene.colorHistogram.size()
-                                 * sizeof(std::pair<uint32_t, uint64_t>);
-        const uint64_t total = subsB + compSubsB + compHistB;
-        ImGui::Text("  Renderer subs_:        %7.2f MB  (%zu chunks)",
-                    mb(subsB), (size_t)g_app.renderer.DrawCount());
-        ImGui::Text("  Compress-scene mirror: %7.2f MB  (subs %zu + hist %zu)",
-                    mb(compSubsB + compHistB),
-                    g_app.compScene.subs.size(), g_app.compScene.colorHistogram.size());
-        ImGui::Text("  TOTAL:                 %7.2f MB", mb(total));
-    }
-
-    ImGui::Separator();
-    ImGui::Text("Disk Compression Sim (L0 stream)");
-    if (ImGui::Button("Run analysis") && !g_app.currentVoxPath.empty()) {
-        std::string err;
-        if (RunCompressionAnalysis(g_app.currentVoxPath.c_str(), g_app.compScene, err)) {
-            g_app.compStatus = "done";
-        } else {
-            g_app.compStatus = "error: " + err;
-        }
-    }
-    ImGui::SameLine();
-    ImGui::TextUnformatted(g_app.compStatus.c_str());
-    {
-        const Scene& cs = g_app.compScene;
-        const uint64_t raw   = cs.compRawBytes;
-        const uint64_t pos   = cs.compPosBytes;
-        const uint64_t mask  = cs.compMaskBytes;
-        const uint64_t ao    = cs.compAoBytes;
-        const uint64_t pal   = cs.compPaletteBytes;
-        const uint64_t cpal  = cs.compColorPalIdxBytes;
-        const uint64_t chuff = cs.compColorHuffBytes;
-        const uint64_t fixed = pos + mask + ao;
-        const uint64_t totPal  = fixed + cpal  + pal;
-        const uint64_t totHuff = fixed + chuff + pal;
-        auto ratio = [&](uint64_t t) { return t ? (double)raw / (double)t : 0.0; };
-        if (raw == 0) {
-            ImGui::TextUnformatted("  (no results yet — click Run analysis)");
-        } else {
-            ImGui::Text("  chunkDim %u, posBits/axis %u",
-                        cs.compChunkDim, cs.compPosBitsPerAxis);
-            ImGui::Text("  Raw (in-mem):   %7.2f MB", mb(raw));
-            ImGui::Text("  Pos stream:     %7.2f MB", mb(pos));
-            ImGui::Text("  visMask stream: %7.2f MB", mb(mask));
-            ImGui::Text("  AO stream:      %7.2f MB", mb(ao));
-            ImGui::Text("  Color (pal8):   %7.2f MB  + palette %llu B", mb(cpal), (unsigned long long)pal);
-            ImGui::Text("  Color (huff):   %7.2f MB  + palette %llu B", mb(chuff), (unsigned long long)pal);
-            ImGui::Separator();
-            ImGui::Text("  TOTAL pal8:     %7.2f MB  (%.2fx vs raw)", mb(totPal),  ratio(totPal));
-            ImGui::Text("  TOTAL huff:     %7.2f MB  (%.2fx vs raw)", mb(totHuff), ratio(totHuff));
-
-            const uint64_t subPos = cs.compSubclusterPosBytes;
-            const uint32_t subDim = cs.compSubclusterDim;
-            const uint64_t totSub = (fixed - pos) + subPos + cpal + pal;
-            ImGui::Separator();
-            ImGui::Text("Sub-cluster pos (S=%u): %.2f MB  (raw pos %.2f MB)",
-                        subDim, mb(subPos), mb(pos));
-            ImGui::Text("  TOTAL pal8+sub: %7.2f MB  (%.2fx vs raw)", mb(totSub), ratio(totSub));
-
-            const uint64_t lzP = cs.compLz4PosBytes;
-            const uint64_t lzM = cs.compLz4MaskBytes;
-            const uint64_t lzA = cs.compLz4AoBytes;
-            const uint64_t lzC = cs.compLz4ColorPalBytes;
-            const uint64_t lzT = cs.compLz4TotalBytes;
-            ImGui::Separator();
-            ImGui::Text("LZ4 per-cluster:");
-            ImGui::Text("  pos     %7.2f MB  (-> %.1f%% of raw)", mb(lzP), pos  ? 100.0 * lzP / (double)pos  : 0.0);
-            ImGui::Text("  mask    %7.2f MB  (-> %.1f%% of raw)", mb(lzM), mask ? 100.0 * lzM / (double)mask : 0.0);
-            ImGui::Text("  ao      %7.2f MB  (-> %.1f%% of raw)", mb(lzA), ao   ? 100.0 * lzA / (double)ao   : 0.0);
-            ImGui::Text("  colorPI %7.2f MB  (-> %.1f%% of raw)", mb(lzC), cpal ? 100.0 * lzC / (double)cpal : 0.0);
-            ImGui::Text("  TOTAL   %7.2f MB  (%.2fx vs raw, %.2fx vs pal8 uncompressed)",
-                        mb(lzT), ratio(lzT), totPal ? (double)totPal / (double)lzT : 0.0);
-        }
-    }
-
-    ImGui::Separator();
-    {
-        const auto& hist = g_app.renderer.ColorHistogram();
-        uint64_t totalVoxels = 0;
-        for (const auto& p : hist) totalVoxels += p.second;
-        ImGui::Text("Color Histogram (%zu unique, %llu voxels)",
-                    hist.size(), (unsigned long long)totalVoxels);
-        {
-            const double hBits   = g_app.renderer.ColorEntropyBits();
-            const double huff    = g_app.renderer.ColorHuffmanBits();
-            const uint32_t palBits = g_app.renderer.ColorPaletteBits();
-            const double raw24Mb = mb((uint64_t)totalVoxels * 3);   // 24 bpp
-            const double palMb   = mb(((uint64_t)totalVoxels * palBits + 7) / 8);
-            const double huffMb  = (totalVoxels * huff) / 8.0 / (1024.0 * 1024.0);
-            const double entMb   = (totalVoxels * hBits) / 8.0 / (1024.0 * 1024.0);
-            ImGui::Text("  Raw RGB24:    24.00 bits/color  (%7.2f MB)", raw24Mb);
-            ImGui::Text("  Palette idx:  %2u   bits/color  (%7.2f MB)  [palette %zu*3B = %.1f KB]",
-                        palBits, palMb, hist.size(), hist.size() * 3 / 1024.0);
-            ImGui::Text("  Huffman avg:  %5.3f bits/color  (%7.2f MB)", huff, huffMb);
-            ImGui::Text("  Shannon H:    %5.3f bits/color  (%7.2f MB, theoretical min)",
-                        hBits, entMb);
-            if (raw24Mb > 0.0) {
-                ImGui::Text("  Huffman ratio vs RGB24: %.2fx smaller", raw24Mb / (huffMb > 0.0 ? huffMb : 1e-9));
-            }
-        }
-        if (ImGui::BeginChild("##colorhist", ImVec2(0, 220), true,
-                              ImGuiWindowFlags_HorizontalScrollbar)) {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const float sw = ImGui::GetFontSize();
-            for (const auto& p : hist) {
-                const uint32_t c = p.first;
-                const uint8_t r = (uint8_t)(c & 0xFF);
-                const uint8_t g = (uint8_t)((c >> 8) & 0xFF);
-                const uint8_t b = (uint8_t)((c >> 16) & 0xFF);
-                ImVec2 pos = ImGui::GetCursorScreenPos();
-                dl->AddRectFilled(pos, ImVec2(pos.x + sw, pos.y + sw),
-                                  IM_COL32(r, g, b, 255));
-                ImGui::Dummy(ImVec2(sw, sw));
-                ImGui::SameLine();
-                const double pct = totalVoxels ? 100.0 * (double)p.second / (double)totalVoxels : 0.0;
-                ImGui::Text("#%02X%02X%02X  %10llu  (%.2f%%)",
-                            r, g, b, (unsigned long long)p.second, pct);
-            }
-        }
-        ImGui::EndChild();
-    }
+    ImGui::Text("GPU (shared)");
+    ImGui::Text("  Splat RTs/UAVs:   %7.2f MB", mb(g_app.renderer.SplatRtBytes()));
 
     ImGui::Separator();
     ImGui::Text("Camera");
@@ -516,19 +354,12 @@ void FrameControlsWindow()
             }
         }
     }
-    // Single tech combo: point-derived techniques only.
     struct TechEntry { const char* name; RenderTech val; };
     static const TechEntry kTechList[] = {
-        { "Points",       RenderTech::Points       },
-        // HexSprite disabled — dropped to allow single structured-SRV point buffer.
-        // { "HexSprite",    RenderTech::HexSprite    },
-        { "PointCS",      RenderTech::PointCS      },
-        { "PolyVID",      RenderTech::PolyVID      },
-        { "Billboard",    RenderTech::Billboard    },
-        { "BillboardTri", RenderTech::BillboardTri },
         { "Splat",        RenderTech::Splat        },
         { "PolyAxis",     RenderTech::PolyAxis     },
         { "PolyAxisInst", RenderTech::PolyAxisInstanced },
+        { "HexSprite",    RenderTech::HexSprite    },
     };
     const int kTechCount = (int)(sizeof(kTechList) / sizeof(kTechList[0]));
     auto techIdxFrom = [&](RenderTech v) -> int {
@@ -746,16 +577,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             const std::string& voxPath = g_app.datasetPaths[idx];
             g_app.currentVoxPath = voxPath;
             g_app.loadStatus = std::string("Loading ") + voxPath + "...";
-            bool ok;
-            if (IsLwPath(voxPath)) {
-                g_app.pendingIsLw = true;
-                ok = lw::LoadWorld(voxPath.c_str(), g_app.pendingLwWorld, err);
-                if (!ok && err.empty()) err = "lw load failed";
-            } else {
-                g_app.pendingIsLw = false;
-                ok = LoadVoxScene(voxPath.c_str(), g_app.pendingScene, err);
-                if (!ok && err.empty()) err = "vox load failed";
-            }
+            bool ok = lw::LoadWorld(voxPath.c_str(), g_app.pendingLwWorld, err);
+            if (!ok && err.empty()) err = "lw load failed";
             g_app.loadErr = err;
             g_app.loadOk.store(ok);
             g_app.loadDone.store(true);
@@ -788,60 +611,26 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             kickLoader();
         }
 
-        // upload scene once loader done
+        // upload world once loader done
         if (g_app.loadDone.load() && !g_app.sceneReady) {
             if (g_app.loadOk.load()) {
-                bool firstUpload = !g_app.everLoaded;
-                if (g_app.pendingIsLw) {
-                    // Free legacy Scene side; upload the LW world.
-                    g_app.renderer.UploadScene(Scene{});  // clear legacy SRVs
-                    g_app.renderer.UploadLwWorld(g_app.pendingLwWorld);
-                    // Always re-center on LW load (legacy path only re-centers
-                    // on first-ever upload, but switching format wants a reset).
-                    {
-                        const auto& w = g_app.pendingLwWorld;
-                        float cx = 0.5f * (float)(w.worldAabbMin[0] + w.worldAabbMax[0]);
-                        float cz = 0.5f * (float)(w.worldAabbMin[2] + w.worldAabbMax[2]);
-                        float topY = (float)w.worldAabbMax[1];
-                        float dx = (float)(w.worldAabbMax[0] - w.worldAabbMin[0]);
-                        float dz = (float)(w.worldAabbMax[2] - w.worldAabbMin[2]);
-                        float ext = (dx > dz ? dx : dz);
-                        // Pull back + up + tilt down so the whole footprint is
-                        // visible from the off-bat (vs the legacy default which
-                        // skylines you over the model).
-                        g_app.camera.position = hlslpp::float3(cx, topY + ext * 0.5f, cz - ext * 0.5f);
-                        g_app.camera.yaw   = 0.0f;
-                        g_app.camera.pitch = -0.5f;          // ~ -28 deg
-                        g_app.camera.moveSpeed = ext * 0.05f;
-                        g_app.camera.farZ = ext * 4.0f + 1000.0f;
-                    }
-                    g_app.pendingLwWorld = lw::World{};
-                } else {
-                    g_app.renderer.ClearLwWorld();
-                    g_app.renderer.UploadScene(g_app.pendingScene);
-                    if (firstUpload) {
-                        float cx = 0.5f * (g_app.pendingScene.aabbMin[0] + g_app.pendingScene.aabbMax[0]);
-                        float cz = 0.5f * (g_app.pendingScene.aabbMin[2] + g_app.pendingScene.aabbMax[2]);
-                        float topY = g_app.pendingScene.aabbMax[1];
-                        float dx = g_app.pendingScene.aabbMax[0] - g_app.pendingScene.aabbMin[0];
-                        float dz = g_app.pendingScene.aabbMax[2] - g_app.pendingScene.aabbMin[2];
-                        float ext = (dx > dz ? dx : dz);
-                        g_app.camera.position = hlslpp::float3(cx, topY, cz);
-                        g_app.camera.yaw = 0.0f;
-                        g_app.camera.pitch = 0.0f;
-                        g_app.camera.moveSpeed = ext * 0.05f;
-                        g_app.camera.farZ = ext * 4.0f + 1000.0f;
-                    }
+                g_app.renderer.UploadLwWorld(g_app.pendingLwWorld);
+                {
+                    const auto& w = g_app.pendingLwWorld;
+                    float cx = 0.5f * (float)(w.worldAabbMin[0] + w.worldAabbMax[0]);
+                    float cz = 0.5f * (float)(w.worldAabbMin[2] + w.worldAabbMax[2]);
+                    float topY = (float)w.worldAabbMax[1];
+                    float dx = (float)(w.worldAabbMax[0] - w.worldAabbMin[0]);
+                    float dz = (float)(w.worldAabbMax[2] - w.worldAabbMin[2]);
+                    float ext = (dx > dz ? dx : dz);
+                    g_app.camera.position = hlslpp::float3(cx, topY + ext * 0.5f, cz - ext * 0.5f);
+                    g_app.camera.yaw   = 0.0f;
+                    g_app.camera.pitch = -0.5f;
+                    g_app.camera.moveSpeed = ext * 0.05f;
+                    g_app.camera.farZ = ext * 4.0f + 1000.0f;
                 }
+                g_app.pendingLwWorld = lw::World{};
                 g_app.everLoaded = true;
-                // Snapshot lightweight bits for on-demand compression analysis
-                // (histogram + per-chunk subs). Keeps full pointVertices out of
-                // memory after the upload.
-                g_app.compScene = Scene{};
-                g_app.compScene.colorHistogram = g_app.pendingScene.colorHistogram;
-                g_app.compScene.subs           = g_app.pendingScene.subs;
-                g_app.compStatus.clear();
-                g_app.pendingScene = Scene{};
                 g_app.sceneReady = true;
                 g_app.loadStatus = "Loaded.";
             } else {
@@ -930,8 +719,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.roughness        = g_app.roughness;
             if (g_app.renderer.HasLwWorld()) {
                 g_app.renderer.DrawLwScene(g_app.camera, ps);
-            } else {
-                g_app.renderer.DrawScene(g_app.camera, ps);
             }
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

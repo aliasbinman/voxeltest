@@ -78,7 +78,6 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\renderer.cpp" />
-    <ClCompile Include="src\vox_loader.cpp" />
     <ClCompile Include="src\lw_loader.cpp" />
     <ClCompile Include="third_party\imgui\imgui.cpp" />
     <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
@@ -95,8 +94,6 @@
   <ItemGroup>
     <ClInclude Include="src\camera.h" />
     <ClInclude Include="src\lodworld.h" />
-    <ClInclude Include="src\mesh.h" />
-    <ClInclude Include="src\vox_loader.h" />
     <ClInclude Include="src\renderer.h" />
   </ItemGroup>
   <ItemGroup>
