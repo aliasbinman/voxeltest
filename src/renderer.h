@@ -313,6 +313,7 @@ private:
     ComPtr<ID3D11Buffer>       cbLwFrame_;   // b0
     ComPtr<ID3D11Buffer>       cbLwLod_;     // b1
     ComPtr<ID3D11Buffer>       cbLwBounds_;  // b2
+    bool                       tearingSupported_ = false;
     // Identity index buffer (0,1,2,...,N-1). BaseVertexLocation is added to
     // SV_VertexID for indexed draws (StartVertexLocation is NOT for plain
     // Draw), so we use DrawIndexed to encode (slotIdx<<24) in BaseVertexLocation.

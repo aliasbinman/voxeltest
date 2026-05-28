@@ -366,6 +366,18 @@ bool Renderer::CreateDeviceAndSwap(HWND hwnd, int adapterIdx)
     ComPtr<IDXGIFactory2> factory;
     adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf()));
 
+    // Detect tearing support so windowed Present can uncap above refresh.
+    tearingSupported_ = false;
+    {
+        ComPtr<IDXGIFactory5> f5;
+        if (SUCCEEDED(factory.As(&f5))) {
+            BOOL allow = FALSE;
+            if (SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow)))) {
+                tearingSupported_ = (allow == TRUE);
+            }
+        }
+    }
+
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.Width = 0; sd.Height = 0;
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -374,10 +386,14 @@ bool Renderer::CreateDeviceAndSwap(HWND hwnd, int adapterIdx)
     sd.BufferCount = 2;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Scaling = DXGI_SCALING_STRETCH;
+    if (tearingSupported_) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
     hr = factory->CreateSwapChainForHwnd(
         device_.Get(), hwnd, &sd, nullptr, nullptr, swap_.GetAddressOf());
-    return SUCCEEDED(hr);
+    if (FAILED(hr)) return false;
+    // Disable DXGI's Alt-Enter auto fullscreen (needed for tearing).
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    return true;
 }
 
 bool Renderer::CreateRenderTargets()
@@ -884,7 +900,8 @@ void Renderer::Resize(uint32_t w, uint32_t h)
     rtv_.Reset();
     dsv_.Reset();
     depthTex_.Reset();
-    swap_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    swap_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN,
+                         tearingSupported_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     width_ = w; height_ = h;
     CreateRenderTargets();
 }
@@ -2930,5 +2947,6 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
 void Renderer::EndFrame(bool vsync)
 {
-    swap_->Present(vsync ? 1 : 0, 0);
+    UINT presentFlags = (!vsync && tearingSupported_) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    swap_->Present(vsync ? 1 : 0, presentFlags);
 }
