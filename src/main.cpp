@@ -331,6 +331,25 @@ void FrameStatsWindow()
         ImGui::Text("  TOTAL:            %7.2f MB", mb(pb + rt));
     }
 
+    if (g_app.renderer.HasLwWorld()) {
+        ImGui::Separator();
+        ImGui::Text("LW (lodworld)");
+        uint64_t totBytes = 0;
+        uint32_t totChunks = 0;
+        uint64_t totPoints = 0;
+        for (int L = 0; L < lw::kLodCount; ++L) {
+            uint32_t s  = g_app.renderer.LwSlotCount(L);
+            uint32_t pc = g_app.renderer.LwPointCount(L);
+            uint64_t bs = g_app.renderer.LwBytes(L);
+            ImGui::Text("  L%d chunks=%-4u points=%9u  %7.2f MB", L, s, pc, mb(bs));
+            totChunks += s;
+            totPoints += pc;
+            totBytes  += bs;
+        }
+        ImGui::Text("  TOTAL chunks=%u points=%llu  %.2f MB",
+                    totChunks, (unsigned long long)totPoints, mb(totBytes));
+    }
+
     ImGui::Separator();
     ImGui::Text("CPU Memory (world)");
     {

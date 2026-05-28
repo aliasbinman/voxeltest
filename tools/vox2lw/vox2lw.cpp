@@ -91,6 +91,48 @@ struct BakedChunk {
     std::vector<lw::DiskPoint> points;
 };
 
+// Per-cluster compression encoded data. Chosen ordering = smaller of
+// {Y-major, Morton}.
+struct ClusterEnc {
+    uint8_t orderMode = lw::kOrderYMajor;
+    std::vector<uint8_t> bitGrid;
+    std::vector<uint8_t> colors;
+};
+
+static ClusterEnc EncodeClusterTryBoth(const lw::DiskPoint* pts, uint32_t numPts,
+                                       uint64_t& outYBytes, uint64_t& outMBytes)
+{
+    auto tryOrder = [&](lw::LwOrderMode mode) -> ClusterEnc {
+        uint8_t grid[lw::kClusterCellCount];
+        std::memset(grid, 0, sizeof(grid));
+        uint8_t palAt[lw::kClusterCellCount];
+        for (uint32_t i = 0; i < numPts; ++i) {
+            const lw::DiskPoint& p = pts[i];
+            uint32_t lx = (uint32_t)(p.posX % lw::kClusterVoxX);
+            uint32_t ly = (uint32_t)(p.posY % lw::kClusterVoxY);
+            uint32_t lz = (uint32_t)(p.posZ % lw::kClusterVoxZ);
+            uint32_t idx = lw::LwCellIndex(mode, lx, ly, lz);
+            grid[idx] = 1;
+            palAt[idx] = p.palIdx;
+        }
+        ClusterEnc e;
+        e.orderMode = (uint8_t)mode;
+        lw::RleEncodeBitGrid(grid, e.bitGrid);
+        e.colors.reserve(numPts);
+        for (uint32_t i = 0; i < lw::kClusterCellCount; ++i) {
+            if (grid[i]) e.colors.push_back(palAt[i]);
+        }
+        return e;
+    };
+    ClusterEnc y = tryOrder(lw::kOrderYMajor);
+    ClusterEnc m = tryOrder(lw::kOrderMorton);
+    outYBytes += y.bitGrid.size() + y.colors.size();
+    outMBytes += m.bitGrid.size() + m.colors.size();
+    if (y.bitGrid.size() + y.colors.size() <= m.bitGrid.size() + m.colors.size())
+        return y;
+    return m;
+}
+
 // ---------- main ----------
 int main(int argc, char** argv)
 {
@@ -400,26 +442,54 @@ int main(int argc, char** argv)
         // reserve
         fwrite(entries.data(), sizeof(lw::ChunkEntry), entries.size(), o);
 
+        uint64_t lodYBytes = 0, lodMBytes = 0;
+        uint64_t lodChoseY = 0, lodChoseM = 0;
         for (size_t i = 0; i < lods[L].size(); ++i) {
             const BakedChunk& bc = lods[L][i];
-            // Serialize blob into one buffer first to know its size.
+
+            // Build per-cluster encoded blobs (bit-grid + colors).
+            std::vector<ClusterEnc> ces(lw::kClustersPerChunk);
+            uint8_t clusterMask[16] = {};
+            uint64_t yT = 0, mT = 0;
+            for (int s = 0; s < lw::kClustersPerChunk; ++s) {
+                const lw::DiskCluster& cl = bc.clusters[s];
+                if (cl.numPoints == 0) continue;
+                clusterMask[s >> 3] |= (uint8_t)(1u << (s & 7));
+                ces[s] = EncodeClusterTryBoth(&bc.points[cl.pointFirst], cl.numPoints, yT, mT);
+                if (ces[s].orderMode == lw::kOrderYMajor) ++lodChoseY; else ++lodChoseM;
+            }
+            lodYBytes += yT;
+            lodMBytes += mT;
+
+            // Serialize compressed chunk blob:
+            //   DiskChunkHeader
+            //   palette
+            //   clusterMask[16]
+            //   per non-empty cluster: orderMode + LEB128 numPoints
+            //                          + LEB128 bgSize + bgBytes + colorsBytes
             std::vector<uint8_t> blob;
-            blob.reserve(sizeof(bc.hdr)
-                       + bc.palette.size() * sizeof(uint32_t)
-                       + sizeof(bc.clusters)
-                       + bc.points.size() * sizeof(lw::DiskPoint));
-            auto push = [&](const void* p, size_t n){
+            blob.reserve(sizeof(bc.hdr) + bc.palette.size() * 4 + 16 + 1024);
+            auto push = [&](const void* p, size_t n) {
                 blob.insert(blob.end(), (const uint8_t*)p, (const uint8_t*)p + n);
             };
             push(&bc.hdr, sizeof(bc.hdr));
             if (!bc.palette.empty()) push(bc.palette.data(), bc.palette.size() * sizeof(uint32_t));
-            push(bc.clusters, sizeof(bc.clusters));
-            if (!bc.points.empty()) push(bc.points.data(), bc.points.size() * sizeof(lw::DiskPoint));
+            push(clusterMask, sizeof(clusterMask));
+            for (int s = 0; s < lw::kClustersPerChunk; ++s) {
+                const lw::DiskCluster& cl = bc.clusters[s];
+                if (cl.numPoints == 0) continue;
+                const ClusterEnc& ce = ces[s];
+                blob.push_back(ce.orderMode);
+                lw::Leb128PutU32(blob, (uint32_t)cl.numPoints);
+                lw::Leb128PutU32(blob, (uint32_t)ce.bitGrid.size());
+                if (!ce.bitGrid.empty()) push(ce.bitGrid.data(), ce.bitGrid.size());
+                if (!ce.colors.empty()) push(ce.colors.data(), ce.colors.size());
+            }
 
-            // LZ4 compress; fall back to raw if compression wouldn't help.
+            // LZ4 on top (header + cluster mask + RLE+colors residual redundancy).
             std::vector<uint8_t> cblob;
             uint32_t writeBytes;
-            uint32_t flags;
+            uint32_t flags = lw::kFlagBitGrid;
             const int rawSize = (int)blob.size();
             const int cap = LZ4_compressBound(rawSize);
             cblob.resize((size_t)cap);
@@ -428,17 +498,13 @@ int main(int argc, char** argv)
                                              rawSize, cap);
             if (cSize > 0 && cSize < rawSize) {
                 writeBytes = (uint32_t)cSize;
-                flags = lw::kFlagLz4;
+                flags |= lw::kFlagLz4;
             } else {
                 writeBytes = (uint32_t)rawSize;
-                flags = 0;
             }
             uint64_t blobOff = (uint64_t)ftell(o);
-            if (flags & lw::kFlagLz4) {
-                fwrite(cblob.data(), 1, writeBytes, o);
-            } else {
-                fwrite(blob.data(), 1, writeBytes, o);
-            }
+            if (flags & lw::kFlagLz4) fwrite(cblob.data(), 1, writeBytes, o);
+            else                       fwrite(blob.data(),  1, writeBytes, o);
 
             entries[i].gridX = bc.hdr.gridX;
             entries[i].gridY = bc.hdr.gridY;
@@ -454,6 +520,13 @@ int main(int argc, char** argv)
         fseek(o, entryStart, SEEK_SET);
         fwrite(entries.data(), sizeof(lw::ChunkEntry), entries.size(), o);
         fseek(o, end, SEEK_SET);
+
+        if (!lods[L].empty()) {
+            printf("[LOD %d] order pick: Y=%llu M=%llu  total Y-only=%llu B, M-only=%llu B\n",
+                   L,
+                   (unsigned long long)lodChoseY, (unsigned long long)lodChoseM,
+                   (unsigned long long)lodYBytes, (unsigned long long)lodMBytes);
+        }
     }
 
     // Patch LODHeaders with offsets.

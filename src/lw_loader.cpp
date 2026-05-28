@@ -92,11 +92,9 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                 blobPtr = rawBlob.data();
                 blobSize = rawBlob.size();
             }
-            // Re-bind `blob` alias used by parser below.
-            std::vector<uint8_t> blob(blobPtr, blobPtr + blobSize);
-            // Parse: DiskChunkHeader, palette[paletteCount], DiskCluster[kClustersPerChunk], DiskPoint[totalPoints]
-            const uint8_t* p = blob.data();
-            const uint8_t* end = p + blob.size();
+            // Parse common header.
+            const uint8_t* p = blobPtr;
+            const uint8_t* end = blobPtr + blobSize;
             if ((size_t)(end - p) < sizeof(DiskChunkHeader)) {
                 fclose(f); err = "blob too small for header"; return false;
             }
@@ -104,12 +102,9 @@ bool LoadWorld(const char* path, World& out, std::string& err)
             memcpy(&dch, p, sizeof(dch)); p += sizeof(dch);
 
             const size_t palBytes = dch.paletteCount * sizeof(uint32_t);
-            const size_t clusterBytes = sizeof(DiskCluster) * kClustersPerChunk;
-            const size_t pointBytes = (size_t)dch.totalPoints * sizeof(DiskPoint);
-            if ((size_t)(end - p) < palBytes + clusterBytes + pointBytes) {
-                fclose(f); err = "blob too small for body"; return false;
+            if ((size_t)(end - p) < palBytes) {
+                fclose(f); err = "blob too small for palette"; return false;
             }
-
             RuntimeChunk& rc = lw.chunks[i];
             rc.gridX = dch.gridX; rc.gridY = dch.gridY; rc.gridZ = dch.gridZ;
             rc.worldOriginX = dch.worldOriginX;
@@ -119,23 +114,91 @@ bool LoadWorld(const char* path, World& out, std::string& err)
             rc.aabbMin[0] = dch.aabbMin[0]; rc.aabbMin[1] = dch.aabbMin[1]; rc.aabbMin[2] = dch.aabbMin[2];
             rc.aabbMax[0] = dch.aabbMax[0]; rc.aabbMax[1] = dch.aabbMax[1]; rc.aabbMax[2] = dch.aabbMax[2];
             for (int k = 0; k < 8; ++k) rc.childId[k] = dch.childId[k];
-
             rc.paletteCount = dch.paletteCount;
             memset(rc.palette, 0, sizeof(rc.palette));
             if (palBytes) memcpy(rc.palette, p, palBytes);
             p += palBytes;
 
-            memcpy(rc.clusters, p, clusterBytes); p += clusterBytes;
-
-            // Pool: append chunk's points; record base.
             rc.poolBase = (uint32_t)lw.pointPool.size();
             rc.poolCount = dch.totalPoints;
-            rc.slotIdx = i;  // For Phase 1 (no streaming), slot == chunk index.
+            rc.slotIdx = i;
 
-            if (pointBytes) {
-                lw.pointPool.resize(lw.pointPool.size() + dch.totalPoints);
-                memcpy(lw.pointPool.data() + rc.poolBase, p, pointBytes);
-                p += pointBytes;
+            if (ce.flags & kFlagBitGrid) {
+                // Compressed: cluster mask + per-cluster (orderMode, leb128 nP,
+                // leb128 bgSize, bgBytes, colorBytes). Reconstruct
+                // rc.clusters[] + DiskPoint pool entries.
+                if ((size_t)(end - p) < 16) { fclose(f); err = "blob short for clusterMask"; return false; }
+                uint8_t clusterMask[16];
+                memcpy(clusterMask, p, 16); p += 16;
+
+                memset(rc.clusters, 0, sizeof(rc.clusters));
+                lw.pointPool.resize(rc.poolBase + dch.totalPoints);
+                uint32_t writePos = rc.poolBase;
+                uint8_t bits[kClusterCellCount];
+
+                for (int s = 0; s < kClustersPerChunk; ++s) {
+                    if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
+                    if (p >= end) { fclose(f); err = "blob short in cluster stream"; return false; }
+                    uint8_t orderMode = *p++;
+                    uint32_t nP = Leb128GetU32(p);
+                    uint32_t bgSize = Leb128GetU32(p);
+                    if (bgSize > (uint32_t)(end - p)) { fclose(f); err = "bgSize > remaining"; return false; }
+                    RleDecodeBitGrid(p, bgSize, bits);
+                    p += bgSize;
+                    if (nP > (uint32_t)(end - p)) { fclose(f); err = "colors > remaining"; return false; }
+                    const uint8_t* colors = p;
+                    p += nP;
+
+                    int cz_g = s / (kClustersX * kClustersY);
+                    int cy_g = (s / kClustersX) % kClustersY;
+                    int cx_g = s % kClustersX;
+                    uint8_t clMn[3] = { 31, 31, 31 };
+                    uint8_t clMx[3] = { 0, 0, 0 };
+
+                    rc.clusters[s].pointFirst = writePos - rc.poolBase;
+                    rc.clusters[s].numPoints  = (uint16_t)nP;
+                    rc.clusters[s]._pad = 0;
+
+                    uint32_t emitted = 0;
+                    for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
+                        if (!bits[cidx]) continue;
+                        uint32_t lx, ly, lz;
+                        LwCellCoord((LwOrderMode)orderMode, cidx, lx, ly, lz);
+                        DiskPoint dp;
+                        dp.posX = (uint8_t)(cx_g * kClusterVoxX + lx);
+                        dp.posY = (uint8_t)(cy_g * kClusterVoxY + ly);
+                        dp.posZ = (uint8_t)(cz_g * kClusterVoxZ + lz);
+                        dp.palIdx = colors[emitted];
+                        dp.visMask = 0x3F;          // AO/visMask not stored in compressed v0
+                        dp.aoPacked[0] = 0xFF;
+                        dp.aoPacked[1] = 0xFF;
+                        dp.aoPacked[2] = 0xFF;
+                        lw.pointPool[writePos + emitted] = dp;
+                        if (lx < clMn[0]) clMn[0] = (uint8_t)lx;
+                        if (ly < clMn[1]) clMn[1] = (uint8_t)ly;
+                        if (lz < clMn[2]) clMn[2] = (uint8_t)lz;
+                        if (lx > clMx[0]) clMx[0] = (uint8_t)lx;
+                        if (ly > clMx[1]) clMx[1] = (uint8_t)ly;
+                        if (lz > clMx[2]) clMx[2] = (uint8_t)lz;
+                        ++emitted;
+                    }
+                    rc.clusters[s].bounds = PackClusterBounds(
+                        clMn[0], clMn[1], clMn[2], clMx[0], clMx[1], clMx[2]);
+                    writePos += emitted;
+                }
+            } else {
+                // Legacy raw format (no compression).
+                const size_t clusterBytes = sizeof(DiskCluster) * kClustersPerChunk;
+                const size_t pointBytes = (size_t)dch.totalPoints * sizeof(DiskPoint);
+                if ((size_t)(end - p) < clusterBytes + pointBytes) {
+                    fclose(f); err = "blob too small for raw body"; return false;
+                }
+                memcpy(rc.clusters, p, clusterBytes); p += clusterBytes;
+                if (pointBytes) {
+                    lw.pointPool.resize(lw.pointPool.size() + dch.totalPoints);
+                    memcpy(lw.pointPool.data() + rc.poolBase, p, pointBytes);
+                    p += pointBytes;
+                }
             }
         }
 

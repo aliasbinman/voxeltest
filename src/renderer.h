@@ -106,6 +106,16 @@ public:
     void ClearLwWorld();
     bool HasLwWorld() const { return lwHasWorld_; }
     void DrawLwScene(const Camera& cam, const DrawSceneParams& args);
+
+    // LW per-LOD stats (Phase 1: all chunks always resident).
+    uint32_t LwSlotCount (int L) const { return (L >= 0 && L < lw::kLodCount) ? lwGpu_[L].slotCount  : 0; }
+    uint32_t LwPointCount(int L) const { return (L >= 0 && L < lw::kLodCount) ? lwGpu_[L].pointCount : 0; }
+    uint64_t LwBytes     (int L) const { return (L >= 0 && L < lw::kLodCount) ? lwGpu_[L].bytes      : 0; }
+    uint64_t LwTotalBytes() const {
+        uint64_t t = 0;
+        for (int L = 0; L < lw::kLodCount; ++L) t += lwGpu_[L].bytes;
+        return t;
+    }
     void Resize(uint32_t w, uint32_t h);
     void UploadScene(const Scene& scene);
     void BeginFrame(float clear[4]);

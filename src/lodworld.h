@@ -10,6 +10,7 @@
 // uncompressed blobs. Streaming + per-chunk LZ4 added in later phases.
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <string>
 
@@ -165,7 +166,124 @@ static_assert(sizeof(DiskChunkHeader) == 60, "");
 inline constexpr uint32_t kFileMagic   = 0x31574F4Cu;  // "LOW1" little-endian
 inline constexpr uint32_t kFileVersion = 1u;
 
-inline constexpr uint32_t kFlagLz4 = 1u << 0;
+inline constexpr uint32_t kFlagLz4         = 1u << 0;
+inline constexpr uint32_t kFlagBitGrid     = 1u << 1;   // per-cluster bit-grid + color stream
+
+// =====================================================================
+// Per-cluster ordering modes. Selected per-cluster at bake time; encoder
+// tries each and keeps the smallest. Decoder reads stored byte to know
+// how to walk the bit-grid.
+//   Y-major (slab):  idx = (y * 32 + z) * 32 + x   — wins on flat tiles
+//   Morton:          standard 3D Z-order            — wins on cubic blobs
+// =====================================================================
+enum LwOrderMode : uint8_t {
+    kOrderYMajor = 0,
+    kOrderMorton = 1,
+};
+
+// LEB128 unsigned encode. Appends 1..5 bytes to `out` for uint32 value.
+inline void Leb128PutU32(std::vector<uint8_t>& out, uint32_t v)
+{
+    while (v >= 0x80u) {
+        out.push_back((uint8_t)((v & 0x7Fu) | 0x80u));
+        v >>= 7;
+    }
+    out.push_back((uint8_t)v);
+}
+// LEB128 unsigned decode. Advances `p`. Caller ensures bounds.
+inline uint32_t Leb128GetU32(const uint8_t*& p)
+{
+    uint32_t v = 0;
+    uint32_t shift = 0;
+    while (true) {
+        uint8_t b = *p++;
+        v |= (uint32_t)(b & 0x7Fu) << shift;
+        if ((b & 0x80u) == 0) break;
+        shift += 7;
+    }
+    return v;
+}
+
+// Pre-baked Morton interleave for 5-bit axis. Returns 15-bit morton code.
+inline uint32_t MortonEncode5(uint32_t x, uint32_t y, uint32_t z)
+{
+    auto spread = [](uint32_t v) -> uint32_t {
+        v &= 0x1F;
+        v = (v | (v << 8)) & 0x0300F00F;
+        v = (v | (v << 4)) & 0x030C30C3;
+        v = (v | (v << 2)) & 0x09249249;
+        return v;
+    };
+    return spread(x) | (spread(y) << 1) | (spread(z) << 2);
+}
+// Inverse: extract (x,y,z) from 15-bit morton code.
+inline void MortonDecode5(uint32_t m, uint32_t& x, uint32_t& y, uint32_t& z)
+{
+    auto compact = [](uint32_t v) -> uint32_t {
+        v &= 0x09249249;
+        v = (v | (v >> 2)) & 0x030C30C3;
+        v = (v | (v >> 4)) & 0x0300F00F;
+        v = (v | (v >> 8)) & 0x1F;
+        return v;
+    };
+    x = compact(m);
+    y = compact(m >> 1);
+    z = compact(m >> 2);
+}
+
+// Voxels-per-cluster (each cluster is 32^3). Used for bit-grid size.
+inline constexpr uint32_t kClusterCellCount = (uint32_t)kClusterVoxX
+                                            * (uint32_t)kClusterVoxY
+                                            * (uint32_t)kClusterVoxZ;
+static_assert(kClusterCellCount == 32768, "bit-grid sizing assumes 32^3 cluster");
+
+// Map cluster-local (x,y,z) → linear cell index for a given order mode.
+inline uint32_t LwCellIndex(LwOrderMode mode, uint32_t x, uint32_t y, uint32_t z)
+{
+    if (mode == kOrderMorton) return MortonEncode5(x, y, z);
+    return (y * kClusterVoxZ + z) * kClusterVoxX + x;
+}
+// Inverse.
+inline void LwCellCoord(LwOrderMode mode, uint32_t idx,
+                        uint32_t& x, uint32_t& y, uint32_t& z)
+{
+    if (mode == kOrderMorton) { MortonDecode5(idx, x, y, z); return; }
+    x = idx % kClusterVoxX;
+    z = (idx / kClusterVoxX) % kClusterVoxZ;
+    y = idx / (kClusterVoxX * kClusterVoxZ);
+}
+
+// RLE bit-grid encode: alternating zero-run / one-run counts (LEB128),
+// starting with a zero-run (count may be 0). Total = kClusterCellCount.
+inline void RleEncodeBitGrid(const uint8_t* bits, std::vector<uint8_t>& out)
+{
+    uint32_t i = 0;
+    uint32_t expect = 0;
+    while (i < kClusterCellCount) {
+        uint32_t run = 0;
+        while (i < kClusterCellCount && bits[i] == expect) { ++i; ++run; }
+        Leb128PutU32(out, run);
+        expect ^= 1;
+    }
+}
+// RLE bit-grid decode. Writes kClusterCellCount bytes (0 or 1) into `bits`.
+inline void RleDecodeBitGrid(const uint8_t* enc, uint32_t encBytes, uint8_t* bits)
+{
+    memset(bits, 0, kClusterCellCount);
+    const uint8_t* p = enc;
+    const uint8_t* end = enc + encBytes;
+    uint32_t i = 0;
+    uint32_t curBit = 0;
+    while (p < end && i < kClusterCellCount) {
+        uint32_t run = Leb128GetU32(p);
+        if (curBit) {
+            for (uint32_t k = 0; k < run && i < kClusterCellCount; ++k) bits[i++] = 1;
+        } else {
+            i += run;
+        }
+        curBit ^= 1;
+    }
+}
 
 #pragma pack(push, 1)
 struct FileHeader {

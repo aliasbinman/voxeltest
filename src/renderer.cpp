@@ -4,6 +4,24 @@
 #include <dxgi1_6.h>
 #include <functional>
 
+// Extract 6 frustum planes from row-major viewProj (16-float storage).
+// Order: 0=L, 1=R, 2=B, 3=T, 4=N, 5=F.
+static inline void ExtractFrustumPlanes(const float M[16], float planes[6][4])
+{
+    planes[0][0] = M[0] + M[3];  planes[0][1] = M[4] + M[7];
+    planes[0][2] = M[8] + M[11]; planes[0][3] = M[12] + M[15];
+    planes[1][0] = M[3] - M[0];  planes[1][1] = M[7] - M[4];
+    planes[1][2] = M[11] - M[8]; planes[1][3] = M[15] - M[12];
+    planes[2][0] = M[1] + M[3];  planes[2][1] = M[5] + M[7];
+    planes[2][2] = M[9] + M[11]; planes[2][3] = M[13] + M[15];
+    planes[3][0] = M[3] - M[1];  planes[3][1] = M[7] - M[5];
+    planes[3][2] = M[11] - M[9]; planes[3][3] = M[15] - M[13];
+    planes[4][0] = M[2];         planes[4][1] = M[6];
+    planes[4][2] = M[10];        planes[4][3] = M[14];
+    planes[5][0] = M[3] - M[2];  planes[5][1] = M[7] - M[6];
+    planes[5][2] = M[11] - M[10];planes[5][3] = M[15] - M[14];
+}
+
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
@@ -1515,22 +1533,10 @@ void Renderer::DrawScene(const Camera& cam, const DrawSceneParams& args)
     }
     shadowDone:;
 
-    // Extract 6 frustum planes from row-major viewProj.
     float M[16];
     hlslpp::store(M, vp);
     float planes[6][4];
-    planes[0][0] = M[0] + M[3];  planes[0][1] = M[4] + M[7];
-    planes[0][2] = M[8] + M[11]; planes[0][3] = M[12] + M[15];
-    planes[1][0] = M[3] - M[0];  planes[1][1] = M[7] - M[4];
-    planes[1][2] = M[11] - M[8]; planes[1][3] = M[15] - M[12];
-    planes[2][0] = M[1] + M[3];  planes[2][1] = M[5] + M[7];
-    planes[2][2] = M[9] + M[11]; planes[2][3] = M[13] + M[15];
-    planes[3][0] = M[3] - M[1];  planes[3][1] = M[7] - M[5];
-    planes[3][2] = M[11] - M[9]; planes[3][3] = M[15] - M[13];
-    planes[4][0] = M[2];         planes[4][1] = M[6];
-    planes[4][2] = M[10];        planes[4][3] = M[14];
-    planes[5][0] = M[3] - M[2];  planes[5][1] = M[7] - M[6];
-    planes[5][2] = M[11] - M[10];planes[5][3] = M[15] - M[14];
+    ExtractFrustumPlanes(M, planes);
 
     struct Job {
         const GpuSubMesh* gs;
@@ -2458,6 +2464,27 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11RenderTargetView* nullRtv2[] = { nullptr };
         ctx_->OMSetRenderTargets(1, nullRtv2, nullptr);
 
+        // Optional shadow blur fill CS: empty texels = avg of non-empty neighbours.
+        if (args.shadowBlur && csShadowBlur_ && shadowFilledUav_) {
+            MICROPROFILE_SCOPEGPUI("LW/ShadowBlur", 0xff80a0a0);
+            ctx_->CSSetShader(csShadowBlur_.Get(), nullptr, 0);
+            ID3D11Buffer* csCbs[] = { cbPerFrame_.Get() };
+            ctx_->CSSetConstantBuffers(0, 1, csCbs);
+            ID3D11ShaderResourceView* srcSrv[] = { shadowSrv_.Get() };
+            ctx_->CSSetShaderResources(7, 1, srcSrv);
+            ID3D11UnorderedAccessView* dstUav[] = { shadowFilledUav_.Get() };
+            UINT initc[] = { 0 };
+            ctx_->CSSetUnorderedAccessViews(3, 1, dstUav, initc);
+            UINT bgx = (shadowSize_ + 7) / 8;
+            UINT bgy = (shadowSize_ + 7) / 8;
+            ctx_->Dispatch(bgx, bgy, 1);
+            ID3D11ShaderResourceView* nullSrv[] = { nullptr };
+            ctx_->CSSetShaderResources(7, 1, nullSrv);
+            ID3D11UnorderedAccessView* nullUav[] = { nullptr };
+            ctx_->CSSetUnorderedAccessViews(3, 1, nullUav, initc);
+            ctx_->CSSetShader(nullptr, nullptr, 0);
+        }
+
         // Mark cache valid until inputs change.
         lastSunDir_[0] = args.sunDir[0];
         lastSunDir_[1] = args.sunDir[1];
@@ -2502,21 +2529,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     ctx_->VSSetConstantBuffers(0, 2, vsCbs);
     ctx_->PSSetConstantBuffers(0, 2, vsCbs);
 
-    // ---- Frustum planes (column-extraction style used elsewhere) ----
+    // ---- Frustum planes ----
     float M[16]; hlslpp::store(M, vp);
     float planes[6][4];
-    planes[0][0] = M[0] + M[3];  planes[0][1] = M[4] + M[7];
-    planes[0][2] = M[8] + M[11]; planes[0][3] = M[12] + M[15];
-    planes[1][0] = M[3] - M[0];  planes[1][1] = M[7] - M[4];
-    planes[1][2] = M[11] - M[8]; planes[1][3] = M[15] - M[12];
-    planes[2][0] = M[1] + M[3];  planes[2][1] = M[5] + M[7];
-    planes[2][2] = M[9] + M[11]; planes[2][3] = M[13] + M[15];
-    planes[3][0] = M[3] - M[1];  planes[3][1] = M[7] - M[5];
-    planes[3][2] = M[11] - M[9]; planes[3][3] = M[15] - M[13];
-    planes[4][0] = M[2];         planes[4][1] = M[6];
-    planes[4][2] = M[10];        planes[4][3] = M[14];
-    planes[5][0] = M[3] - M[2];  planes[5][1] = M[7] - M[6];
-    planes[5][2] = M[11] - M[10];planes[5][3] = M[15] - M[14];
+    ExtractFrustumPlanes(M, planes);
     auto cullAabb = [&](float mnx, float mny, float mnz, float mxx, float mxy, float mxz) -> bool {
         for (int pi = 0; pi < 6; ++pi) {
             float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
