@@ -251,6 +251,9 @@ bool Renderer::UploadLwWorld(const lw::World& w)
                     maxChunkPoints, maxChunkPoints * 4.0 / (1024.0 * 1024.0));
     }
 
+    // New world means any cached shadow map is stale.
+    shadowMapDirty_ = true;
+
     lwHasWorld_ = true;
     return true;
 }
@@ -2367,7 +2370,23 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     }
 
     // ---- Shadow caster pass: render LW points to shadowDsv_, depth-only ----
+    bool shadowSkipped = false;
     if (sunShadowsOn && shadowDsv_) {
+        const float epsDir = 1e-4f;
+        bool dirChanged =
+              std::fabs(args.sunDir[0] - lastSunDir_[0]) > epsDir
+           || std::fabs(args.sunDir[1] - lastSunDir_[1]) > epsDir
+           || std::fabs(args.sunDir[2] - lastSunDir_[2]) > epsDir;
+        bool sizeChanged = (shadowSize_ != lastShadowSize_);
+        bool cullChanged = (args.shadowCullFront != lastShadowCullFront_);
+        bool lodChanged  = (args.shadowLod != lastShadowLod_);
+        bool blurChanged = (args.shadowBlur != lastShadowBlur_);
+        if (!args.shadowForceRebuild && !shadowMapDirty_
+            && !dirChanged && !sizeChanged && !cullChanged && !lodChanged && !blurChanged) {
+            shadowSkipped = true;   // reuse cached shadow map this frame
+        }
+    }
+    if (sunShadowsOn && shadowDsv_ && !shadowSkipped) {
         MICROPROFILE_SCOPEGPUI("LW/Shadow", 0xff909090);
         mapCbLwFrame(sunVPstore);   // VS projects via sunVP instead of main vp
 
@@ -2422,10 +2441,20 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11RenderTargetView* nullRtv2[] = { nullptr };
         ctx_->OMSetRenderTargets(1, nullRtv2, nullptr);
 
+        // Mark cache valid until inputs change.
+        lastSunDir_[0] = args.sunDir[0];
+        lastSunDir_[1] = args.sunDir[1];
+        lastSunDir_[2] = args.sunDir[2];
+        lastShadowSize_      = shadowSize_;
+        lastShadowCullFront_ = args.shadowCullFront;
+        lastShadowLod_       = args.shadowLod;
+        lastShadowBlur_      = args.shadowBlur;
+        shadowMapDirty_      = false;
+
         // Restore main vp into cbLwFrame_ for subsequent passes.
         mapCbLwFrame(vpStoreMain);
     } else {
-        // No shadow caster — still need main vp in cbLwFrame_ for point draws.
+        // No shadow caster (off, or cached) — still need main vp in cbLwFrame_.
         mapCbLwFrame(vpStoreMain);
     }
 
@@ -2537,11 +2566,48 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                 drawList[L].push_back({ slot, 0u, rc.poolCount });
                 return;
             }
-            bool any = false;
+            // Need finer LOD. Per-octant: recurse where child exists, draw
+            // parent's clusters in that octant where child is missing.
+            bool fallbackOct[8];
+            bool anyFallback = false;
             for (int c = 0; c < 8; ++c) {
-                if (rc.childId[c] != lw::kNoChild) { any = true; visit(L - 1, rc.childId[c]); }
+                if (rc.childId[c] != lw::kNoChild) {
+                    visit(L - 1, rc.childId[c]);
+                    fallbackOct[c] = false;
+                } else {
+                    fallbackOct[c] = true;
+                    anyFallback = true;
+                }
             }
-            if (!any) drawList[L].push_back({ slot, 0u, rc.poolCount });
+            if (anyFallback) {
+                uint32_t spanFirst = 0, spanCount = 0;
+                auto flush = [&]() {
+                    if (spanCount > 0) {
+                        drawList[L].push_back({ slot, spanFirst, spanCount });
+                        spanCount = 0;
+                    }
+                };
+                for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c) {
+                    const lw::DiskCluster& cl = rc.clusters[slot_c];
+                    if (cl.numPoints == 0) { flush(); continue; }
+                    int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
+                    int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
+                    int cx_g = slot_c % lw::kClustersX;
+                    int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
+                    if (!fallbackOct[oct]) { flush(); continue; }
+                    if (spanCount == 0) {
+                        spanFirst = cl.pointFirst;
+                        spanCount = cl.numPoints;
+                    } else if (cl.pointFirst == spanFirst + spanCount) {
+                        spanCount += cl.numPoints;
+                    } else {
+                        flush();
+                        spanFirst = cl.pointFirst;
+                        spanCount = cl.numPoints;
+                    }
+                }
+                flush();
+            }
             return;
         }
 
