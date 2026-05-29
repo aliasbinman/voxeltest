@@ -163,8 +163,9 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             if ((a8 & 0x80u) == 0u) continue;
             uint lodIdx = (a8 >> 4) & 7u;       // 3 bits, supports LOD0..7
             uint ao4    = a8 & 0xFu;
-            uint parityN = 0u;                  // parity dropped from encoding
             float aoN   = (float)ao4 / 15.0;
+            // parity now lives in mask channel bit 30 (decoded below after mask Load).
+            uint parityN = 0u;
             // halfExt = 0.5 * (1 << lodIdx) — LOD voxel half-extent in world units.
             float halfExt = 0.5 * (float)(1u << lodIdx);
             float zN = gSplatDepth.Load(int3(sp, 0));
@@ -172,6 +173,7 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             if (zN > fbZ) { fbZ = zN; fbHave = true; }
             uint maskFull = gSplatMaskSrv.Load(int3(sp, 0));
             uint visMaskN = maskFull & 0x3Fu;
+            parityN = (maskFull >> 30u) & 1u;   // cluster checker parity
             float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
             // Snap to LOD-aligned voxel grid: collapses adjacent splats from
             // the same cluster onto the same AABB (kills cube-edge seams on

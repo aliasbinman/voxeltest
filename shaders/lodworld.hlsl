@@ -104,12 +104,12 @@ VSOut vsmain_lw_points(uint vid : SV_VertexID)
     VSOut o;
     o.svpos  = mul(float4(world, 1.0), gViewProj);
     o.wpos   = world;
-    // Pack visMask + all 6 face AOs into mask channel (R32_UINT splat RT).
+    // Pack visMask + all 6 face AOs + parity into mask channel (R32_UINT).
     // bits 0-5  : visMask
     // bits 6-29 : 6 face AOs × 4 bits (face 0 at bit 6, face 5 at bit 26)
-    // CS dilate picks the dominant face and pulls that face's AO out.
-    o.mask   = (mask & 0x3Fu) | (aoPck << 6u);
+    // bit 30    : cluster checker parity (free bit; alpha now uses 3-bit LOD)
     o.parity = (cx + cy + cz) & 1u;
+    o.mask   = (mask & 0x3Fu) | (aoPck << 6u) | (o.parity << 30u);
 
     uint colPck = gLwPalette[ci.paletteBase + palIdx];
     o.colAO.r = ((float)  (colPck & 0xFFu)) / 255.0;
