@@ -161,18 +161,32 @@ static ClusterEnc EncodeClusterTryBoth(const lw::DiskPoint* pts, uint32_t numPts
         e.orderMode = (uint8_t)mode;
         lw::RleEncodeBitGrid(grid, e.bitGrid);
         e.colors.reserve(numPts);
-        if (g_storeAo)      e.ao.reserve((size_t)numPts * 3);
         if (g_storeVisMask) e.visMask.reserve((size_t)numPts);
+        // Variable-length AO: per voxel, pack popcount(visMask) nibbles
+        // (4 bits per visible face) back-to-back. Hidden-face AO is dropped
+        // entirely. Loader reads back using its own recomputed visMask.
+        uint8_t aoBitBuf = 0;
+        int     aoBitCnt = 0;
+        auto pushNib = [&](uint8_t nib) {
+            if (aoBitCnt == 0) { aoBitBuf = (uint8_t)(nib & 0xF); aoBitCnt = 4; }
+            else               { aoBitBuf |= (uint8_t)((nib & 0xF) << 4); e.ao.push_back(aoBitBuf); aoBitCnt = 0; }
+        };
         for (uint32_t i = 0; i < lw::kClusterCellCount; ++i) {
             if (!grid[i]) continue;
             e.colors.push_back(palAt[i]);
             if (g_storeAo) {
-                e.ao.push_back(aoAt[i][0]);
-                e.ao.push_back(aoAt[i][1]);
-                e.ao.push_back(aoAt[i][2]);
+                uint8_t vm = vmAt[i];
+                uint32_t ap = (uint32_t)aoAt[i][0]
+                           | ((uint32_t)aoAt[i][1] << 8)
+                           | ((uint32_t)aoAt[i][2] << 16);
+                for (int fi = 0; fi < 6; ++fi) {
+                    if (!((vm >> fi) & 1u)) continue;
+                    pushNib((uint8_t)((ap >> (fi * 4)) & 0xF));
+                }
             }
             if (g_storeVisMask) e.visMask.push_back(vmAt[i]);
         }
+        if (g_storeAo && aoBitCnt > 0) e.ao.push_back(aoBitBuf);   // flush tail nibble
 
         // ---- Cell-AO bitstream ----
         // Walk cluster cells in chosen order. For each EMPTY cell adjacent to
@@ -695,6 +709,19 @@ int main(int argc, char** argv)
         uint64_t lodSubPalBins[5] = {0,0,0,0,0};  // 1,2,4,8-bit clusters + n>=129
         uint64_t lodColorBits[4]  = {0,0,0,0};    // total bits if {fixed8, perCluster1,2,4,8 best}
         uint64_t lodSubPalHdrBytes = 0;           // sum of sub-palette index tables (1 byte per unique color used)
+        // Per-cluster sub-palette stats for AO (24-bit aoPacked words).
+        uint64_t lodAoSubBins[5] = {0,0,0,0,0};   // 1/2/4/8-bit clusters + giveup
+        uint64_t lodAoBitsAdapt   = 0;            // total bits via sub-pal
+        uint64_t lodAoHdrBytes    = 0;            // 3 B per unique aoPacked in sub-pal
+        // Per-FACE sub-palette: each face's nibble has its own per-cluster palette.
+        uint64_t lodAoFaceBits = 0;               // sum of per-voxel per-face index bits
+        uint64_t lodAoFaceHdrBits = 0;            // sum of per-cluster palette bits (4 bits per entry × N)
+        // RLE color packing: per-cluster, walk cells in chosen axis order, emit
+        // alternating empty/solid runs with packed length+color. Replaces both
+        // the bit-grid stream (positions recovered from walk) AND the color
+        // stream (color included inline). Try 3 axis orders, pick smallest.
+        uint64_t lodRleColorBytes = 0;
+        uint64_t lodRleOrderHist[3] = {0,0,0};
 
         uint64_t lodCellAoBytes = 0;          // raw bytes if cell-AO stored (4b per AO cell)
         uint64_t lodCellAoCells = 0;          // count of cells needing AO
@@ -769,6 +796,37 @@ int main(int argc, char** argv)
                 return (uint8_t)(q >> 4);
             };
 
+            // Chunk-local solid bit-grid (LOD-resolution). Used to compute
+            // per-voxel visMask the SAME way lw_loader does (cross-chunk
+            // neighbours treated as empty) so the variable-length AO stream
+            // we emit matches what the loader expects to read back.
+            const int CWv = lw::kChunkVoxX, CHv = lw::kChunkVoxY, CDv = lw::kChunkVoxZ;
+            std::vector<uint8_t> chBits((size_t)((CWv * CHv * CDv + 7) / 8), 0);
+            auto chSet = [&](int x, int y, int z) {
+                size_t idx = (size_t)((y * CDv + z) * CWv + x);
+                chBits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+            };
+            auto chGet = [&](int x, int y, int z) -> bool {
+                if (x < 0 || y < 0 || z < 0 || x >= CWv || y >= CHv || z >= CDv) return false;
+                size_t idx = (size_t)((y * CDv + z) * CWv + x);
+                return (chBits[idx >> 3] >> (idx & 7)) & 1u;
+            };
+            for (const LodVox& v : voxList) {
+                chSet(v.x - ck.gx * lw::kChunkVoxX,
+                      v.y - ck.gy * lw::kChunkVoxY,
+                      v.z - ck.gz * lw::kChunkVoxZ);
+            }
+            auto visMaskFor = [&](int lx, int ly, int lz) -> uint8_t {
+                uint8_t m = 0;
+                if (!chGet(lx + 1, ly, lz)) m |= 0x01;   // +X
+                if (!chGet(lx - 1, ly, lz)) m |= 0x02;   // -X
+                if (!chGet(lx, ly + 1, lz)) m |= 0x04;   // +Y
+                if (!chGet(lx, ly - 1, lz)) m |= 0x08;   // -Y
+                if (!chGet(lx, ly, lz + 1)) m |= 0x10;   // +Z
+                if (!chGet(lx, ly, lz - 1)) m |= 0x20;   // -Z
+                return m;
+            };
+
             // Bucket voxels into clusters (dense slots; empty slots untouched).
             std::vector<lw::DiskPoint> bucket[lw::kClustersPerChunk];
             uint8_t cMn[lw::kClustersPerChunk][3];
@@ -793,7 +851,7 @@ int main(int argc, char** argv)
                 p.posY = (uint8_t)ly;
                 p.posZ = (uint8_t)lz;
                 p.palIdx = (uint8_t)palMap[v.color];
-                p.visMask = v.visMask & 0x3F;
+                p.visMask = visMaskFor(lx, ly, lz);
                 uint32_t aoPacked = 0;
                 for (int fi = 0; fi < 6; ++fi) {
                     uint8_t a4 = faceAo4(v.x, v.y, v.z, fi);
@@ -864,7 +922,7 @@ int main(int argc, char** argv)
                 lodCellAoBytes += (aoCells * 4 + 7) / 8;
             }
 
-            // ----- Sub-palette stats per cluster -----
+            // ----- Sub-palette stats per cluster: color + AO -----
             for (int s = 0; s < lw::kClustersPerChunk; ++s) {
                 if (bucket[s].empty()) continue;
                 uint8_t seen[256] = {};
@@ -878,9 +936,100 @@ int main(int argc, char** argv)
                 else if (uniques <= 16)  { bpi = 4; lodSubPalBins[2]++; }
                 else                     { bpi = 8; lodSubPalBins[3]++; }
                 uint64_t n = (uint64_t)bucket[s].size();
-                lodColorBits[0] += n * 8;             // fixed-8 (current)
-                lodColorBits[1] += n * (uint64_t)bpi; // adaptive
-                lodSubPalHdrBytes += (uint64_t)uniques; // 1 byte per palette entry in sub-pal header
+                lodColorBits[0] += n * 8;
+                lodColorBits[1] += n * (uint64_t)bpi;
+                lodSubPalHdrBytes += (uint64_t)uniques;
+
+                // AO sub-palette over the 24-bit aoPacked word per voxel.
+                std::unordered_map<uint32_t, uint8_t> aoSeen;
+                aoSeen.reserve(32);
+                for (const auto& p : bucket[s]) {
+                    uint32_t w = (uint32_t)p.aoPacked[0]
+                              | ((uint32_t)p.aoPacked[1] << 8)
+                              | ((uint32_t)p.aoPacked[2] << 16);
+                    aoSeen.emplace(w, (uint8_t)aoSeen.size());
+                }
+                int aoUniques = (int)aoSeen.size();
+                int aoBpi;
+                if      (aoUniques <= 2)   { aoBpi = 1; lodAoSubBins[0]++; }
+                else if (aoUniques <= 4)   { aoBpi = 2; lodAoSubBins[1]++; }
+                else if (aoUniques <= 16)  { aoBpi = 4; lodAoSubBins[2]++; }
+                else if (aoUniques <= 256) { aoBpi = 8; lodAoSubBins[3]++; }
+                else                       { aoBpi = 24; lodAoSubBins[4]++; }
+                lodAoBitsAdapt += n * (uint64_t)aoBpi;
+                if (aoUniques <= 256) lodAoHdrBytes += (uint64_t)aoUniques * 3;
+
+                // ---- New RLE color packing measurement ----
+                // For this cluster, try 3 axis-fastest orders and pick min.
+                auto lenBytes = [](uint32_t c) -> size_t {
+                    if (c <= 0x3F) return 1;
+                    size_t nb = 1; c >>= 6;
+                    while (c > 0x7F) { ++nb; c >>= 7; }
+                    return nb + 1;
+                };
+                auto rleSize = [&](int order) -> size_t {
+                    static thread_local uint8_t solBuf[lw::kClusterCellCount];
+                    static thread_local uint8_t palBuf[lw::kClusterCellCount];
+                    std::memset(solBuf, 0, sizeof(solBuf));
+                    for (const auto& p : bucket[s]) {
+                        uint32_t lx = p.posX % lw::kClusterVoxX;
+                        uint32_t ly = p.posY % lw::kClusterVoxY;
+                        uint32_t lz = p.posZ % lw::kClusterVoxZ;
+                        uint32_t idx;
+                        if      (order == 0) idx = (lz * lw::kClusterVoxY + ly) * lw::kClusterVoxX + lx; // X-fast
+                        else if (order == 1) idx = (lz * lw::kClusterVoxX + lx) * lw::kClusterVoxY + ly; // Y-fast
+                        else                 idx = (ly * lw::kClusterVoxX + lx) * lw::kClusterVoxZ + lz; // Z-fast
+                        solBuf[idx] = 1;
+                        palBuf[idx] = p.palIdx;
+                    }
+                    // Build runs.
+                    size_t bytes = 0;
+                    uint32_t pos = 0;
+                    bool firstSolid = (lw::kClusterCellCount > 0 && solBuf[0]);
+                    if (firstSolid) bytes += 1;   // empty len = 0 (1 byte)
+                    while (pos < lw::kClusterCellCount) {
+                        // empty run
+                        uint32_t es = pos;
+                        while (pos < lw::kClusterCellCount && !solBuf[pos]) ++pos;
+                        uint32_t emp = pos - es;
+                        if (!(firstSolid && es == 0)) bytes += lenBytes(emp);
+                        if (pos >= lw::kClusterCellCount) break;
+                        // solid run (same color)
+                        uint8_t col = palBuf[pos];
+                        uint32_t ss = pos;
+                        while (pos < lw::kClusterCellCount && solBuf[pos] && palBuf[pos] == col) ++pos;
+                        uint32_t sol2 = pos - ss;
+                        if (sol2 == 1) bytes += 1;                      // just color
+                        else           bytes += lenBytes(sol2) + 1;     // length + color
+                    }
+                    return bytes;
+                };
+                size_t bestBytes = rleSize(0);
+                int bestOrder = 0;
+                for (int o = 1; o < 3; ++o) {
+                    size_t b = rleSize(o);
+                    if (b < bestBytes) { bestBytes = b; bestOrder = o; }
+                }
+                lodRleColorBytes += bestBytes;
+                lodRleOrderHist[bestOrder]++;
+
+                // Per-face sub-palette: each face direction independently.
+                for (int fi = 0; fi < 6; ++fi) {
+                    uint16_t mask = 0;
+                    for (const auto& p : bucket[s]) {
+                        uint8_t nib = (p.aoPacked[(fi * 4) >> 3] >> ((fi * 4) & 7)) & 0xFu;
+                        mask |= (uint16_t)(1u << nib);
+                    }
+                    int u = __popcnt16(mask);
+                    int bpi2;
+                    if      (u <= 1)  bpi2 = 0;
+                    else if (u <= 2)  bpi2 = 1;
+                    else if (u <= 4)  bpi2 = 2;
+                    else if (u <= 8)  bpi2 = 3;
+                    else              bpi2 = 4;
+                    lodAoFaceBits   += n * (uint64_t)bpi2;
+                    lodAoFaceHdrBits += (uint64_t)u * 4;   // 4 bits per palette entry
+                }
             }
 
             // Concatenate cluster buckets into chunk's flat point array.
@@ -957,6 +1106,29 @@ int main(int argc, char** argv)
                    L,
                    (unsigned long long)lodCellAoCells,
                    lodCellAoBytes / (1024.0 * 1024.0));
+            // Sub-palette AO measurement (no format change yet).
+            double aoMbFixed = (lodVoxelCount * 3.0) / (1024.0 * 1024.0);
+            double aoMbAdapt = ((lodAoBitsAdapt + 7) / 8 + lodAoHdrBytes) / (1024.0 * 1024.0);
+            double avgBitsAo = (double)lodAoBitsAdapt / (double)lodVoxelCount;
+            double rleMb = lodRleColorBytes / (1024.0 * 1024.0);
+            printf("[LOD %d]   RLE color packing: %.2f MB  (replaces bit-grid + colors)  orders(X/Y/Z fast): %llu/%llu/%llu\n",
+                   L, rleMb,
+                   (unsigned long long)lodRleOrderHist[0],
+                   (unsigned long long)lodRleOrderHist[1],
+                   (unsigned long long)lodRleOrderHist[2]);
+            double aoFaceMb = ((lodAoFaceBits + lodAoFaceHdrBits + 7) / 8) / (1024.0 * 1024.0);
+            double avgBitsFace = (double)lodAoFaceBits / (double)lodVoxelCount;
+            printf("[LOD %d]   AO perFace subPal: %.2f MB  (%.2f bits/vox + %llu hdr bits)\n",
+                   L, aoFaceMb, avgBitsFace, (unsigned long long)lodAoFaceHdrBits);
+            printf("[LOD %d]   AO subPal(1/2/4/8/24-bit clusters: %llu/%llu/%llu/%llu/%llu)  fixed24b=%.2f MB  adapt=%.2f MB  (%.2f bits/vox + %llu B hdrs)\n",
+                   L,
+                   (unsigned long long)lodAoSubBins[0],
+                   (unsigned long long)lodAoSubBins[1],
+                   (unsigned long long)lodAoSubBins[2],
+                   (unsigned long long)lodAoSubBins[3],
+                   (unsigned long long)lodAoSubBins[4],
+                   aoMbFixed, aoMbAdapt, avgBitsAo,
+                   (unsigned long long)lodAoHdrBytes);
         }
     }
     src.clear(); src.shrink_to_fit();
@@ -1079,7 +1251,11 @@ int main(int argc, char** argv)
                 lw::Leb128PutU32(blob, (uint32_t)ce.bitGrid.size());
                 if (!ce.bitGrid.empty()) push(ce.bitGrid.data(), ce.bitGrid.size());
                 if (!ce.colors.empty()) push(ce.colors.data(), ce.colors.size());
-                if (g_storeAo      && !ce.ao.empty())      push(ce.ao.data(),      ce.ao.size());
+                if (g_storeAo) {
+                    // Variable-length AO stream (packed nibbles per visMask). Prefix size.
+                    lw::Leb128PutU32(blob, (uint32_t)ce.ao.size());
+                    if (!ce.ao.empty()) push(ce.ao.data(), ce.ao.size());
+                }
                 if (g_storeVisMask && !ce.visMask.empty()) push(ce.visMask.data(), ce.visMask.size());
                 if (g_storeCellAo) {
                     lw::Leb128PutU32(blob, ce.cellAoCount);

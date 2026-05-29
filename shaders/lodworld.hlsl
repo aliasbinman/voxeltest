@@ -69,12 +69,10 @@ float EncodeSplatAlpha(float ao01, uint lodIdx, uint parity)
 // ---- VS ----
 struct VSOut {
     float4 svpos : SV_Position;
-    float3 col   : COLOR0;
-    nointerpolation float ao    : COLOR1;
+    float4 colAO   : COLOR0;
     nointerpolation uint mask  : COLOR2;
     nointerpolation uint parity : COLOR3;   // cluster checker: (cx+cy+cz) & 1
     float3 wpos  : TEXCOORD0;
-    nointerpolation uint faceDbg : COLOR4;  // PolyAxis face index, debug-only
 };
 
 VSOut vsmain_lw_points(uint vid : SV_VertexID)
@@ -113,9 +111,10 @@ VSOut vsmain_lw_points(uint vid : SV_VertexID)
     o.parity = (cx + cy + cz) & 1u;
 
     uint colPck = gLwPalette[ci.paletteBase + palIdx];
-    o.col = float3((float)(colPck         & 0xFFu),
-                   (float)((colPck >>  8) & 0xFFu),
-                   (float)((colPck >> 16) & 0xFFu)) / 255.0;
+    o.colAO.r = ((float)  (colPck & 0xFFu)) / 255.0;
+    o.colAO.g = ((float) ((colPck >> 8) & 0xFFu)) / 255.0;
+    o.colAO.b = ((float) ((colPck >> 16) & 0xFFu)) / 255.0;
+    
 
     // Splat AO = average of visible face AOs. Camera-direction face pick
     // would flicker when camera angle crosses an octant boundary; averaging
@@ -127,8 +126,7 @@ VSOut vsmain_lw_points(uint vid : SV_VertexID)
         sumAo += (float)((aoPck >> (f * 4u)) & 0xFu);
         ++cntAo;
     }
-    o.ao = (cntAo > 0) ? (sumAo / (15.0 * (float)cntAo)) : 1.0;
-    o.faceDbg = 0u;
+    o.colAO.a = (cntAo > 0) ? (sumAo / (15.0 * (float) cntAo)) : 1.0;
     return o;
 }
 
@@ -168,11 +166,14 @@ VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
     uint aoPck = (p.pack1 >> 8);
 
     VSOut o;
-    o.faceDbg = face;
     if (((mask >> face) & 1u) == 0u) {
         // Hidden face: emit clip pos with w=0 → guaranteed clip-discarded.
         o.svpos = float4(0, 0, 0, 0);
-        o.col = float3(0,0,0); o.ao = 0; o.mask = 0; o.parity = 0; o.wpos = float3(0,0,0);
+        o.colAO.rgb = float3(0,0,0); 
+        o.colAO.a = 0; 
+        o.mask = 0; 
+        o.parity = 0; 
+        o.wpos = float3(0,0,0);
         return o;
     }
 
@@ -180,6 +181,7 @@ VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
     float3 corner    = voxOrigin + kFaceVerts[face][vertIn];
     float3 world     = ci.worldOrigin + corner * ci.lodScale;
     o.svpos = mul(float4(world, 1.0), gViewProj);
+    
     
     o.wpos  = world;
     o.mask  = mask;
@@ -189,13 +191,12 @@ VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
     o.parity = (cx + cy + cz) & 1u;
 
     uint colPck = gLwPalette[ci.paletteBase + palIdx];
-    o.col = float3((float)( colPck         & 0xFFu),
+    o.colAO.rgb = float3((float)( colPck         & 0xFFu),
                    (float)((colPck >>  8u) & 0xFFu),
                    (float)((colPck >> 16u) & 0xFFu)) / 255.0;
 
     uint nib = (aoPck >> (face * 4)) & 0xF;
-    o.ao = (float)nib / 15.0;
-    //o.ao = (float)face / 5.0;
+    o.colAO.a = (float) nib / 15.0;
     return o;
 }
 
@@ -208,7 +209,7 @@ struct SplatOut {
 SplatOut psmain_lw_splat_albedo(VSOut i)
 {
     SplatOut o;
-    o.col  = float4(i.col, EncodeSplatAlpha(i.ao, gLodIdx, i.parity));
+    o.col  = float4(i.colAO.rgb, EncodeSplatAlpha(i.colAO.a, gLodIdx, i.parity));
     o.mask = i.mask;     // full 30-bit packed: visMask(6) + 6 face AOs(24)
     return o;
 }
@@ -216,7 +217,7 @@ SplatOut psmain_lw_splat_albedo(VSOut i)
 // ---- PS: opaque debug (no splat encoding — for "just see voxels" sanity) ----
 float4 psmain_lw_debug(VSOut i) : SV_Target
 {
-    return float4(i.col, 1.0);
+    return float4(i.colAO.rgb, 1.0);
 }
 
 // ---- PS: PolyAxis (post-dilate, direct to scene RT) ----
@@ -225,10 +226,12 @@ float4 psmain_lw_debug(VSOut i) : SV_Target
 // ambient cube * AO, sun N·L with shadow PCF, depth+height fog, ACES tonemap.
 float4 psmain_lw_polyaxis_lit(VSOut i) : SV_Target
 {
+    //return float4(1, 0, 1, 1);
+    
     float3 N = normalize(cross(ddx(i.wpos), ddy(i.wpos)));
     float3 toCam = normalize(gCamPos - i.wpos);
     if (dot(N, toCam) < 0.0) N = -N;
-    float3 outRgb = ShadeWithLighting(i.col, N, i.wpos, i.ao,
+    float3 outRgb = ShadeWithLighting(i.colAO.rgb, N, i.wpos, i.colAO.a,
                                       gLodIdx, i.parity, (int)gMode);
     return float4(outRgb, 1.0);
 }
@@ -247,7 +250,7 @@ float4 psmain_lw_lodviz(VSOut i) : SV_Target
     float3 tint = kLodTints[min(gLodIdx, 4u)];
     // Checker: parity 0 = dark, parity 1 = light.
     float check = (i.parity == 0u) ? 0.55 : 1.00;
-    float ao = lerp(0.45, 1.0, i.ao);     // keep some floor so dark voxels visible
+    float ao = lerp(0.45, 1.0, i.colAO.a);     // keep some floor so dark voxels visible
     return float4(tint * check * ao, 1.0);
 }
 

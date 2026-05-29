@@ -168,8 +168,10 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                     if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "colors remaining"; return false; }
                     cd.colors = p; p += cd.nP;
                     if (ce.flags & kFlagAo) {
-                        size_t aoBytes = (size_t)cd.nP * 3;
-                        if (aoBytes > (size_t)(end - p)) { fclose(f); err = "ao remaining"; return false; }
+                        // Variable-length: leb128 byte count, then packed
+                        // nibbles per visMask-set face per voxel.
+                        uint32_t aoBytes = Leb128GetU32(p);
+                        if (aoBytes > (uint32_t)(end - p)) { fclose(f); err = "ao remaining"; return false; }
                         cd.ao = p;
                         p += aoBytes;
                     } else {
@@ -241,7 +243,9 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                     return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
                 };
 
-                // Pass 3: emit DiskPoints with visMask + per-face AO from neighbour cells.
+                // Pass 3: emit DiskPoints. visMask recomputed from chunk
+                // bit-grid; per-face AO unpacked from variable-length nibble
+                // stream (one nibble per set visMask bit, packed back-to-back).
                 uint32_t writePos = rc.poolBase;
                 for (int s = 0; s < kClustersPerChunk; ++s) {
                     if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
@@ -252,6 +256,7 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                     rc.clusters[s].numPoints  = (uint16_t)cd.nP;
                     rc.clusters[s]._pad = 0;
                     uint32_t emitted = 0;
+                    uint32_t aoBitPos = 0;       // per-cluster nibble cursor
                     for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
                         if (!cd.bits[cidx]) continue;
                         uint32_t lx, ly, lz;
@@ -262,8 +267,6 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                         dp.posY = (uint8_t)wy;
                         dp.posZ = (uint8_t)wz;
                         dp.palIdx = cd.colors[emitted];
-                        // visMask: face f visible iff neighbour cell empty.
-                        // visMask bit order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z.
                         uint8_t mask = 0;
                         if (!cbGet(wx+1,wy,wz)) mask |= 0x01;
                         if (!cbGet(wx-1,wy,wz)) mask |= 0x02;
@@ -272,17 +275,23 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                         if (!cbGet(wx,wy,wz+1)) mask |= 0x10;
                         if (!cbGet(wx,wy,wz-1)) mask |= 0x20;
                         dp.visMask = mask;
-                        // Per-face AO straight from disk stream (3 bytes per
-                        // emitted point, baked by vox2lw from chunk solid grid).
+                        // Unpack variable-length AO nibbles per visMask bit.
+                        // Hidden faces get nibble 0 (never sampled at runtime).
+                        uint32_t ap = 0;
                         if (cd.ao) {
-                            dp.aoPacked[0] = cd.ao[emitted * 3 + 0];
-                            dp.aoPacked[1] = cd.ao[emitted * 3 + 1];
-                            dp.aoPacked[2] = cd.ao[emitted * 3 + 2];
+                            for (int fi = 0; fi < 6; ++fi) {
+                                if (!((mask >> fi) & 1u)) continue;
+                                uint8_t byte = cd.ao[aoBitPos >> 1];
+                                uint8_t nib  = (aoBitPos & 1u) ? (byte >> 4) : (byte & 0x0F);
+                                ap |= (uint32_t)nib << (fi * 4);
+                                ++aoBitPos;
+                            }
                         } else {
-                            dp.aoPacked[0] = 0xFF;
-                            dp.aoPacked[1] = 0xFF;
-                            dp.aoPacked[2] = 0xFF;
+                            ap = 0xFFFFFFu;   // all 15 = bright fallback
                         }
+                        dp.aoPacked[0] = (uint8_t)(ap & 0xFF);
+                        dp.aoPacked[1] = (uint8_t)((ap >> 8) & 0xFF);
+                        dp.aoPacked[2] = (uint8_t)((ap >> 16) & 0xFF);
                         lw.pointPool[writePos + emitted] = dp;
                         if (lx < clMn[0]) clMn[0] = (uint8_t)lx;
                         if (ly < clMn[1]) clMn[1] = (uint8_t)ly;
