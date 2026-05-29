@@ -72,10 +72,8 @@ bool LoadWorld(const char* path, World& out, std::string& err)
         std::vector<uint8_t> diskBlob;
         std::vector<uint8_t> rawBlob;
 
-        uint32_t cellAoChunks = 0;
         for (uint32_t i = 0; i < cc; ++i) {
             const ChunkEntry& ce = entries[i];
-            if (ce.flags & kFlagCellAo) ++cellAoChunks;
             diskBlob.resize(ce.blobBytes);
             if (!ReadAt(f, ce.blobOffset, diskBlob.data(), ce.blobBytes)) {
                 fclose(f); err = "chunk blob read"; return false;
@@ -286,17 +284,6 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                             dp.aoPacked[2] = 0xFF;
                         }
                         lw.pointPool[writePos + emitted] = dp;
-                        static int dumpCnt = 0;
-                        if (L == 0 && dumpCnt < 8) {
-                            std::fprintf(stderr, "[lw] dp[%d] pos=(%u,%u,%u) ao=%02x%02x%02x  nibs=%x %x %x %x %x %x  visMask=%02x\n",
-                                dumpCnt, dp.posX, dp.posY, dp.posZ,
-                                dp.aoPacked[2], dp.aoPacked[1], dp.aoPacked[0],
-                                dp.aoPacked[0]&0xF, (dp.aoPacked[0]>>4)&0xF,
-                                dp.aoPacked[1]&0xF, (dp.aoPacked[1]>>4)&0xF,
-                                dp.aoPacked[2]&0xF, (dp.aoPacked[2]>>4)&0xF,
-                                dp.visMask);
-                            ++dumpCnt;
-                        }
                         if (lx < clMn[0]) clMn[0] = (uint8_t)lx;
                         if (ly < clMn[1]) clMn[1] = (uint8_t)ly;
                         if (lz < clMn[2]) clMn[2] = (uint8_t)lz;
@@ -324,8 +311,6 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                 }
             }
         }
-
-        std::fprintf(stderr, "[lw] LOD %d cellAo chunks: %u / %u\n", L, cellAoChunks, cc);
 
         // ---- Build SoA cull arrays (world float AABBs) ----
         lw.cull.minX.resize(cc); lw.cull.minY.resize(cc); lw.cull.minZ.resize(cc);

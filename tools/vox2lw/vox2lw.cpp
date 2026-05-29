@@ -743,27 +743,30 @@ int main(int argc, char** argv)
                 sum += (int)a;
                 ++cnt;
             };
+            // Per-LOD contrast bias. Averaging across a LOD voxel's face
+            // washes out dark crevices. Apply gentle power curve to 0..1 AO.
+            // Capped at L=2 so LOD3/4 don't go pitch black on large voxels.
+            //   L=0 exp 1.0 (no change), L=1 1.10, L=2/3/4 1.20.
+            int lodForExp = (L > 2) ? 2 : L;
+            const float lodExp = 1.0f + 0.1f * (float)lodForExp;
+            // Per-face AO for the LOD voxel = average of aoFace[f] across ALL
+            // step^3 source voxels that compose this LOD voxel. pollSrcAo
+            // skips empty cells and hidden-face source voxels (aoFace=0), so
+            // only lit face contributions average in.
             auto faceAo4 = [&](int vx, int vy, int vz, int f) -> uint8_t {
                 int sx0 = vx * step, sy0 = vy * step, sz0 = vz * step;
                 int sum = 0, cnt = 0;
-                if (f == 0 || f == 1) {                   // ±X: sweep YZ
-                    int sx = (f == 0) ? sx0 + step - 1 : sx0;
-                    for (int dy = 0; dy < step; ++dy)
-                    for (int dz = 0; dz < step; ++dz)
-                        pollSrcAo(sx, sy0 + dy, sz0 + dz, f, sum, cnt);
-                } else if (f == 2 || f == 3) {            // ±Y: sweep XZ
-                    int sy = (f == 2) ? sy0 + step - 1 : sy0;
-                    for (int dx = 0; dx < step; ++dx)
-                    for (int dz = 0; dz < step; ++dz)
-                        pollSrcAo(sx0 + dx, sy, sz0 + dz, f, sum, cnt);
-                } else {                                  // ±Z: sweep XY
-                    int sz = (f == 4) ? sz0 + step - 1 : sz0;
-                    for (int dx = 0; dx < step; ++dx)
-                    for (int dy = 0; dy < step; ++dy)
-                        pollSrcAo(sx0 + dx, sy0 + dy, sz, f, sum, cnt);
-                }
-                int avg = cnt ? (sum / cnt) : 255;
-                return (uint8_t)(avg >> 4);   // 0..255 -> 0..15 nibble
+                for (int dx = 0; dx < step; ++dx)
+                for (int dy = 0; dy < step; ++dy)
+                for (int dz = 0; dz < step; ++dz)
+                    pollSrcAo(sx0 + dx, sy0 + dy, sz0 + dz, f, sum, cnt);
+                if (cnt == 0) return 15;
+                float a01 = (float)(sum / cnt) * (1.0f / 255.0f);
+                if (lodExp != 1.0f) a01 = powf(a01, lodExp);
+                int q = (int)(a01 * 255.0f + 0.5f);
+                if (q < 0)   q = 0;
+                if (q > 255) q = 255;
+                return (uint8_t)(q >> 4);
             };
 
             // Bucket voxels into clusters (dense slots; empty slots untouched).

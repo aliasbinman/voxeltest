@@ -589,6 +589,9 @@ bool Renderer::CreateShaders()
     HRESULT hr = S_OK;
 
     // -------------- Shared shaders in voxel.hlsl (post-process / dilate / TAA) --------------
+    // Shaders #include "shading.hlsli" for shared lighting code. Use
+    // D3D_COMPILE_STANDARD_FILE_INCLUDE handler with the .hlsl's directory
+    // as the base so the include resolves relative to shaders/.
     std::string src = ReadTextFile("shaders/voxel.hlsl");
     if (src.empty()) {
         std::fprintf(stderr, "shaders/voxel.hlsl not found\n");
@@ -597,7 +600,8 @@ bool Renderer::CreateShaders()
     }
     auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob) -> bool {
         ComPtr<ID3DBlob> errs;
-        HRESULT chr = D3DCompile(src.data(), src.size(), "voxel.hlsl", nullptr, nullptr,
+        HRESULT chr = D3DCompile(src.data(), src.size(), "shaders/voxel.hlsl", nullptr,
+                                 D3D_COMPILE_STANDARD_FILE_INCLUDE,
                                  entry, target, cflags, 0, blob.GetAddressOf(), errs.GetAddressOf());
         if (FAILED(chr)) {
             std::string msg = "Shader compile error [";
@@ -647,7 +651,8 @@ bool Renderer::CreateShaders()
         }
         auto compileLw = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob) -> bool {
             ComPtr<ID3DBlob> errs;
-            HRESULT chr = D3DCompile(lwSrc.data(), lwSrc.size(), "lodworld.hlsl", nullptr, nullptr,
+            HRESULT chr = D3DCompile(lwSrc.data(), lwSrc.size(), "shaders/lodworld.hlsl", nullptr,
+                                     D3D_COMPILE_STANDARD_FILE_INCLUDE,
                                      entry, target, cflags, 0, blob.GetAddressOf(), errs.GetAddressOf());
             if (FAILED(chr)) {
                 std::string msg = "LW shader compile [";
@@ -691,8 +696,10 @@ bool Renderer::CreateShaders()
         bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        // CBLwFrame: 64 + 16 + 16 + 16 + 16 + 16 (mode+pad) = 144 B
-        bd.ByteWidth = 144;
+        // CBLwFrame: 64(vp) + 16(cam+near) + 16(light+sun) + 16(amb+expo)
+        //          + 16(fog) + 16(heightFog+shadowEn) + 16(shadowBias+colorize+ambient)
+        //          + 64(sunVP) + 16(mode+pad) = 240 B
+        bd.ByteWidth = 240;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwFrame_.GetAddressOf()))) return false;
         // CBLwLod: uint + float + uint2 = 16 bytes.
         bd.ByteWidth = 16;
@@ -811,7 +818,10 @@ void Renderer::TryHotReloadShaders()
     };
     uint64_t m1 = mtimeOf("shaders/voxel.hlsl");
     uint64_t m2 = mtimeOf("shaders/lodworld.hlsl");
-    uint64_t mtime = (m1 > m2) ? m1 : m2;
+    uint64_t m3 = mtimeOf("shaders/shading.hlsli");
+    uint64_t mtime = m1;
+    if (m2 > mtime) mtime = m2;
+    if (m3 > mtime) mtime = m3;
     if (mtime == 0) return;
     if (mtime == shaderMtime_) return;
     if (shaderMtime_ == 0) {
@@ -973,7 +983,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->Unmap(cbLwLod_.Get(), 0);
     };
     // Helper: write a given viewproj + shading state into cbLwFrame_.
-    auto mapCbLwFrame = [&](const float vp16[16]) {
+    // Lambda captures of sunVPstore + shadowEnable happen at call sites which
+    // pass them in (init values are zero -> shadow stub returns 1.0 -> off).
+    auto mapCbLwFrame = [&](const float vp16[16], const float sunVP16[16], float shadowEnable) {
         D3D11_MAPPED_SUBRESOURCE mm;
         ctx_->Map(cbLwFrame_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
         struct CbLw {
@@ -982,6 +994,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             float lightDir[3];      float sunIntensity;
             float ambientColor[3];  float exposure;
             float fogColor[3];      float fogDensity;
+            float heightFogDensity, heightFogFalloff, heightFogStart, shadowEnable;
+            float shadowBias, shadowMapSize, colorizeClusters, ambient;
+            float sunViewProj[16];
             uint32_t mode;          uint32_t _padFrame[3];
         } cb;
         for (int i = 0; i < 16; ++i) cb.vp[i] = vp16[i];
@@ -998,6 +1013,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cb.fogColor[1] = args.fogColor[1];
         cb.fogColor[2] = args.fogColor[2];
         cb.fogDensity = args.fogDensity;
+        cb.heightFogDensity = args.heightFogDensity;
+        cb.heightFogFalloff = args.heightFogFalloff;
+        cb.heightFogStart   = args.heightFogStart;
+        cb.shadowEnable = shadowEnable;
+        cb.shadowBias = args.shadowBias;
+        cb.shadowMapSize = (float)((args.shadowMapSize > 0) ? args.shadowMapSize : 2048);
+        cb.colorizeClusters = 0.0f;
+        cb.ambient = 0.7f;     // sun multiplier (matches voxel.hlsl gAmbient default)
+        for (int i = 0; i < 16; ++i) cb.sunViewProj[i] = sunVP16[i];
         cb.mode = (uint32_t)args.mode;
         cb._padFrame[0] = cb._padFrame[1] = cb._padFrame[2] = 0;
         memcpy(mm.pData, &cb, sizeof(cb));
@@ -1117,7 +1141,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     }
     if (sunShadowsOn && shadowDsv_ && !shadowSkipped) {
         MICROPROFILE_SCOPEGPUI("LW/Shadow", 0xff909090);
-        mapCbLwFrame(sunVPstore);   // VS projects via sunVP instead of main vp
+        mapCbLwFrame(sunVPstore, sunVPstore, sunShadowsOn ? 1.0f : 0.0f);   // VS projects via sunVP
 
         ID3D11RenderTargetView* nullRtv[] = { nullptr };
         ctx_->OMSetRenderTargets(1, nullRtv, shadowDsv_.Get());
@@ -1202,10 +1226,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         shadowMapDirty_      = false;
 
         // Restore main vp into cbLwFrame_ for subsequent passes.
-        mapCbLwFrame(vpStoreMain);
+        mapCbLwFrame(vpStoreMain, sunVPstore, sunShadowsOn ? 1.0f : 0.0f);
     } else {
         // No shadow caster (off, or cached) — still need main vp in cbLwFrame_.
-        mapCbLwFrame(vpStoreMain);
+        mapCbLwFrame(vpStoreMain, sunVPstore, sunShadowsOn ? 1.0f : 0.0f);
     }
 
     // ---- Splat RT setup (color + mask) + splat DSV ----
@@ -1299,6 +1323,63 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         return usePoly ? &drawListPoly[L] : &drawListSplat[L];
     };
 
+    // Per-cluster recursive walker. Each cluster: cull, compute closest LOD;
+    // if finer than its parent chunk's LOD AND child chunk exists, descend
+    // into the 8 child clusters covering this cluster's region.
+    std::function<void(int, uint32_t, int)> visitCluster =
+        [&](int L, uint32_t chunkSlot, int clSlot) {
+        const lw::LODWorld& lwL = lwWorld_.lods[L];
+        const lw::RuntimeChunk& rc = lwL.chunks[chunkSlot];
+        const lw::DiskCluster& cl = rc.clusters[clSlot];
+        if (cl.numPoints == 0) return;
+
+        int cz_g = clSlot / (lw::kClustersX * lw::kClustersY);
+        int cy_g = (clSlot / lw::kClustersX) % lw::kClustersY;
+        int cx_g = clSlot % lw::kClustersX;
+        const float lodScaleF = (float)lwL.lodScale;
+        uint8_t bnds[6]; lw::UnpackClusterBounds(cl.bounds, bnds);
+        float mnx = (float)rc.worldOriginX + ((float)(cx_g * lw::kClusterVoxX + bnds[0])     ) * lodScaleF;
+        float mny = (float)rc.worldOriginY + ((float)(cy_g * lw::kClusterVoxY + bnds[1])     ) * lodScaleF;
+        float mnz = (float)rc.worldOriginZ + ((float)(cz_g * lw::kClusterVoxZ + bnds[2])     ) * lodScaleF;
+        float mxx = (float)rc.worldOriginX + ((float)(cx_g * lw::kClusterVoxX + bnds[3] + 1) ) * lodScaleF;
+        float mxy = (float)rc.worldOriginY + ((float)(cy_g * lw::kClusterVoxY + bnds[4] + 1) ) * lodScaleF;
+        float mxz = (float)rc.worldOriginZ + ((float)(cz_g * lw::kClusterVoxZ + bnds[5] + 1) ) * lodScaleF;
+        if (cullAabb(mnx, mny, mnz, mxx, mxy, mxz)) return;
+
+        float distNearC = nearAabbDist(mnx, mny, mnz, mxx, mxy, mxz);
+        int des = desiredLodForDist(distNearC);
+
+        // 8 child chunks per parent, picked by parent cluster's octant.
+        int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
+        uint32_t childChunkId = rc.childId[oct];
+
+        // Terminal: this LOD fine enough, or no child to descend into.
+        if (des >= L || childChunkId == lw::kNoChild || L == 0) {
+            std::vector<DrawItem>* dl = pickListForChunk(L,
+                0.5f * (mnx + mxx), 0.5f * (mny + mxy), 0.5f * (mnz + mxz));
+            if (dl) dl->push_back({ chunkSlot, cl.pointFirst, cl.numPoints });
+            return;
+        }
+
+        // Recurse: this parent cluster covers 2x2x2 = 8 child clusters.
+        // Octant-local indices of parent: (lcx in 0..3, lcy = 0 since
+        // kClustersY = 2 -> 1 Y slice per octant, lcz in 0..3). Each parent
+        // cluster maps to child cluster grid (2*lcx + dx, dy, 2*lcz + dz).
+        int lcx = cx_g & 3;
+        int lcz = cz_g & 3;
+        for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+        for (int dz = 0; dz < 2; ++dz) {
+            int childCx = 2 * lcx + dx;
+            int childCy = dy;
+            int childCz = 2 * lcz + dz;
+            int childSlot = childCz * (lw::kClustersX * lw::kClustersY)
+                          + childCy * lw::kClustersX
+                          + childCx;
+            visitCluster(L - 1, childChunkId, childSlot);
+        }
+    };
+
     std::function<void(int, uint32_t)> visit = [&](int L, uint32_t slot) {
         const lw::LODWorld& lwL = lwWorld_.lods[L];
         if (slot >= lwL.chunks.size()) return;
@@ -1374,83 +1455,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             return;
         }
 
-        // ---- Straddle path: per-cluster decision, aggregated to octant ----
-        const float lodScaleF = (float)lwL.lodScale;
-        const float clusterW  = (float)lw::kClusterVoxX * lodScaleF;
-        const float clusterH  = (float)lw::kClusterVoxY * lodScaleF;
-        const float clusterD  = clusterW;
-
-        // Per-cluster cull + LOD decision (combined pre-pass).
-        bool clCulled[lw::kClustersPerChunk];
-        bool octStays[8];
-        for (int o = 0; o < 8; ++o) octStays[o] = true;
+        // ---- Straddle path: true per-cluster recursive decision. ----
+        // Each cluster checked independently. If its closest LOD is finer
+        // than the current chunk's LOD AND a child chunk exists, recurse
+        // into the 2x2x2 = 8 child clusters that cover this parent cluster.
+        // Otherwise draw the parent cluster at this LOD.
         for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c) {
             const lw::DiskCluster& cl = rc.clusters[slot_c];
-            if (cl.numPoints == 0) { clCulled[slot_c] = true; continue; }
-            int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
-            int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
-            int cx_g = slot_c % lw::kClustersX;
-
-            // Tight cluster AABB from packed bounds (cluster-local voxels).
-            uint8_t bnds[6]; lw::UnpackClusterBounds(cl.bounds, bnds);
-            float mnx = (float)rc.worldOriginX + ((float)(cx_g * lw::kClusterVoxX + bnds[0])      ) * lodScaleF;
-            float mny = (float)rc.worldOriginY + ((float)(cy_g * lw::kClusterVoxY + bnds[1])      ) * lodScaleF;
-            float mnz = (float)rc.worldOriginZ + ((float)(cz_g * lw::kClusterVoxZ + bnds[2])      ) * lodScaleF;
-            float mxx = (float)rc.worldOriginX + ((float)(cx_g * lw::kClusterVoxX + bnds[3] + 1)  ) * lodScaleF;
-            float mxy = (float)rc.worldOriginY + ((float)(cy_g * lw::kClusterVoxY + bnds[4] + 1)  ) * lodScaleF;
-            float mxz = (float)rc.worldOriginZ + ((float)(cz_g * lw::kClusterVoxZ + bnds[5] + 1)  ) * lodScaleF;
-            if (cullAabb(mnx, mny, mnz, mxx, mxy, mxz)) { clCulled[slot_c] = true; continue; }
-            clCulled[slot_c] = false;
-
-            // LOD decision: cluster center vs camera.
-            float cwx = (float)rc.worldOriginX + ((float)cx_g + 0.5f) * clusterW;
-            float cwy = (float)rc.worldOriginY + ((float)cy_g + 0.5f) * clusterH;
-            float cwz = (float)rc.worldOriginZ + ((float)cz_g + 0.5f) * clusterD;
-            float dx = camP[0] - cwx, dy = camP[1] - cwy, dz = camP[2] - cwz;
-            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-            int des = desiredLodForDist(dist);
-            if (des < L) {
-                int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
-                octStays[oct] = false;
-            }
-        }
-        // If child missing, force octant to stay at this LOD.
-        for (int o = 0; o < 8; ++o) {
-            if (!octStays[o] && rc.childId[o] == lw::kNoChild) octStays[o] = true;
-        }
-
-        // Build draw spans: include non-culled clusters in stay-octants.
-        uint32_t spanFirst = 0, spanCount = 0;
-        auto flush = [&]() {
-            if (spanCount > 0) {
-                if (dl) dl->push_back({ slot, spanFirst, spanCount });
-                spanCount = 0;
-            }
-        };
-        for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c) {
-            if (clCulled[slot_c]) { flush(); continue; }
-            const lw::DiskCluster& cl = rc.clusters[slot_c];
-            int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
-            int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
-            int cx_g = slot_c % lw::kClustersX;
-            int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
-            if (!octStays[oct]) { flush(); continue; }
-            if (spanCount == 0) {
-                spanFirst = cl.pointFirst;
-                spanCount = cl.numPoints;
-            } else if (cl.pointFirst == spanFirst + spanCount) {
-                spanCount += cl.numPoints;
-            } else {
-                flush();
-                spanFirst = cl.pointFirst;
-                spanCount = cl.numPoints;
-            }
-        }
-        flush();
-
-        // Recurse into octants that don't stay (i.e. went to finer child).
-        for (int oct = 0; oct < 8; ++oct) {
-            if (!octStays[oct]) visit(L - 1, rc.childId[oct]);
+            if (cl.numPoints == 0) continue;
+            visitCluster(L, slot, slot_c);
         }
     };
 
@@ -1603,6 +1616,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->PSSetShader(psLwPolyAxisLit_.Get(), nullptr, 0);
             ID3D11Buffer* paCbs[] = { cbLwFrame_.Get(), cbLwLod_.Get() };
             ctx_->VSSetConstantBuffers(0, 2, paCbs);
+            ctx_->PSSetConstantBuffers(0, 2, paCbs);
+            // Shadow map for SampleShadow (t6) + comparison sampler (s1).
+            // Match splat CS: only use blurred shadow if blur actually ran
+            // (otherwise the filled tex contains zeros = blacks everything).
+            ID3D11ShaderResourceView* psShadowSrv =
+                (args.shadowBlur && shadowFilledSrv_) ? shadowFilledSrv_.Get() : shadowSrv_.Get();
+            ctx_->PSSetShaderResources(6, 1, &psShadowSrv);
+            ID3D11SamplerState* psSamps[] = { shadowSamp_.Get() };
+            ctx_->PSSetSamplers(1, 1, psSamps);
             for (int L = lw::kLodCount - 1; L >= 0; --L) {
                 if (drawListPoly[L].empty()) continue;
                 const LwGpu& g = lwGpu_[L];

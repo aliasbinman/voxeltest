@@ -99,6 +99,7 @@
   <ItemGroup>
     <None Include="shaders\voxel.hlsl" />
     <None Include="shaders\lodworld.hlsl" />
+    <None Include="shaders\shading.hlsli" />
     <None Include="voxeltest.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

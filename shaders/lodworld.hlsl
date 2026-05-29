@@ -12,10 +12,19 @@ cbuffer CBLwFrame : register(b0)
     float    gNearZ;
     float3   gLightDir;       // sun direction (world-space, normalized)
     float    gSunIntensity;
-    float3   gAmbientColor;
+    float3   gAmbientColor;   // unused since shared lighting uses ambient cube
     float    gExposure;
     float3   gFogColor;
     float    gFogDensity;
+    float    gHeightFogDensity;
+    float    gHeightFogFalloff;
+    float    gHeightFogStart;
+    float    gShadowEnable;
+    float    gShadowBias;
+    float    gShadowMapSize;
+    float    gColorizeClusters;
+    float    gAmbient;        // sun multiplier in shared ApplyShadowLighting
+    row_major float4x4 gSunViewProj;
     uint     gMode;           // ShadingMode: 0=Lit 1=FlatColor 2=Normals 3=Ao 4=LodViz
     uint3    _padFrame;
 };
@@ -27,6 +36,9 @@ cbuffer CBLwLod : register(b1)
     uint  gLwDrawBase;        // offset added to SV_VertexID when fetching from pool
                               //  (= cluster.pointFirst when drawing a sub-span)
 };
+
+// Shared lighting (same as voxel.hlsl). Reads CBLwFrame uniforms.
+#include "shading.hlsli"
 
 // ---- SRVs (per-LOD; rebound when switching LODs) ----
 struct LwPoint { uint pack0; uint pack1; };           // 8 bytes
@@ -208,48 +220,17 @@ float4 psmain_lw_debug(VSOut i) : SV_Target
 }
 
 // ---- PS: PolyAxis (post-dilate, direct to scene RT) ----
-// Branches on gMode: 0=Lit, 1=FlatColor, 2=Normals, 3=Ao, 4=LodViz.
-// Face normal via ddx/ddy of wpos. AO modulates ambient; sun adds N·L.
+// Face normal from ddx/ddy of wpos. All lighting via ShadeWithLighting
+// (shaders/shading.hlsli) so PolyAxis + splat CS produce identical look:
+// ambient cube * AO, sun N·L with shadow PCF, depth+height fog, ACES tonemap.
 float4 psmain_lw_polyaxis_lit(VSOut i) : SV_Target
 {
     float3 N = normalize(cross(ddx(i.wpos), ddy(i.wpos)));
     float3 toCam = normalize(gCamPos - i.wpos);
     if (dot(N, toCam) < 0.0) N = -N;
-
-    if (gMode == 1u) return float4(i.col, 1.0);
-    if (gMode == 2u) return float4(N * 0.5 + 0.5, 1.0);
-    if (gMode == 3u) {
-        return float4(i.ao.xxx, 1.0);
-    }
-    if (gMode == 4u) {
-        static const float3 kLodTints[5] = {
-            float3(1.00, 0.40, 0.40),
-            float3(1.00, 0.80, 0.30),
-            float3(0.40, 1.00, 0.40),
-            float3(0.40, 0.70, 1.00),
-            float3(0.90, 0.40, 1.00),
-        };
-        float3 tint = kLodTints[min(gLodIdx, 4u)];
-        float check = (i.parity == 0u) ? 0.55 : 1.00;
-        float aoFloor = lerp(0.45, 1.0, i.ao);
-        return float4(tint * check * aoFloor, 1.0);
-    }
-
-    // Match splat lighting: AO modulates ambient only; sun unscaled. ACES
-    // tonemap with exposure pre-multiply (Reinhard was crushing midtones).
-    float3 amb = gAmbientColor * i.ao;
-    float3 L   = normalize(gLightDir);
-    float  nDl = saturate(dot(N, L));
-    float3 sun = float3(1.10, 1.00, 0.85) * (nDl * gSunIntensity);
-    float3 lit = i.col * (amb + sun);
-    float dist = length(i.wpos - gCamPos);
-    float fog = exp(-dist * gFogDensity);
-    lit = lerp(gFogColor, lit, fog);
-    // ACES filmic tonemap (matches voxel.hlsl Tonemap()).
-    lit *= gExposure;
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    lit = saturate((lit * (a * lit + b)) / (lit * (c * lit + d) + e));
-    return float4(lit, 1.0);
+    float3 outRgb = ShadeWithLighting(i.col, N, i.wpos, i.ao,
+                                      gLodIdx, i.parity, (int)gMode);
+    return float4(outRgb, 1.0);
 }
 
 // ---- PS: AO + per-LOD tint + per-cluster checker ----
