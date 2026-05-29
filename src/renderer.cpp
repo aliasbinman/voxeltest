@@ -516,9 +516,11 @@ bool Renderer::CreateRenderTargets()
     if (FAILED(device_->CreateUnorderedAccessView(splatFinalTex_.Get(), nullptr, splatFinalUav_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateShaderResourceView(splatFinalTex_.Get(), nullptr, splatFinalSrv_.GetAddressOf()))) return false;
 
-    // Per-pixel visMask emitted by point PS (MRT slot 1), consumed by CS.
+    // Per-pixel splat info emitted by point PS (MRT slot 1), consumed by CS.
+    // Layout: visMask(6) | face0_ao(4) | face1_ao(4) | ... | face5_ao(4) = 30 bits.
+    // R32_UINT — CS picks the relevant face during dilate and decodes its AO.
     D3D11_TEXTURE2D_DESC smd = sd2;
-    smd.Format = DXGI_FORMAT_R8_UINT;
+    smd.Format = DXGI_FORMAT_R32_UINT;
     smd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(device_->CreateTexture2D(&smd, nullptr, splatMaskTex_.GetAddressOf()))) return false;
     if (FAILED(device_->CreateRenderTargetView(splatMaskTex_.Get(), nullptr, splatMaskRtv_.GetAddressOf()))) return false;
@@ -575,7 +577,7 @@ bool Renderer::CreateRenderTargets()
     splatRtBytes_ = pix * (
           bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM)   // splatColorTex_
         + bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM)   // splatFinalTex_
-        + bytesOf(DXGI_FORMAT_R8_UINT)          // splatMaskTex_
+        + bytesOf(DXGI_FORMAT_R32_UINT)         // splatMaskTex_
         + bytesOf(DXGI_FORMAT_R32_FLOAT)        // splatFinalDepthTex_
         + bytesOf(DXGI_FORMAT_R32_TYPELESS));   // splatDepthTex_
     return true;
@@ -589,7 +591,8 @@ bool Renderer::CreateShaders()
     // -------------- Shared shaders in voxel.hlsl (post-process / dilate / TAA) --------------
     std::string src = ReadTextFile("shaders/voxel.hlsl");
     if (src.empty()) {
-        MessageBoxA(nullptr, "shaders/voxel.hlsl not found", "Renderer", MB_ICONERROR);
+        std::fprintf(stderr, "shaders/voxel.hlsl not found\n");
+        if (!shaderReloading_) MessageBoxA(nullptr, "shaders/voxel.hlsl not found", "Renderer", MB_ICONERROR);
         return false;
     }
     auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob) -> bool {
@@ -600,8 +603,9 @@ bool Renderer::CreateShaders()
             std::string msg = "Shader compile error [";
             msg += entry; msg += "]\n";
             if (errs) msg += std::string((const char*)errs->GetBufferPointer(), errs->GetBufferSize());
+            std::fprintf(stderr, "%s\n", msg.c_str());
             OutputDebugStringA(msg.c_str()); OutputDebugStringA("\n");
-            MessageBoxA(nullptr, msg.c_str(), entry, MB_ICONERROR);
+            if (!shaderReloading_) MessageBoxA(nullptr, msg.c_str(), entry, MB_ICONERROR);
             return false;
         }
         return true;
@@ -637,7 +641,8 @@ bool Renderer::CreateShaders()
     {
         std::string lwSrc = ReadTextFile("shaders/lodworld.hlsl");
         if (lwSrc.empty()) {
-            MessageBoxA(nullptr, "shaders/lodworld.hlsl not found", "Renderer", MB_ICONERROR);
+            std::fprintf(stderr, "shaders/lodworld.hlsl not found\n");
+            if (!shaderReloading_) MessageBoxA(nullptr, "shaders/lodworld.hlsl not found", "Renderer", MB_ICONERROR);
             return false;
         }
         auto compileLw = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob) -> bool {
@@ -648,8 +653,9 @@ bool Renderer::CreateShaders()
                 std::string msg = "LW shader compile [";
                 msg += entry; msg += "]\n";
                 if (errs) msg += std::string((const char*)errs->GetBufferPointer(), errs->GetBufferSize());
+                std::fprintf(stderr, "%s\n", msg.c_str());
                 OutputDebugStringA(msg.c_str()); OutputDebugStringA("\n");
-                MessageBoxA(nullptr, msg.c_str(), entry, MB_ICONERROR);
+                if (!shaderReloading_) MessageBoxA(nullptr, msg.c_str(), entry, MB_ICONERROR);
                 return false;
             }
             return true;
@@ -685,8 +691,8 @@ bool Renderer::CreateShaders()
         bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        // CBLwFrame: 64 (mat) + 16 (camPos+nearZ) + 16 (lightDir+sunInt) + 16 (amb+exposure) + 16 (fog) = 128 B
-        bd.ByteWidth = 128;
+        // CBLwFrame: 64 + 16 + 16 + 16 + 16 + 16 (mode+pad) = 144 B
+        bd.ByteWidth = 144;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwFrame_.GetAddressOf()))) return false;
         // CBLwLod: uint + float + uint2 = 16 bytes.
         bd.ByteWidth = 16;
@@ -794,23 +800,35 @@ void Renderer::Resize(uint32_t w, uint32_t h)
 
 void Renderer::TryHotReloadShaders()
 {
-    HANDLE h = CreateFileA("shaders/voxel.hlsl", GENERIC_READ, FILE_SHARE_READ,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    FILETIME ft = {};
-    GetFileTime(h, nullptr, nullptr, &ft);
-    CloseHandle(h);
-    uint64_t mtime = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    auto mtimeOf = [](const char* path) -> uint64_t {
+        HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return 0;
+        FILETIME ft = {};
+        GetFileTime(h, nullptr, nullptr, &ft);
+        CloseHandle(h);
+        return ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    };
+    uint64_t m1 = mtimeOf("shaders/voxel.hlsl");
+    uint64_t m2 = mtimeOf("shaders/lodworld.hlsl");
+    uint64_t mtime = (m1 > m2) ? m1 : m2;
+    if (mtime == 0) return;
     if (mtime == shaderMtime_) return;
     if (shaderMtime_ == 0) {
         shaderMtime_ = mtime;
         return;
     }
-    OutputDebugStringA("[HotReload] voxel.hlsl changed - recompiling\n");
-    if (CreateShaders()) {
+    std::fprintf(stderr, "[HotReload] shaders changed - recompiling\n");
+    OutputDebugStringA("[HotReload] shaders changed - recompiling\n");
+    shaderReloading_ = true;
+    bool ok = CreateShaders();
+    shaderReloading_ = false;
+    if (ok) {
+        std::fprintf(stderr, "[HotReload] success\n");
         OutputDebugStringA("[HotReload] success\n");
     } else {
-        OutputDebugStringA("[HotReload] FAILED - check error dialog\n");
+        std::fprintf(stderr, "[HotReload] FAILED - kept previous shaders\n");
+        OutputDebugStringA("[HotReload] FAILED - kept previous shaders\n");
     }
     shaderMtime_ = mtime;
 }
@@ -964,6 +982,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             float lightDir[3];      float sunIntensity;
             float ambientColor[3];  float exposure;
             float fogColor[3];      float fogDensity;
+            uint32_t mode;          uint32_t _padFrame[3];
         } cb;
         for (int i = 0; i < 16; ++i) cb.vp[i] = vp16[i];
         float cp[3]; hlslpp::store(cp, cam.position);
@@ -979,6 +998,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cb.fogColor[1] = args.fogColor[1];
         cb.fogColor[2] = args.fogColor[2];
         cb.fogDensity = args.fogDensity;
+        cb.mode = (uint32_t)args.mode;
+        cb._padFrame[0] = cb._padFrame[1] = cb._padFrame[2] = 0;
         memcpy(mm.pData, &cb, sizeof(cb));
         ctx_->Unmap(cbLwFrame_.Get(), 0);
     };
@@ -1572,7 +1593,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->OMSetRenderTargets(1, mrt, dsv_.Get());
             ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
             ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
-            ctx_->RSSetState(rsSolid_.Get());
+            ctx_->RSSetState(rsNoCull_.Get());
             ctx_->IASetInputLayout(nullptr);
             ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ID3D11Buffer* nullVb[] = { nullptr };

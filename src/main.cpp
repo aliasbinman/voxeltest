@@ -619,11 +619,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                     const auto& w = g_app.pendingLwWorld;
                     float cx = 0.5f * (float)(w.worldAabbMin[0] + w.worldAabbMax[0]);
                     float cz = 0.5f * (float)(w.worldAabbMin[2] + w.worldAabbMax[2]);
-                    float topY = (float)w.worldAabbMax[1];
                     float dx = (float)(w.worldAabbMax[0] - w.worldAabbMin[0]);
                     float dz = (float)(w.worldAabbMax[2] - w.worldAabbMin[2]);
                     float ext = (dx > dz ? dx : dz);
-                    g_app.camera.position = hlslpp::float3(cx, topY + ext * 0.5f, cz - ext * 0.5f);
+                    // Tallest LOD0 chunk top.
+                    int32_t maxTop = w.worldAabbMin[1];
+                    for (const auto& rc : w.lods[0].chunks) {
+                        int32_t t = rc.worldOriginY + lw::kChunkVoxY;
+                        if (t > maxTop) maxTop = t;
+                    }
+                    g_app.camera.position = hlslpp::float3(cx, (float)maxTop, cz - ext * 0.5f);
                     g_app.camera.yaw   = 0.0f;
                     g_app.camera.pitch = -0.5f;
                     g_app.camera.moveSpeed = ext * 0.05f;

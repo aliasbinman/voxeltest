@@ -16,6 +16,8 @@ cbuffer CBLwFrame : register(b0)
     float    gExposure;
     float3   gFogColor;
     float    gFogDensity;
+    uint     gMode;           // ShadingMode: 0=Lit 1=FlatColor 2=Normals 3=Ao 4=LodViz
+    uint3    _padFrame;
 };
 cbuffer CBLwLod : register(b1)
 {
@@ -56,10 +58,11 @@ float EncodeSplatAlpha(float ao01, uint lodIdx, uint parity)
 struct VSOut {
     float4 svpos : SV_Position;
     float3 col   : COLOR0;
-    float  ao    : COLOR1;
+    nointerpolation float ao    : COLOR1;
     nointerpolation uint mask  : COLOR2;
     nointerpolation uint parity : COLOR3;   // cluster checker: (cx+cy+cz) & 1
     float3 wpos  : TEXCOORD0;
+    nointerpolation uint faceDbg : COLOR4;  // PolyAxis face index, debug-only
 };
 
 VSOut vsmain_lw_points(uint vid : SV_VertexID)
@@ -90,7 +93,11 @@ VSOut vsmain_lw_points(uint vid : SV_VertexID)
     VSOut o;
     o.svpos  = mul(float4(world, 1.0), gViewProj);
     o.wpos   = world;
-    o.mask   = mask;
+    // Pack visMask + all 6 face AOs into mask channel (R32_UINT splat RT).
+    // bits 0-5  : visMask
+    // bits 6-29 : 6 face AOs × 4 bits (face 0 at bit 6, face 5 at bit 26)
+    // CS dilate picks the dominant face and pulls that face's AO out.
+    o.mask   = (mask & 0x3Fu) | (aoPck << 6u);
     o.parity = (cx + cy + cz) & 1u;
 
     uint colPck = gLwPalette[ci.paletteBase + palIdx];
@@ -109,6 +116,7 @@ VSOut vsmain_lw_points(uint vid : SV_VertexID)
         ++cntAo;
     }
     o.ao = (cntAo > 0) ? (sumAo / (15.0 * (float)cntAo)) : 1.0;
+    o.faceDbg = 0u;
     return o;
 }
 
@@ -145,9 +153,10 @@ VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
     uint pz = (p.pack0 >> 16) & 0xFFu;
     uint palIdx = (p.pack0 >> 24) & 0xFFu;
     uint mask   = (p.pack1 >>  0) & 0x3Fu;
-    uint aoPck  = (p.pack1 >>  8);
+    uint aoPck = (p.pack1 >> 8);
 
     VSOut o;
+    o.faceDbg = face;
     if (((mask >> face) & 1u) == 0u) {
         // Hidden face: emit clip pos with w=0 → guaranteed clip-discarded.
         o.svpos = float4(0, 0, 0, 0);
@@ -159,6 +168,7 @@ VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
     float3 corner    = voxOrigin + kFaceVerts[face][vertIn];
     float3 world     = ci.worldOrigin + corner * ci.lodScale;
     o.svpos = mul(float4(world, 1.0), gViewProj);
+    
     o.wpos  = world;
     o.mask  = mask;
     uint cx = px >> 5;
@@ -171,8 +181,9 @@ VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
                    (float)((colPck >>  8u) & 0xFFu),
                    (float)((colPck >> 16u) & 0xFFu)) / 255.0;
 
-    uint nib = (aoPck >> (face * 4u)) & 0xFu;
+    uint nib = (aoPck >> (face * 4)) & 0xF;
     o.ao = (float)nib / 15.0;
+    //o.ao = (float)face / 5.0;
     return o;
 }
 
@@ -186,7 +197,7 @@ SplatOut psmain_lw_splat_albedo(VSOut i)
 {
     SplatOut o;
     o.col  = float4(i.col, EncodeSplatAlpha(i.ao, gLodIdx, i.parity));
-    o.mask = i.mask & 0x3Fu;
+    o.mask = i.mask;     // full 30-bit packed: visMask(6) + 6 face AOs(24)
     return o;
 }
 
@@ -196,26 +207,48 @@ float4 psmain_lw_debug(VSOut i) : SV_Target
     return float4(i.col, 1.0);
 }
 
-// ---- PS: PolyAxis lit (post-dilate, direct to scene RT) ----
+// ---- PS: PolyAxis (post-dilate, direct to scene RT) ----
+// Branches on gMode: 0=Lit, 1=FlatColor, 2=Normals, 3=Ao, 4=LodViz.
 // Face normal via ddx/ddy of wpos. AO modulates ambient; sun adds N·L.
-// Fog + exposure + Reinhard tonemap to match splat path roughly.
 float4 psmain_lw_polyaxis_lit(VSOut i) : SV_Target
 {
     float3 N = normalize(cross(ddx(i.wpos), ddy(i.wpos)));
     float3 toCam = normalize(gCamPos - i.wpos);
     if (dot(N, toCam) < 0.0) N = -N;
+
+    if (gMode == 1u) return float4(i.col, 1.0);
+    if (gMode == 2u) return float4(N * 0.5 + 0.5, 1.0);
+    if (gMode == 3u) {
+        return float4(i.ao.xxx, 1.0);
+    }
+    if (gMode == 4u) {
+        static const float3 kLodTints[5] = {
+            float3(1.00, 0.40, 0.40),
+            float3(1.00, 0.80, 0.30),
+            float3(0.40, 1.00, 0.40),
+            float3(0.40, 0.70, 1.00),
+            float3(0.90, 0.40, 1.00),
+        };
+        float3 tint = kLodTints[min(gLodIdx, 4u)];
+        float check = (i.parity == 0u) ? 0.55 : 1.00;
+        float aoFloor = lerp(0.45, 1.0, i.ao);
+        return float4(tint * check * aoFloor, 1.0);
+    }
+
+    // Match splat lighting: AO modulates ambient only; sun unscaled. ACES
+    // tonemap with exposure pre-multiply (Reinhard was crushing midtones).
     float3 amb = gAmbientColor * i.ao;
     float3 L   = normalize(gLightDir);
     float  nDl = saturate(dot(N, L));
-    float3 sun = float3(1.0, 0.96, 0.90) * (nDl * gSunIntensity);
+    float3 sun = float3(1.10, 1.00, 0.85) * (nDl * gSunIntensity);
     float3 lit = i.col * (amb + sun);
-    // Depth fog (matches ApplyFog rough behaviour).
     float dist = length(i.wpos - gCamPos);
     float fog = exp(-dist * gFogDensity);
     lit = lerp(gFogColor, lit, fog);
-    // Exposure + Reinhard tonemap.
+    // ACES filmic tonemap (matches voxel.hlsl Tonemap()).
     lit *= gExposure;
-    lit = lit / (lit + 1.0);
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    lit = saturate((lit * (a * lit + b)) / (lit * (c * lit + d) + e));
     return float4(lit, 1.0);
 }
 

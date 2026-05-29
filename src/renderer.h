@@ -242,4 +242,10 @@ private:
     uint32_t lastDrawn_ = 0;
     uint64_t lastPointCount_ = 0;
     uint64_t shaderMtime_ = 0;
+    bool     shaderReloading_ = false;
+public:
+    enum class ReloadStatus { None, Success, Failed };
+    ReloadStatus lastReloadStatus_ = ReloadStatus::None;
+    uint32_t     reloadCount_      = 0;
+    bool         ForceReloadShaders();
 };

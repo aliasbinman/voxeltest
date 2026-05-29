@@ -97,9 +97,8 @@
     <ClInclude Include="src\renderer.h" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="shaders\common.hlsli" />
     <None Include="shaders\voxel.hlsl" />
-    <None Include="shaders\postfx.hlsl" />
+    <None Include="shaders\lodworld.hlsl" />
     <None Include="voxeltest.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

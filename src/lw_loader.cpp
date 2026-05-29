@@ -72,8 +72,10 @@ bool LoadWorld(const char* path, World& out, std::string& err)
         std::vector<uint8_t> diskBlob;
         std::vector<uint8_t> rawBlob;
 
+        uint32_t cellAoChunks = 0;
         for (uint32_t i = 0; i < cc; ++i) {
             const ChunkEntry& ce = entries[i];
+            if (ce.flags & kFlagCellAo) ++cellAoChunks;
             diskBlob.resize(ce.blobBytes);
             if (!ReadAt(f, ce.blobOffset, diskBlob.data(), ce.blobBytes)) {
                 fclose(f); err = "chunk blob read"; return false;
@@ -137,6 +139,7 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                     uint32_t nP;
                     uint8_t  bits[kClusterCellCount];
                     const uint8_t* colors;
+                    const uint8_t* ao;        // 3 bytes per emitted point (per-face packed)
                     const uint8_t* cellAo;
                     uint32_t cellAoCount;
                     int oX, oY, oZ;
@@ -169,7 +172,10 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                     if (ce.flags & kFlagAo) {
                         size_t aoBytes = (size_t)cd.nP * 3;
                         if (aoBytes > (size_t)(end - p)) { fclose(f); err = "ao remaining"; return false; }
+                        cd.ao = p;
                         p += aoBytes;
+                    } else {
+                        cd.ao = nullptr;
                     }
                     if (ce.flags & kFlagVisMask) {
                         if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "vm remaining"; return false; }
@@ -268,20 +274,29 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                         if (!cbGet(wx,wy,wz+1)) mask |= 0x10;
                         if (!cbGet(wx,wy,wz-1)) mask |= 0x20;
                         dp.visMask = mask;
-                        // Per-face AO from neighbour cell's stored cellAO.
-                        // Splat shader averages visible faces in HLSL for
-                        // stability; PolyAxis uses per-face directly.
-                        uint8_t ao[6] = {
-                            caGet(wx+1,wy,wz), caGet(wx-1,wy,wz),
-                            caGet(wx,wy+1,wz), caGet(wx,wy-1,wz),
-                            caGet(wx,wy,wz+1), caGet(wx,wy,wz-1),
-                        };
-                        uint32_t aoPacked = 0;
-                        for (int fi = 0; fi < 6; ++fi) aoPacked |= (uint32_t)(ao[fi] & 0xF) << (fi * 4);
-                        dp.aoPacked[0] = (uint8_t)(aoPacked & 0xFF);
-                        dp.aoPacked[1] = (uint8_t)((aoPacked >> 8) & 0xFF);
-                        dp.aoPacked[2] = (uint8_t)((aoPacked >> 16) & 0xFF);
+                        // Per-face AO straight from disk stream (3 bytes per
+                        // emitted point, baked by vox2lw from chunk solid grid).
+                        if (cd.ao) {
+                            dp.aoPacked[0] = cd.ao[emitted * 3 + 0];
+                            dp.aoPacked[1] = cd.ao[emitted * 3 + 1];
+                            dp.aoPacked[2] = cd.ao[emitted * 3 + 2];
+                        } else {
+                            dp.aoPacked[0] = 0xFF;
+                            dp.aoPacked[1] = 0xFF;
+                            dp.aoPacked[2] = 0xFF;
+                        }
                         lw.pointPool[writePos + emitted] = dp;
+                        static int dumpCnt = 0;
+                        if (L == 0 && dumpCnt < 8) {
+                            std::fprintf(stderr, "[lw] dp[%d] pos=(%u,%u,%u) ao=%02x%02x%02x  nibs=%x %x %x %x %x %x  visMask=%02x\n",
+                                dumpCnt, dp.posX, dp.posY, dp.posZ,
+                                dp.aoPacked[2], dp.aoPacked[1], dp.aoPacked[0],
+                                dp.aoPacked[0]&0xF, (dp.aoPacked[0]>>4)&0xF,
+                                dp.aoPacked[1]&0xF, (dp.aoPacked[1]>>4)&0xF,
+                                dp.aoPacked[2]&0xF, (dp.aoPacked[2]>>4)&0xF,
+                                dp.visMask);
+                            ++dumpCnt;
+                        }
                         if (lx < clMn[0]) clMn[0] = (uint8_t)lx;
                         if (ly < clMn[1]) clMn[1] = (uint8_t)ly;
                         if (lz < clMn[2]) clMn[2] = (uint8_t)lz;
@@ -309,6 +324,8 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                 }
             }
         }
+
+        std::fprintf(stderr, "[lw] LOD %d cellAo chunks: %u / %u\n", L, cellAoChunks, cc);
 
         // ---- Build SoA cull arrays (world float AABBs) ----
         lw.cull.minX.resize(cc); lw.cull.minY.resize(cc); lw.cull.minZ.resize(cc);

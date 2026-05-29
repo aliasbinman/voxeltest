@@ -575,6 +575,8 @@ VSPolyVidOut vsmain_polyaxis(uint vid : SV_VertexID)
     }
 
     o.svpos = mul(float4(world, 1.0), gViewProj);
+    o.svpos.x *= 0.0;
+    
     float3 n = float3(0, 0, 0);
     if (faceAxis == 0u) n.x = sgn;
     else if (faceAxis == 1u) n.y = sgn;
@@ -645,6 +647,9 @@ VSPolyVidOut vsmain_polyaxis_instanced(uint vid : SV_VertexID, uint iid : SV_Ins
         return o;
     }
     o.svpos = mul(float4(world, 1.0), gViewProj);
+    o.svpos.x *= 0.0;
+    
+    
     float3 n = float3(0, 0, 0);
     if (faceAxis == 0u) n.x = sgn;
     else if (faceAxis == 1u) n.y = sgn;
@@ -663,6 +668,8 @@ VSPolyVidOut vsmain_polyaxis_instanced(uint vid : SV_VertexID, uint iid : SV_Ins
 
 float4 psmain_polyvid(VSPolyVidOut i) : SV_Target
 {
+    return float4(1, 0, 0, 1);
+    
     float3 n = i.nrm * i.nrm;
     n = n * n;
     n = n * n;
@@ -1108,7 +1115,8 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             float zN = gSplatDepth.Load(int3(sp, 0));
             if (zN <= 0.0) continue;
             if (zN > fbZ) { fbZ = zN; fbHave = true; }
-            uint visMaskN = gSplatMaskSrv.Load(int3(sp, 0)) & 0x3Fu;
+            uint maskFull = gSplatMaskSrv.Load(int3(sp, 0));
+            uint visMaskN = maskFull & 0x3Fu;
             float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
             // Snap to LOD-aligned voxel grid so adjacent splats from the same
             // cluster collapse to the same AABB. Without this, neighbor pixels
@@ -1136,6 +1144,7 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                 float3 absD = abs(d);
                 float bestProj = -1.0;
                 float3 n = float3(0, 1, 0);
+                float pickedFaceAo = aoN;   // fallback to alpha's avg
                 [unroll] for (uint fi = 0u; fi < 6u; ++fi) {
                     if (((visMaskN >> fi) & 1u) == 0u) continue;
                     float3 fn = float3(0, 0, 0);
@@ -1145,15 +1154,19 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                     else if (fi == 3u) fn = float3( 0,-1, 0);
                     else if (fi == 4u) fn = float3( 0, 0, 1);
                     else               fn = float3( 0, 0,-1);
-                    // Project (hit-center) onto face normal: larger = closer to that face.
                     float p = dot(d, fn);
-                    if (p > bestProj) { bestProj = p; n = fn; }
+                    if (p > bestProj) {
+                        bestProj = p; n = fn;
+                        // Per-face AO baked into mask channel by VS (bits 6+).
+                        uint nib = (maskFull >> (6u + fi * 4u)) & 0xFu;
+                        pickedFaceAo = (float)nib / 15.0;
+                    }
                 }
                 bestT      = tHit;
                 bestAlbedo = s.rgb;
                 bestN      = n;
                 bestMask   = visMaskN;
-                bestAo     = aoN;
+                bestAo     = pickedFaceAo;
                 bestLodIdx = lodIdx;
                 bestParity = parityN;
                 anyHit     = true;
@@ -1170,7 +1183,7 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
         } else if (mode == 1) {
             outRgb = ApplyFog(bestAlbedo, hit);
         } else if (mode == 3) {
-            outRgb = ApplyFog(bestAo.xxx, hit);
+            outRgb = bestAo.xxx;          // raw AO, no fog (matches PolyAxis)
         } else if (mode == 4) {
             // AO * per-LOD tint, with per-cluster checker (parity bit from alpha).
             float check = (bestParity == 0u) ? 0.55 : 1.00;

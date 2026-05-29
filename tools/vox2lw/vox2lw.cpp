@@ -19,6 +19,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <filesystem>
 #include <functional>
@@ -104,7 +105,7 @@ struct ClusterEnc {
     uint32_t             cellAoCount = 0;
 };
 
-static bool g_storeAo = false;     // toggled via main() arg
+static bool g_storeAo = true;      // always on — per-face AO baked into .lw
 static bool g_storeVisMask = false;
 static bool g_storeCellAo = false;
 static uint64_t g_aoHisto[16] = {};
@@ -498,6 +499,140 @@ int main(int argc, char** argv)
     printf("[in] src voxels: %zu  AABB: x[%d..%d] y[%d..%d] z[%d..%d]\n",
            src.size(), worldMn[0], worldMx[0], worldMn[1], worldMx[1], worldMn[2], worldMx[2]);
 
+    // ========================================================================
+    // Per-source-voxel per-face AO bake via hemisphere raycast.
+    // Build a dense bit-grid of source solidity, then for each exposed face
+    // cast kAoSamples cosine-weighted rays into the outward hemisphere and
+    // DDA-step up to kAoMaxSteps source cells. ao = 1 - hits/samples, scaled
+    // to 0..255 and stored in SrcVox.aoFace[f]. LOD bake later averages these
+    // per-source values across the LOD voxel's face area.
+    // ========================================================================
+    const int spanX0 = worldMx[0] - worldMn[0] + 1;
+    const int spanY0 = worldMx[1] - worldMn[1] + 1;
+    const int spanZ0 = worldMx[2] - worldMn[2] + 1;
+    std::vector<uint8_t> filledBM(((size_t)spanX0 * spanY0 * spanZ0 + 7) / 8, 0);
+    auto bIdx = [&](int x, int y, int z) -> size_t {
+        return (size_t)((z - worldMn[2]) * spanY0 + (y - worldMn[1])) * (size_t)spanX0
+             + (size_t)(x - worldMn[0]);
+    };
+    for (const SrcVox& s : src) {
+        size_t i = bIdx(s.x, s.y, s.z);
+        filledBM[i >> 3] |= (uint8_t)(1u << (i & 7));
+    }
+    auto isFilled = [&](int x, int y, int z) -> bool {
+        if (x < worldMn[0] || x > worldMx[0] ||
+            y < worldMn[1] || y > worldMx[1] ||
+            z < worldMn[2] || z > worldMx[2]) return false;
+        size_t i = bIdx(x, y, z);
+        return (filledBM[i >> 3] >> (i & 7)) & 1u;
+    };
+    // Map source voxel coord -> index in `src` so LOD bake can read the
+    // pre-baked per-face AO of any specific source voxel.
+    std::unordered_map<CellKey, uint32_t, CellHash> srcIdx;
+    srcIdx.reserve(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        srcIdx[{ src[i].x, src[i].y, src[i].z }] = (uint32_t)i;
+    }
+
+    {
+        // Face delta: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z (matches engine convention).
+        static const int kFaceDelta[6][3] = {
+            { 1, 0, 0}, {-1, 0, 0}, { 0, 1, 0}, { 0,-1, 0}, { 0, 0, 1}, { 0, 0,-1},
+        };
+        const int kAoSamples  = 48;
+        const int kAoMaxSteps = 24;
+        const float kTwoPi = 6.2831853071795864f;
+        auto Hammersley = [](int i, int N, float& u, float& v) {
+            u = (float)i / (float)N;
+            uint32_t b = (uint32_t)i;
+            b = ((b & 0x55555555u) << 1) | ((b & 0xAAAAAAAAu) >> 1);
+            b = ((b & 0x33333333u) << 2) | ((b & 0xCCCCCCCCu) >> 2);
+            b = ((b & 0x0F0F0F0Fu) << 4) | ((b & 0xF0F0F0F0u) >> 4);
+            b = ((b & 0x00FF00FFu) << 8) | ((b & 0xFF00FF00u) >> 8);
+            b = (b << 16) | (b >> 16);
+            v = (float)b * 2.3283064365386963e-10f;
+        };
+        printf("[AO] hemisphere bake start: %zu src voxels, %d samples, %d max steps\n",
+               src.size(), kAoSamples, kAoMaxSteps);
+        const int64_t N = (int64_t)src.size();
+        uint64_t totalRays = 0, totalHits = 0;
+        #pragma omp parallel for schedule(dynamic, 256) reduction(+:totalRays) reduction(+:totalHits)
+        for (int64_t li = 0; li < N; ++li) {
+            SrcVox& vd = src[(size_t)li];
+            int vx = vd.x, vy = vd.y, vz = vd.z;
+            // Cranley-Patterson rotation per voxel kills banding on flats.
+            uint32_t h = (uint32_t)vx * 0x9E3779B1u
+                       ^ (uint32_t)vy * 0x85EBCA77u
+                       ^ (uint32_t)vz * 0xC2B2AE3Du;
+            h ^= h >> 16; h *= 0x7FEB352Du;
+            h ^= h >> 15; h *= 0x846CA68Bu;
+            h ^= h >> 16;
+            float jitU = (float)(h & 0xFFFFu)         * (1.0f / 65536.0f);
+            float jitV = (float)((h >> 16) & 0xFFFFu) * (1.0f / 65536.0f);
+            for (int fi = 0; fi < 6; ++fi) vd.aoFace[fi] = 0;
+            for (int fi = 0; fi < 6; ++fi) {
+                int nxF = vx + kFaceDelta[fi][0];
+                int nyF = vy + kFaceDelta[fi][1];
+                int nzF = vz + kFaceDelta[fi][2];
+                if (isFilled(nxF, nyF, nzF)) continue;   // interior face
+                float Nx = (float)kFaceDelta[fi][0];
+                float Ny = (float)kFaceDelta[fi][1];
+                float Nz = (float)kFaceDelta[fi][2];
+                float Tx, Ty, Tz, Bx, By, Bz;
+                if (fi < 2)      { Tx = 0; Ty = 1; Tz = 0; Bx = 0; By = 0; Bz = 1; }
+                else if (fi < 4) { Tx = 1; Ty = 0; Tz = 0; Bx = 0; By = 0; Bz = 1; }
+                else             { Tx = 1; Ty = 0; Tz = 0; Bx = 0; By = 1; Bz = 0; }
+                int hits = 0;
+                for (int s = 0; s < kAoSamples; ++s) {
+                    float u, v;
+                    Hammersley(s, kAoSamples, u, v);
+                    u += jitU; u -= floorf(u);
+                    v += jitV; v -= floorf(v);
+                    float r = sqrtf(u);
+                    float theta = kTwoPi * v;
+                    float a = r * cosf(theta);
+                    float b = r * sinf(theta);
+                    float c = sqrtf(fmaxf(0.0f, 1.0f - u));
+                    float dx = a * Tx + b * Bx + c * Nx;
+                    float dy = a * Ty + b * By + c * Ny;
+                    float dz = a * Tz + b * Bz + c * Nz;
+                    float ox = (float)vx + 0.5f + 0.501f * Nx;
+                    float oy = (float)vy + 0.5f + 0.501f * Ny;
+                    float oz = (float)vz + 0.5f + 0.501f * Nz;
+                    int ix = (int)floorf(ox), iy = (int)floorf(oy), iz = (int)floorf(oz);
+                    float fx = ox - (float)ix, fy = oy - (float)iy, fz = oz - (float)iz;
+                    int sx = dx > 0.0f ? 1 : (dx < 0.0f ? -1 : 0);
+                    int sy = dy > 0.0f ? 1 : (dy < 0.0f ? -1 : 0);
+                    int sz = dz > 0.0f ? 1 : (dz < 0.0f ? -1 : 0);
+                    float invDx = (fabsf(dx) > 1e-6f) ? 1.0f / fabsf(dx) : 1e30f;
+                    float invDy = (fabsf(dy) > 1e-6f) ? 1.0f / fabsf(dy) : 1e30f;
+                    float invDz = (fabsf(dz) > 1e-6f) ? 1.0f / fabsf(dz) : 1e30f;
+                    float tmx = sx > 0 ? (1.0f - fx) * invDx : sx < 0 ? fx * invDx : 1e30f;
+                    float tmy = sy > 0 ? (1.0f - fy) * invDy : sy < 0 ? fy * invDy : 1e30f;
+                    float tmz = sz > 0 ? (1.0f - fz) * invDz : sz < 0 ? fz * invDz : 1e30f;
+                    bool hit = false;
+                    for (int step = 0; step < kAoMaxSteps; ++step) {
+                        if (tmx < tmy && tmx < tmz)      { ix += sx; tmx += invDx; }
+                        else if (tmy < tmz)              { iy += sy; tmy += invDy; }
+                        else                             { iz += sz; tmz += invDz; }
+                        if (isFilled(ix, iy, iz)) { hit = true; break; }
+                    }
+                    if (hit) ++hits;
+                    ++totalRays;
+                }
+                totalHits += hits;
+                float faceAo = 1.0f - (float)hits / (float)kAoSamples;
+                int aoByte = (int)(faceAo * 255.0f + 0.5f);
+                if (aoByte < 1)   aoByte = 1;
+                if (aoByte > 255) aoByte = 255;
+                vd.aoFace[fi] = (uint8_t)aoByte;
+            }
+        }
+        printf("[AO] bake done: %llu rays, %.1f%% hit\n",
+               (unsigned long long)totalRays,
+               totalRays ? 100.0 * (double)totalHits / (double)totalRays : 0.0);
+    }
+
     // ---- build all LODs ----
     std::vector<std::vector<BakedChunk>> lods(lw::kLodCount);
 
@@ -547,7 +682,8 @@ int main(int argc, char** argv)
                          FloorDiv(v.z, lw::kChunkVoxZ) };
             chunkVox[ck].push_back(v);
         }
-        cells.clear();
+        // Keep `cells` alive — used below as a global solidity oracle so
+        // per-face AO can sample voxels in adjacent chunks (avoids seams).
         printf("[LOD %d] chunks=%zu (step=%d)\n", L, chunkVox.size(), step);
 
         // Measurement totals for this LOD.
@@ -593,6 +729,43 @@ int main(int argc, char** argv)
                 }
             }
 
+            // Per-face AO: average the pre-baked hemisphere AO of every
+            // source voxel on the LOD voxel's outward face surface. Returns
+            // 4-bit nibble (0..15) for packing. Source AO is 0..255; we
+            // average in 8-bit then shift to nibble. Empty sample cells
+            // (no source voxel there) contribute the brightest value so
+            // partially-empty LOD voxels don't get artificially darkened.
+            auto pollSrcAo = [&](int sx, int sy, int sz, int f, int& sum, int& cnt) {
+                auto it = srcIdx.find({ sx, sy, sz });
+                if (it == srcIdx.end()) return;          // no source voxel here
+                uint8_t a = src[it->second].aoFace[f];
+                if (a == 0) return;                       // interior face (not baked)
+                sum += (int)a;
+                ++cnt;
+            };
+            auto faceAo4 = [&](int vx, int vy, int vz, int f) -> uint8_t {
+                int sx0 = vx * step, sy0 = vy * step, sz0 = vz * step;
+                int sum = 0, cnt = 0;
+                if (f == 0 || f == 1) {                   // ±X: sweep YZ
+                    int sx = (f == 0) ? sx0 + step - 1 : sx0;
+                    for (int dy = 0; dy < step; ++dy)
+                    for (int dz = 0; dz < step; ++dz)
+                        pollSrcAo(sx, sy0 + dy, sz0 + dz, f, sum, cnt);
+                } else if (f == 2 || f == 3) {            // ±Y: sweep XZ
+                    int sy = (f == 2) ? sy0 + step - 1 : sy0;
+                    for (int dx = 0; dx < step; ++dx)
+                    for (int dz = 0; dz < step; ++dz)
+                        pollSrcAo(sx0 + dx, sy, sz0 + dz, f, sum, cnt);
+                } else {                                  // ±Z: sweep XY
+                    int sz = (f == 4) ? sz0 + step - 1 : sz0;
+                    for (int dx = 0; dx < step; ++dx)
+                    for (int dy = 0; dy < step; ++dy)
+                        pollSrcAo(sx0 + dx, sy0 + dy, sz, f, sum, cnt);
+                }
+                int avg = cnt ? (sum / cnt) : 255;
+                return (uint8_t)(avg >> 4);   // 0..255 -> 0..15 nibble
+            };
+
             // Bucket voxels into clusters (dense slots; empty slots untouched).
             std::vector<lw::DiskPoint> bucket[lw::kClustersPerChunk];
             uint8_t cMn[lw::kClustersPerChunk][3];
@@ -620,7 +793,10 @@ int main(int argc, char** argv)
                 p.visMask = v.visMask & 0x3F;
                 uint32_t aoPacked = 0;
                 for (int fi = 0; fi < 6; ++fi) {
-                    aoPacked |= (uint32_t)((v.aoFace[fi] >> 4) & 0xF) << (fi * 4);
+                    uint8_t a4 = faceAo4(v.x, v.y, v.z, fi);
+                    aoPacked |= (uint32_t)a4 << (fi * 4);
+                    g_aoHisto[a4]++;
+                    g_aoCount++;
                 }
                 p.aoPacked[0] = (uint8_t)(aoPacked & 0xFF);
                 p.aoPacked[1] = (uint8_t)((aoPacked >> 8) & 0xFF);
