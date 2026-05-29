@@ -289,9 +289,22 @@ void FrameStatsWindow()
 
     auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
 
-    ImGui::Text("Scene");
-    ImGui::Text("  Drawn chunks: %u", g_app.renderer.LastDrawnCount());
-    ImGui::Text("  Points drawn: %llu", (unsigned long long)g_app.renderer.LastPointCount());
+    ImGui::Text("Frame");
+    ImGui::Text("  Draw calls:      %u", g_app.renderer.LastDrawnCount());
+    {
+        uint64_t voxTot  = g_app.renderer.LastPointCount();
+        uint64_t voxSpl  = g_app.renderer.LastSplatVoxelCount();
+        uint64_t voxPoly = g_app.renderer.LastPolyVoxelCount();
+        uint64_t tris    = g_app.renderer.LastTriCount();
+        ImGui::Text("  Voxels drawn:    %llu  (splat %llu  +  poly %llu)",
+                    (unsigned long long)voxTot,
+                    (unsigned long long)voxSpl,
+                    (unsigned long long)voxPoly);
+        ImGui::Text("  Triangles drawn: %llu  (12 per poly voxel)",
+                    (unsigned long long)tris);
+        ImGui::Text("  Splat points:    %llu  (1 point primitive each)",
+                    (unsigned long long)voxSpl);
+    }
 
     if (g_app.renderer.HasLwWorld()) {
         ImGui::Separator();

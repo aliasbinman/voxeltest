@@ -1477,6 +1477,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     MICROPROFILE_SCOPEGPUI("LW/Points", 0xffc0a040);
     uint32_t drawCount = 0;
     uint64_t pointCountTotal = 0;
+    uint64_t splatVoxels = 0;
+    uint64_t polyVoxels  = 0;
+    uint64_t triCount    = 0;
     static const uint32_t kLodColors[5] = {
         0xffff6060, 0xffffa030, 0xff60c060, 0xff6098c0, 0xffc060ff
     };
@@ -1504,11 +1507,11 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                 ctx_->Draw(it.drawCount, 0);
                 ++drawCount;
                 pointCountTotal += it.drawCount;
+                splatVoxels += it.drawCount;
             }
         }
     }
-    lastDrawn_ = drawCount;
-    lastPointCount_ = pointCountTotal;
+    (void)pointCountTotal;   // stats consolidated below after polyaxis pass
 
     // ---- Splat dilate CS (csSplat_) — fills holes, lighting, shadow lookup ----
     if (args.splatFilter && csSplat_) {
@@ -1638,6 +1641,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                     const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
                     setLodCbForLod(L, rc.slotIdx, it.drawBase);
                     ctx_->Draw(it.drawCount * 36u, 0);
+                    ++drawCount;
+                    polyVoxels += it.drawCount;
+                    triCount   += (uint64_t)it.drawCount * 12ull;   // 6 faces × 2 tris
                 }
             }
         }
@@ -1648,6 +1654,13 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11ShaderResourceView* nullSrvs[3] = { nullptr, nullptr, nullptr };
         ctx_->VSSetShaderResources(0, 3, nullSrvs);
     }
+
+    // Finalize per-frame stats now that both splat + polyaxis passes ran.
+    lastDrawn_           = drawCount;
+    lastPointCount_      = splatVoxels + polyVoxels;
+    lastPolyVoxelCount_  = polyVoxels;
+    lastSplatVoxelCount_ = splatVoxels;
+    lastTriCount_        = triCount;
 
     // ---- TAA composite + post (optional) ----
     ID3D11ShaderResourceView* postInput = nullptr;

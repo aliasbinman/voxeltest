@@ -103,6 +103,9 @@ public:
     uint32_t                  ShadowMapSize()    const { return shadowSize_; }
     uint32_t LastDrawnCount() const { return lastDrawn_; }
     uint64_t LastPointCount() const { return lastPointCount_; }
+    uint64_t LastTriCount()   const { return lastTriCount_; }
+    uint64_t LastPolyVoxelCount() const { return lastPolyVoxelCount_; }
+    uint64_t LastSplatVoxelCount() const { return lastSplatVoxelCount_; }
 
 private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
@@ -241,6 +244,9 @@ private:
     uint64_t splatRtBytes_ = 0;
     uint32_t lastDrawn_ = 0;
     uint64_t lastPointCount_ = 0;
+    uint64_t lastTriCount_   = 0;
+    uint64_t lastPolyVoxelCount_  = 0;
+    uint64_t lastSplatVoxelCount_ = 0;
     uint64_t shaderMtime_ = 0;
     bool     shaderReloading_ = false;
 public:
