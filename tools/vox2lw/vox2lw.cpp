@@ -19,6 +19,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <atomic>
 #include <unordered_set>
 #include <algorithm>
 #include <filesystem>
@@ -105,7 +106,8 @@ struct ClusterEnc {
     uint32_t             cellAoCount = 0;
 };
 
-static bool g_storeAo = true;      // always on — per-face AO baked into .lw
+static bool g_storeAo  = true;      // always on — per-face AO baked into .lw
+static bool g_bakeAo   = true;      // run hemisphere AO bake; off => default-bright AO
 static bool g_storeVisMask = false;
 static bool g_storeCellAo = false;
 static uint64_t g_aoHisto[16] = {};
@@ -255,12 +257,15 @@ int main(int argc, char** argv)
     const char* outPath = (argc > 2) ? argv[2] : "assets/kingslanding.lw";
     for (int a = 1; a < argc; ++a) {
         if      (strcmp(argv[a], "--ao") == 0)     g_storeAo = true;
+        else if (strcmp(argv[a], "--noao") == 0)   g_bakeAo = false;
         else if (strcmp(argv[a], "--vm") == 0)     g_storeVisMask = true;
         else if (strcmp(argv[a], "--cellao") == 0) g_storeCellAo = true;
         else if (strcmp(argv[a], "--full") == 0) { g_storeAo = true; g_storeVisMask = true; }
     }
-    printf("[cfg] AO=%s  visMask=%s  cellAO=%s\n",
-           g_storeAo ? "ON" : "OFF", g_storeVisMask ? "ON" : "OFF", g_storeCellAo ? "ON" : "OFF");
+    printf("[cfg] AO=%s (bake=%s)  visMask=%s  cellAO=%s\n",
+           g_storeAo ? "ON" : "OFF", g_bakeAo ? "ON" : "OFF",
+           g_storeVisMask ? "ON" : "OFF", g_storeCellAo ? "ON" : "OFF");
+    fflush(stdout);
 
     // ---- read source: detect magic VXL3 vs MagicaVoxel "VOX " ----
     FILE* f = fopen(inPath, "rb");
@@ -512,6 +517,7 @@ int main(int argc, char** argv)
 
     printf("[in] src voxels: %zu  AABB: x[%d..%d] y[%d..%d] z[%d..%d]\n",
            src.size(), worldMn[0], worldMx[0], worldMn[1], worldMx[1], worldMn[2], worldMx[2]);
+    fflush(stdout);
 
     // ========================================================================
     // Per-source-voxel per-face AO bake via hemisphere raycast.
@@ -524,7 +530,11 @@ int main(int argc, char** argv)
     const int spanX0 = worldMx[0] - worldMn[0] + 1;
     const int spanY0 = worldMx[1] - worldMn[1] + 1;
     const int spanZ0 = worldMx[2] - worldMn[2] + 1;
-    std::vector<uint8_t> filledBM(((size_t)spanX0 * spanY0 * spanZ0 + 7) / 8, 0);
+    const size_t bmBytes = ((size_t)spanX0 * spanY0 * spanZ0 + 7) / 8;
+    printf("[bake] building filledBM bit-grid: span %dx%dx%d = %.2f MB\n",
+           spanX0, spanY0, spanZ0, bmBytes / (1024.0 * 1024.0));
+    fflush(stdout);
+    std::vector<uint8_t> filledBM(bmBytes, 0);
     auto bIdx = [&](int x, int y, int z) -> size_t {
         return (size_t)((z - worldMn[2]) * spanY0 + (y - worldMn[1])) * (size_t)spanX0
              + (size_t)(x - worldMn[0]);
@@ -541,14 +551,32 @@ int main(int argc, char** argv)
         return (filledBM[i >> 3] >> (i & 7)) & 1u;
     };
     // Map source voxel coord -> index in `src` so LOD bake can read the
-    // pre-baked per-face AO of any specific source voxel.
+    // pre-baked per-face AO of any specific source voxel. Skip entirely when
+    // --noao: LOD bake just returns constant bright AO without lookup.
     std::unordered_map<CellKey, uint32_t, CellHash> srcIdx;
-    srcIdx.reserve(src.size());
-    for (size_t i = 0; i < src.size(); ++i) {
-        srcIdx[{ src[i].x, src[i].y, src[i].z }] = (uint32_t)i;
+    if (g_bakeAo) {
+        printf("[bake] building srcIdx hash: %zu entries (~%.2f MB est)\n",
+               src.size(), (src.size() * 32.0) / (1024.0 * 1024.0));
+        fflush(stdout);
+        srcIdx.reserve(src.size());
+        for (size_t i = 0; i < src.size(); ++i) {
+            srcIdx[{ src[i].x, src[i].y, src[i].z }] = (uint32_t)i;
+            if ((i & 0xFFFFF) == 0 && i > 0) {
+                printf("[bake] srcIdx: %zu / %zu (%.1f%%)\n",
+                       i, src.size(), 100.0 * (double)i / (double)src.size());
+                fflush(stdout);
+            }
+        }
+    } else {
+        printf("[bake] srcIdx skipped (--noao).\n");
+        fflush(stdout);
     }
 
-    {
+    if (!g_bakeAo) {
+        printf("[bake] AO bake skipped (--noao). All faces default to bright (255).\n");
+        for (SrcVox& s : src) for (int fi = 0; fi < 6; ++fi) s.aoFace[fi] = 255;
+        fflush(stdout);
+    } else {
         // Face delta: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z (matches engine convention).
         static const int kFaceDelta[6][3] = {
             { 1, 0, 0}, {-1, 0, 0}, { 0, 1, 0}, { 0,-1, 0}, { 0, 0, 1}, { 0, 0,-1},
@@ -568,8 +596,11 @@ int main(int argc, char** argv)
         };
         printf("[AO] hemisphere bake start: %zu src voxels, %d samples, %d max steps\n",
                src.size(), kAoSamples, kAoMaxSteps);
+        fflush(stdout);
         const int64_t N = (int64_t)src.size();
         uint64_t totalRays = 0, totalHits = 0;
+        std::atomic<int64_t> progress{0};
+        const int64_t reportStride = (N > 100) ? (N / 100) : 1;
         #pragma omp parallel for schedule(dynamic, 256) reduction(+:totalRays) reduction(+:totalHits)
         for (int64_t li = 0; li < N; ++li) {
             SrcVox& vd = src[(size_t)li];
@@ -641,17 +672,26 @@ int main(int argc, char** argv)
                 if (aoByte > 255) aoByte = 255;
                 vd.aoFace[fi] = (uint8_t)aoByte;
             }
+            int64_t done = progress.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (done % reportStride == 0) {
+                int pct = (int)((done * 100) / N);
+                #pragma omp critical
+                { printf("[AO] %d%% (%lld / %lld voxels)\n", pct, (long long)done, (long long)N); fflush(stdout); }
+            }
         }
         printf("[AO] bake done: %llu rays, %.1f%% hit\n",
                (unsigned long long)totalRays,
                totalRays ? 100.0 * (double)totalHits / (double)totalRays : 0.0);
-    }
+        fflush(stdout);
+    }   // end if/else (g_bakeAo)
 
     // ---- build all LODs ----
     std::vector<std::vector<BakedChunk>> lods(lw::kLodCount);
 
     for (int L = 0; L < lw::kLodCount; ++L) {
         const int32_t step = 1 << L;
+        printf("[LOD %d] starting (step=%d)\n", L, step);
+        fflush(stdout);
 
         // Aggregate src voxels into LOD-step cells.
         std::unordered_map<CellKey, CellAcc, CellHash> cells;
@@ -728,7 +768,14 @@ int main(int argc, char** argv)
 
         // Bake each chunk.
         lods[L].reserve(chunkVox.size());
+        size_t bakedChunks = 0;
+        const size_t reportEvery = std::max((size_t)1, chunkVox.size() / 20);
         for (auto& kv : chunkVox) {
+            if ((bakedChunks % reportEvery) == 0) {
+                printf("[LOD %d] baking chunk %zu / %zu\n", L, bakedChunks, chunkVox.size());
+                fflush(stdout);
+            }
+            ++bakedChunks;
             const ChunkKey& ck = kv.first;
             const std::vector<LodVox>& voxList = kv.second;
             if (voxList.empty()) continue;
@@ -781,6 +828,7 @@ int main(int argc, char** argv)
             // skips empty cells and hidden-face source voxels (aoFace=0), so
             // only lit face contributions average in.
             auto faceAo4 = [&](int vx, int vy, int vz, int f) -> uint8_t {
+                if (!g_bakeAo) return 15;            // --noao: skip src lookup
                 int sx0 = vx * step, sy0 = vy * step, sz0 = vz * step;
                 int sum = 0, cnt = 0;
                 for (int dx = 0; dx < step; ++dx)

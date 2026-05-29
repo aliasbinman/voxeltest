@@ -290,8 +290,15 @@ void FrameStatsWindow()
     auto mb = [](uint64_t b) { return (double)b / (1024.0 * 1024.0); };
 
     ImGui::Text("Frame");
-    ImGui::Text("  Draw calls:      %u", g_app.renderer.LastDrawnCount());
     {
+        uint32_t total = g_app.renderer.LastDrawnCount();
+        uint32_t splat = g_app.renderer.LastSplatDrawCalls();
+        uint32_t poly  = g_app.renderer.LastPolyDrawCalls();
+        uint32_t fast  = g_app.renderer.LastFastDrawCalls();
+        ImGui::Text("  Draw calls:      %u  (splat %u  +  poly %u)", total, splat, poly);
+        ImGui::Text("  Fast draws:      %u / %u  (same chunk as prev, CB-only update)",
+                    fast, total);
+
         uint64_t voxTot  = g_app.renderer.LastPointCount();
         uint64_t voxSpl  = g_app.renderer.LastSplatVoxelCount();
         uint64_t voxPoly = g_app.renderer.LastPolyVoxelCount();

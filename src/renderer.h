@@ -106,6 +106,9 @@ public:
     uint64_t LastTriCount()   const { return lastTriCount_; }
     uint64_t LastPolyVoxelCount() const { return lastPolyVoxelCount_; }
     uint64_t LastSplatVoxelCount() const { return lastSplatVoxelCount_; }
+    uint32_t LastSplatDrawCalls() const { return lastSplatDrawCalls_; }
+    uint32_t LastPolyDrawCalls()  const { return lastPolyDrawCalls_;  }
+    uint32_t LastFastDrawCalls()  const { return lastFastDrawCalls_;  }
 
 private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
@@ -247,6 +250,9 @@ private:
     uint64_t lastTriCount_   = 0;
     uint64_t lastPolyVoxelCount_  = 0;
     uint64_t lastSplatVoxelCount_ = 0;
+    uint32_t lastSplatDrawCalls_  = 0;
+    uint32_t lastPolyDrawCalls_   = 0;
+    uint32_t lastFastDrawCalls_   = 0;
     uint64_t shaderMtime_ = 0;
     bool     shaderReloading_ = false;
 public:

@@ -1262,7 +1262,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     float planes[6][4];
     ExtractFrustumPlanes(M, planes);
     auto cullAabb = [&](float mnx, float mny, float mnz, float mxx, float mxy, float mxz) -> bool {
-        for (int pi = 0; pi < 6; ++pi) {
+        // Skip the far plane (index 5) — reverse-Z infinite-far makes it
+        // ill-defined and rejects valid distant chunks. Side + near planes only.
+        for (int pi = 0; pi < 5; ++pi) {
             float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
             float px = a >= 0 ? mxx : mnx;
             float py = b >= 0 ? mxy : mny;
@@ -1480,6 +1482,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     uint64_t splatVoxels = 0;
     uint64_t polyVoxels  = 0;
     uint64_t triCount    = 0;
+    uint32_t splatDraws  = 0;
+    uint32_t polyDraws   = 0;
+    uint32_t fastDraws   = 0;       // consecutive draws with same chunk slot
+    uint32_t prevSlot    = 0xFFFFFFFFu;
     static const uint32_t kLodColors[5] = {
         0xffff6060, 0xffffa030, 0xff60c060, 0xff6098c0, 0xffc060ff
     };
@@ -1498,17 +1504,38 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
         // Splat sub-pass only — PolyAxis runs AFTER dilate + composite so its
         // solid cube triangles don't get treated as splats by csmain_splat.
+        // Coalesce contiguous (same chunk, adjacent drawBase+drawCount) items
+        // into single draws to avoid per-cluster Map/Unmap on cbLwLod_ + Draw.
         if (!drawListSplat[L].empty()) {
             ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
             ctx_->VSSetShader(vsLwPoints_.Get(), nullptr, 0);
-            for (const DrawItem& it : drawListSplat[L]) {
-                const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
-                setLodCbForLod(L, rc.slotIdx, it.drawBase);
-                ctx_->Draw(it.drawCount, 0);
+            std::sort(drawListSplat[L].begin(), drawListSplat[L].end(),
+                      [](const DrawItem& a, const DrawItem& b) {
+                          if (a.slot != b.slot) return a.slot < b.slot;
+                          return a.drawBase < b.drawBase;
+                      });
+            uint32_t curSlot = 0xFFFFFFFFu, curBase = 0, curCount = 0;
+            auto flushSplat = [&]() {
+                if (curCount == 0) return;
+                const lw::RuntimeChunk& rc = lwL.chunks[curSlot];
+                setLodCbForLod(L, rc.slotIdx, curBase);
+                ctx_->Draw(curCount, 0);
                 ++drawCount;
-                pointCountTotal += it.drawCount;
-                splatVoxels += it.drawCount;
+                ++splatDraws;
+                if (curSlot == prevSlot) ++fastDraws;
+                prevSlot = curSlot;
+                splatVoxels += curCount;
+                curCount = 0;
+            };
+            for (const DrawItem& it : drawListSplat[L]) {
+                if (it.slot == curSlot && curBase + curCount == it.drawBase) {
+                    curCount += it.drawCount;
+                } else {
+                    flushSplat();
+                    curSlot = it.slot; curBase = it.drawBase; curCount = it.drawCount;
+                }
             }
+            flushSplat();
         }
     }
     (void)pointCountTotal;   // stats consolidated below after polyaxis pass
@@ -1637,14 +1664,34 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                     g.pointSrv.Get(), g.chunkInfoSrv.Get(), g.paletteSrv.Get(),
                 };
                 ctx_->VSSetShaderResources(0, 3, vsSrvs);
-                for (const DrawItem& it : drawListPoly[L]) {
-                    const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
-                    setLodCbForLod(L, rc.slotIdx, it.drawBase);
-                    ctx_->Draw(it.drawCount * 36u, 0);
+                std::sort(drawListPoly[L].begin(), drawListPoly[L].end(),
+                          [](const DrawItem& a, const DrawItem& b) {
+                              if (a.slot != b.slot) return a.slot < b.slot;
+                              return a.drawBase < b.drawBase;
+                          });
+                uint32_t curSlot = 0xFFFFFFFFu, curBase = 0, curCount = 0;
+                auto flushPoly = [&]() {
+                    if (curCount == 0) return;
+                    const lw::RuntimeChunk& rc = lwL.chunks[curSlot];
+                    setLodCbForLod(L, rc.slotIdx, curBase);
+                    ctx_->Draw(curCount * 36u, 0);
                     ++drawCount;
-                    polyVoxels += it.drawCount;
-                    triCount   += (uint64_t)it.drawCount * 12ull;   // 6 faces × 2 tris
+                    ++polyDraws;
+                    if (curSlot == prevSlot) ++fastDraws;
+                    prevSlot = curSlot;
+                    polyVoxels += curCount;
+                    triCount   += (uint64_t)curCount * 12ull;
+                    curCount = 0;
+                };
+                for (const DrawItem& it : drawListPoly[L]) {
+                    if (it.slot == curSlot && curBase + curCount == it.drawBase) {
+                        curCount += it.drawCount;
+                    } else {
+                        flushPoly();
+                        curSlot = it.slot; curBase = it.drawBase; curCount = it.drawCount;
+                    }
                 }
+                flushPoly();
             }
         }
     }
@@ -1661,6 +1708,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     lastPolyVoxelCount_  = polyVoxels;
     lastSplatVoxelCount_ = splatVoxels;
     lastTriCount_        = triCount;
+    lastSplatDrawCalls_  = splatDraws;
+    lastPolyDrawCalls_   = polyDraws;
+    lastFastDrawCalls_   = fastDraws;
 
     // ---- TAA composite + post (optional) ----
     ID3D11ShaderResourceView* postInput = nullptr;

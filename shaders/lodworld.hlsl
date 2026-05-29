@@ -54,15 +54,16 @@ StructuredBuffer<LwPoint>     gLwPoints     : register(t0);
 StructuredBuffer<LwChunkInfo> gLwChunkInfos : register(t1);
 StructuredBuffer<uint>        gLwPalette    : register(t2);
 
-// ---- Splat alpha encoding (mirrors SplatEncodeAlpha in voxel.hlsl) ----
-//   bit 7      = marker
-//   bits 6:5   = lodIdx
-//   bits 4:1   = AO 4-bit
-//   bit 0      = cluster checker parity (0 = dark, 1 = light) — used by lodViz
+// ---- Splat alpha encoding ----
+//   bit 7    = marker
+//   bits 6:4 = lodIdx (3 bits = 0..7 supports kLodCount=5)
+//   bits 3:0 = AO 4-bit
+//   (parity dropped to free bit for 3-bit LOD)
 float EncodeSplatAlpha(float ao01, uint lodIdx, uint parity)
 {
     uint ao4 = (uint)(saturate(ao01) * 15.0 + 0.5);
-    uint a8  = 0x80u | ((lodIdx & 3u) << 5) | ((ao4 & 0xFu) << 1) | (parity & 1u);
+    uint dummy = parity;   // suppress unused-param warning; encoding drops parity
+    uint a8  = 0x80u | ((lodIdx & 7u) << 4) | (ao4 & 0xFu);
     return (float)a8 / 255.0;
 }
 

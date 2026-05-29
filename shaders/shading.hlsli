@@ -78,14 +78,15 @@ float SampleShadow(float3 wpos)
     return sum / 9.0;
 }
 
-// ---- LodViz tints (2..5 = LOD0..3, anything else white) ----
+// ---- LodViz tints (2..6 = LOD0..4, anything else white) ----
 float3 ClusterTint(uint t)
 {
     if (t == 1u) return float3(0.3, 1.0, 0.3);
-    if (t == 2u) return float3(0.3, 0.5, 1.0);
-    if (t == 3u) return float3(0.8, 0.3, 1.0);
-    if (t == 4u) return float3(1.0, 1.0, 0.3);
-    if (t == 5u) return float3(1.0, 0.55, 0.1);
+    if (t == 2u) return float3(0.3, 0.5, 1.0);   // L0 blue
+    if (t == 3u) return float3(0.8, 0.3, 1.0);   // L1 purple
+    if (t == 4u) return float3(1.0, 1.0, 0.3);   // L2 yellow
+    if (t == 5u) return float3(1.0, 0.55, 0.1);  // L3 orange
+    if (t == 6u) return float3(1.0, 0.3, 0.3);   // L4 red
     return float3(1.0, 1.0, 1.0);
 }
 

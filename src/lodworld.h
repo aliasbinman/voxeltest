@@ -409,10 +409,9 @@ inline uint32_t MakeStartVertex(uint32_t slotIdx, uint32_t vtxIdxInChunk)
     return (slotIdx << kStartVertexVtxBits) | (vtxIdxInChunk & kStartVertexVtxMask);
 }
 
-// Max simultaneously-resident chunks per LOD. Encoding uses top 8 bits of
-// SV_VertexID, but D3D11 BaseVertexLocation is INT32 — keep slot << 24 in
-// positive int range, so cap at 128.
-inline constexpr uint32_t kMaxResidentChunksPerLod = 128;
+// Max resident chunks per LOD. Slot now passed via per-draw CB (gLwSlot),
+// so no hard encoding cap — limit chosen to fit GPU SRV + sanity check.
+inline constexpr uint32_t kMaxResidentChunksPerLod = 65536;
 
 // =====================================================================
 // Loader / writer prototypes. Implementations in src/lw_loader.cpp and

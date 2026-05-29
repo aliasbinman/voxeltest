@@ -161,14 +161,12 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             uint a8 = (uint)(s.a * 255.0 + 0.5);
             if (a8 == 0u) continue;
             if ((a8 & 0x80u) == 0u) continue;
-            uint lodIdx = (a8 >> 5) & 3u;
-            uint ao4    = (a8 >> 1) & 0xFu;
-            uint parityN = a8 & 1u;
+            uint lodIdx = (a8 >> 4) & 7u;       // 3 bits, supports LOD0..7
+            uint ao4    = a8 & 0xFu;
+            uint parityN = 0u;                  // parity dropped from encoding
             float aoN   = (float)ao4 / 15.0;
-            float halfExt = (lodIdx == 0u) ? 0.5
-                          : (lodIdx == 1u) ? 1.0
-                          : (lodIdx == 2u) ? 2.0
-                          :                  4.0;
+            // halfExt = 0.5 * (1 << lodIdx) — LOD voxel half-extent in world units.
+            float halfExt = 0.5 * (float)(1u << lodIdx);
             float zN = gSplatDepth.Load(int3(sp, 0));
             if (zN <= 0.0) continue;
             if (zN > fbZ) { fbZ = zN; fbHave = true; }
