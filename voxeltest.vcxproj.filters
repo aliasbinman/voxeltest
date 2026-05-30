@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="shaders">
+      <UniqueIdentifier>{5F8C2A1B-8E0B-4A1C-8B2D-2E7C9F1A3B4D}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\voxel.hlsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="shaders\lodworld.hlsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="shaders\postfx.hlsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="shaders\shading.hlsli">
+      <Filter>shaders</Filter>
+    </None>
+  </ItemGroup>
+</Project>

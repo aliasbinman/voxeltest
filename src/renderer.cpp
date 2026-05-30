@@ -718,18 +718,42 @@ bool Renderer::CreateShaders()
         return true;
     };
 
-    ComPtr<ID3DBlob> csbSp, csbSpFill, csbShBlur, psbSc, vsbTa, psbTa, psbPo, vsbl;
+    ComPtr<ID3DBlob> csbSp, csbSpFill, csbShBlur;
     if (!compile("csmain_splat",           "cs_5_0", csbSp))     return false;
     if (!compile("csmain_splat_fill",      "cs_5_0", csbSpFill)) return false;
     if (!compile("csmain_shadow_blur",     "cs_5_0", csbShBlur)) return false;
-    if (!compile("psmain_splat_composite", "ps_5_0", psbSc))     return false;
-    if (!compile("vsmain_taa",             "vs_5_0", vsbTa))     return false;
-    if (!compile("psmain_taa",             "ps_5_0", psbTa))     return false;
-    if (!compile("psmain_post",            "ps_5_0", psbPo))     return false;
-    if (!compile("vsmain_blit",            "vs_5_0", vsbl))      return false;
-    ComPtr<ID3DBlob> psbGrMark, psbGrBlur;
-    if (!compile("psmain_godray_mark",     "ps_5_0", psbGrMark)) return false;
-    if (!compile("psmain_godray_blur",     "ps_5_0", psbGrBlur)) return false;
+
+    // Fullscreen VS/PS passes live in postfx.hlsl (separate translation unit).
+    std::string fxSrc = ReadTextFile("shaders/postfx.hlsl");
+    if (fxSrc.empty()) {
+        std::fprintf(stderr, "shaders/postfx.hlsl not found\n");
+        if (!shaderReloading_) MessageBoxA(nullptr, "shaders/postfx.hlsl not found", "Renderer", MB_ICONERROR);
+        return false;
+    }
+    auto compileFx = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob) -> bool {
+        ComPtr<ID3DBlob> errs;
+        HRESULT chr = D3DCompile(fxSrc.data(), fxSrc.size(), "shaders/postfx.hlsl", nullptr,
+                                 D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                                 entry, target, cflags, 0, blob.GetAddressOf(), errs.GetAddressOf());
+        if (FAILED(chr)) {
+            std::string msg = "Shader compile error [";
+            msg += entry; msg += "]\n";
+            if (errs) msg += std::string((const char*)errs->GetBufferPointer(), errs->GetBufferSize());
+            std::fprintf(stderr, "%s\n", msg.c_str());
+            OutputDebugStringA(msg.c_str()); OutputDebugStringA("\n");
+            if (!shaderReloading_) MessageBoxA(nullptr, msg.c_str(), entry, MB_ICONERROR);
+            return false;
+        }
+        return true;
+    };
+    ComPtr<ID3DBlob> psbSc, vsbTa, psbTa, psbPo, vsbl, psbGrMark, psbGrBlur;
+    if (!compileFx("psmain_splat_composite", "ps_5_0", psbSc))     return false;
+    if (!compileFx("vsmain_taa",             "vs_5_0", vsbTa))     return false;
+    if (!compileFx("psmain_taa",             "ps_5_0", psbTa))     return false;
+    if (!compileFx("psmain_post",            "ps_5_0", psbPo))     return false;
+    if (!compileFx("vsmain_blit",            "vs_5_0", vsbl))      return false;
+    if (!compileFx("psmain_godray_mark",     "ps_5_0", psbGrMark)) return false;
+    if (!compileFx("psmain_godray_blur",     "ps_5_0", psbGrBlur)) return false;
 
     hr = device_->CreateComputeShader(csbSp->GetBufferPointer(),     csbSp->GetBufferSize(),     nullptr, csSplat_.GetAddressOf());           if (FAILED(hr)) return false;
     hr = device_->CreateComputeShader(csbSpFill->GetBufferPointer(), csbSpFill->GetBufferSize(), nullptr, csSplatFill_.GetAddressOf());       if (FAILED(hr)) return false;
@@ -949,9 +973,11 @@ void Renderer::TryHotReloadShaders()
     uint64_t m1 = mtimeOf("shaders/voxel.hlsl");
     uint64_t m2 = mtimeOf("shaders/lodworld.hlsl");
     uint64_t m3 = mtimeOf("shaders/shading.hlsli");
+    uint64_t m4 = mtimeOf("shaders/postfx.hlsl");
     uint64_t mtime = m1;
     if (m2 > mtime) mtime = m2;
     if (m3 > mtime) mtime = m3;
+    if (m4 > mtime) mtime = m4;
     if (mtime == 0) return;
     if (mtime == shaderMtime_) return;
     if (shaderMtime_ == 0) {
