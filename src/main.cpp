@@ -163,6 +163,7 @@ struct AppState {
     std::atomic<bool>       frustumValid{ false };
     std::atomic<bool>       loaderQuit{ false };
     std::atomic<bool>       loaderTrigger{ false };
+    std::atomic<float>      streamRadiusScale{ 1.0f };   // 1.0 = default; higher = wider shells, less pop-in
     std::mutex              loaderMu;
     std::condition_variable loaderCv;
     std::thread             loaderThread;
@@ -490,6 +491,14 @@ void FrameControlsWindow()
             ImGui::ColorEdit3("Clear color", g_app.bgColor);
             ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
             ImGui::Checkbox("LW: PolyAxis (cube faces, per-face AO)", &g_app.lwPolyAxis);
+            {
+                float rs = g_app.streamRadiusScale.load();
+                if (ImGui::SliderFloat("Stream radius", &rs, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic)) {
+                    g_app.streamRadiusScale.store(rs);
+                    g_app.loaderTrigger.store(true);
+                    g_app.loaderCv.notify_one();
+                }
+            }
             ImGui::Separator();
             ImGui::Text("Camera");
             ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -635,11 +644,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             // Per-LOD shell radii (world units). Tighter than before so each
             // cycle finishes faster + finer LODs aren't dragged down by huge
             // LOD3 shells. LOD4 always full (small world-wide coarse view).
-            cfg.radius[4] = 0.0f;                                       // full
-            cfg.radius[3] = 2.0f * (float)lw::kChunkVoxX * 8.0f;        // 4096
-            cfg.radius[2] = 2.0f * (float)lw::kChunkVoxX * 4.0f;        // 2048
-            cfg.radius[1] = 2.0f * (float)lw::kChunkVoxX * 2.0f;        // 1024
-            cfg.radius[0] = 2.0f * (float)lw::kChunkVoxX * 1.0f;        // 512
+            const float rs = g_app.streamRadiusScale.load();
+            cfg.radius[4] = 0.0f;                                            // full
+            cfg.radius[3] = rs * 2.0f * (float)lw::kChunkVoxX * 8.0f;        // 4096 @1.0
+            cfg.radius[2] = rs * 2.0f * (float)lw::kChunkVoxX * 4.0f;        // 2048 @1.0
+            cfg.radius[1] = rs * 2.0f * (float)lw::kChunkVoxX * 2.0f;        // 1024 @1.0
+            cfg.radius[0] = rs * 2.0f * (float)lw::kChunkVoxX * 1.0f;        // 512 @1.0
             cfg.hasFrustum = g_app.frustumValid.load();
             if (cfg.hasFrustum) {
                 for (int i = 0; i < 24; ++i) {

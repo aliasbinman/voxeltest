@@ -76,6 +76,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         MICROPROFILE_SCOPEI("Loader", "LOD", 0xff80a0ff);
         auto tLodStart = clk::now();
         double tReadMs = 0, tLz4Ms = 0, tDecodeMs = 0;
+        double tPass1Ms = 0, tRankMs = 0, tCullMs = 0, tHeaderMs = 0;
         uint64_t bytesRead = 0, bytesLz4Raw = 0;
         LODWorld& lw = out.lods[L];
         lw.lodLevel = (uint8_t)L;
@@ -118,6 +119,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
             }
             return true;
         };
+        auto tRank0 = clk::now();
         for (uint32_t i = 0; i < cc; ++i) {
             const ChunkEntry& ce = entries[i];
             float mnx = (float)ce.gridX * chunkW;
@@ -144,6 +146,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
             if (a.prio != b.prio) return a.prio < b.prio;
             return a.dist2 < b.dist2;
         });
+        tRankMs = std::chrono::duration<double, std::milli>(clk::now() - tRank0).count();
 
         for (size_t r = 0; r < ranks.size(); ++r) {
             MICROPROFILE_SCOPEI("Loader", "Chunk", 0xffffd060);
@@ -178,6 +181,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                 bytesLz4Raw += ce.blobBytesRaw;
             }
             // Parse common header.
+            auto tHdr0 = clk::now();
             const uint8_t* p = blobPtr;
             const uint8_t* end = blobPtr + blobSize;
             if ((size_t)(end - p) < sizeof(DiskChunkHeader)) {
@@ -215,21 +219,28 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
 
                 memset(rc.clusters, 0, sizeof(rc.clusters));
                 lw.pointPool.resize(rc.poolBase + dch.totalPoints);
+                tHeaderMs += std::chrono::duration<double, std::milli>(clk::now() - tHdr0).count();
+                auto tP1_0 = clk::now();
 
-                // Pass 1: parse all sub-blobs, decode bit-grids, fill chunk-wide bit-grid.
+                // Pass 1: parse all sub-blobs, decode bit-grids.
+                // If kFlagVisMask is present we capture the stored visMask
+                // pointer and skip the chunk-wide bit-grid fill entirely
+                // (the bit-grid only existed to feed Pass3's visMask
+                // recompute via 6 neighbour lookups per voxel).
                 struct ClusterDec {
                     uint8_t  orderMode;
                     uint32_t nP;
                     uint8_t  bits[kClusterCellCount];
                     const uint8_t* colors;
-                    const uint8_t* ao;        // 3 bytes per emitted point (per-face packed)
-                    const uint8_t* cellAo;
-                    uint32_t cellAoCount;
+                    const uint8_t* ao;        // packed nibbles per set visMask bit
+                    const uint8_t* vm;        // 1 byte per emitted voxel (visMask)
                     int oX, oY, oZ;
                 };
                 std::vector<ClusterDec> cds(kClustersPerChunk);
                 const int CW = kChunkVoxX, CH = kChunkVoxY, CD = kChunkVoxZ;
-                std::vector<uint8_t> chunkBits((size_t)((CW * CH * CD + 7) / 8), 0);
+                const bool haveVm = (ce.flags & kFlagVisMask) != 0;
+                std::vector<uint8_t> chunkBits;
+                if (!haveVm) chunkBits.assign((size_t)((CW * CH * CD + 7) / 8), 0);
                 auto cbSet = [&](int x, int y, int z) {
                     size_t idx = (size_t)((y * CD + z) * CW + x);
                     chunkBits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
@@ -253,8 +264,6 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                     if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "colors remaining"; return false; }
                     cd.colors = p; p += cd.nP;
                     if (ce.flags & kFlagAo) {
-                        // Variable-length: leb128 byte count, then packed
-                        // nibbles per visMask-set face per voxel.
                         uint32_t aoBytes = Leb128GetU32(p);
                         if (aoBytes > (uint32_t)(end - p)) { fclose(f); err = "ao remaining"; return false; }
                         cd.ao = p;
@@ -262,72 +271,36 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                     } else {
                         cd.ao = nullptr;
                     }
-                    if (ce.flags & kFlagVisMask) {
+                    if (haveVm) {
                         if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "vm remaining"; return false; }
+                        cd.vm = p;
                         p += cd.nP;
+                    } else {
+                        cd.vm = nullptr;
                     }
                     if (ce.flags & kFlagCellAo) {
-                        cd.cellAoCount = Leb128GetU32(p);
-                        uint32_t cellAoBytes = (cd.cellAoCount + 1) / 2;
+                        // Skip cellAo bytes (unused by runtime).
+                        uint32_t cellAoCount = Leb128GetU32(p);
+                        uint32_t cellAoBytes = (cellAoCount + 1) / 2;
                         if (cellAoBytes > (uint32_t)(end - p)) { fclose(f); err = "cellao remaining"; return false; }
-                        cd.cellAo = p;
                         p += cellAoBytes;
-                    } else {
-                        cd.cellAo = nullptr;
-                        cd.cellAoCount = 0;
                     }
                     cd.oZ = (s / (kClustersX * kClustersY)) * kClusterVoxZ;
                     cd.oY = ((s / kClustersX) % kClustersY) * kClusterVoxY;
                     cd.oX = (s % kClustersX) * kClusterVoxX;
-                    // Fill chunk-wide bit-grid.
-                    for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
-                        if (!cd.bits[cidx]) continue;
-                        uint32_t lx, ly, lz;
-                        LwCellCoord((LwOrderMode)cd.orderMode, cidx, lx, ly, lz);
-                        cbSet(cd.oX + lx, cd.oY + ly, cd.oZ + lz);
-                    }
-                }
-
-                // Pass 2: build chunk-wide cell-AO grid from per-cluster cellAo streams.
-                std::vector<uint8_t> chunkCellAo;
-                if (ce.flags & kFlagCellAo) {
-                    chunkCellAo.assign((size_t)((CW * CH * CD + 1) / 2), 0);
-                    auto caSet = [&](int x, int y, int z, uint8_t ao4) {
-                        size_t idx = (size_t)((y * CD + z) * CW + x);
-                        uint8_t& byte = chunkCellAo[idx >> 1];
-                        if (idx & 1) byte = (byte & 0x0F) | (uint8_t)(ao4 << 4);
-                        else         byte = (byte & 0xF0) | (uint8_t)(ao4 & 0x0F);
-                    };
-                    for (int s = 0; s < kClustersPerChunk; ++s) {
-                        if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
-                        const ClusterDec& cd = cds[s];
-                        if (!cd.cellAo) continue;
-                        uint32_t consumed = 0;
+                    // Fill chunk-wide bit-grid only if we'll need it for
+                    // visMask recompute in Pass3.
+                    if (!haveVm) {
                         for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
-                            if (cd.bits[cidx]) continue;
+                            if (!cd.bits[cidx]) continue;
                             uint32_t lx, ly, lz;
                             LwCellCoord((LwOrderMode)cd.orderMode, cidx, lx, ly, lz);
-                            int wx = cd.oX + lx, wy = cd.oY + ly, wz = cd.oZ + lz;
-                            if (!(cbGet(wx+1,wy,wz) || cbGet(wx-1,wy,wz) ||
-                                  cbGet(wx,wy+1,wz) || cbGet(wx,wy-1,wz) ||
-                                  cbGet(wx,wy,wz+1) || cbGet(wx,wy,wz-1))) continue;
-                            if (consumed >= cd.cellAoCount) break;
-                            uint8_t b = cd.cellAo[consumed >> 1];
-                            uint8_t ao4 = (consumed & 1) ? (b >> 4) : (b & 0x0F);
-                            caSet(wx, wy, wz, ao4);
-                            ++consumed;
+                            cbSet(cd.oX + lx, cd.oY + ly, cd.oZ + lz);
                         }
                     }
                 }
-                bool haveCellAo = (ce.flags & kFlagCellAo) != 0;
-                auto caGet = [&](int x, int y, int z) -> uint8_t {
-                    if (!haveCellAo) return 0xF;
-                    if (x < 0 || y < 0 || z < 0 || x >= CW || y >= CH || z >= CD) return 0xF;
-                    size_t idx = (size_t)((y * CD + z) * CW + x);
-                    uint8_t byte = chunkCellAo[idx >> 1];
-                    return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
-                };
 
+                tPass1Ms += std::chrono::duration<double, std::milli>(clk::now() - tP1_0).count();
                 MICROPROFILE_SCOPEI("Loader", "Pass3", 0xffe080e0);
                 auto tD0 = clk::now();
                 // Pass 3: emit DiskPoints. visMask recomputed from chunk
@@ -354,13 +327,18 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                         dp.posY = (uint8_t)wy;
                         dp.posZ = (uint8_t)wz;
                         dp.palIdx = cd.colors[emitted];
-                        uint8_t mask = 0;
-                        if (!cbGet(wx+1,wy,wz)) mask |= 0x01;
-                        if (!cbGet(wx-1,wy,wz)) mask |= 0x02;
-                        if (!cbGet(wx,wy+1,wz)) mask |= 0x04;
-                        if (!cbGet(wx,wy-1,wz)) mask |= 0x08;
-                        if (!cbGet(wx,wy,wz+1)) mask |= 0x10;
-                        if (!cbGet(wx,wy,wz-1)) mask |= 0x20;
+                        uint8_t mask;
+                        if (cd.vm) {
+                            mask = cd.vm[emitted];
+                        } else {
+                            mask = 0;
+                            if (!cbGet(wx+1,wy,wz)) mask |= 0x01;
+                            if (!cbGet(wx-1,wy,wz)) mask |= 0x02;
+                            if (!cbGet(wx,wy+1,wz)) mask |= 0x04;
+                            if (!cbGet(wx,wy-1,wz)) mask |= 0x08;
+                            if (!cbGet(wx,wy,wz+1)) mask |= 0x10;
+                            if (!cbGet(wx,wy,wz-1)) mask |= 0x20;
+                        }
                         dp.visMask = mask;
                         // Unpack variable-length AO nibbles per visMask bit.
                         // Hidden faces get nibble 0 (never sampled at runtime).
@@ -410,6 +388,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         }
 
         // ---- Build SoA cull arrays (world float AABBs) ----
+        auto tCull0 = clk::now();
         lw.cull.minX.resize(cc); lw.cull.minY.resize(cc); lw.cull.minZ.resize(cc);
         lw.cull.maxX.resize(cc); lw.cull.maxY.resize(cc); lw.cull.maxZ.resize(cc);
         lw.cull.culled.assign(cc, 0);
@@ -426,14 +405,17 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
             lw.cull.maxY[i] = (float)rc.worldOriginY + ((float)rc.aabbMax[1] + 1.0f) * s;
             lw.cull.maxZ[i] = (float)rc.worldOriginZ + ((float)rc.aabbMax[2] + 1.0f) * s;
         }
+        tCullMs = std::chrono::duration<double, std::milli>(clk::now() - tCull0).count();
 
         // Per-LOD timing summary.
         double tTotalMs = std::chrono::duration<double, std::milli>(clk::now() - tLodStart).count();
-        double tOtherMs = tTotalMs - tReadMs - tLz4Ms - tDecodeMs;
-        std::printf("[Loader] LOD %d  total=%.1fms  read=%.1f (%.1f MB)  lz4=%.1f (%.1f MB raw)  decode=%.1f  other=%.1f  ranked=%zu/%u\n",
-                    L, tTotalMs, tReadMs, bytesRead / (1024.0*1024.0),
-                    tLz4Ms, bytesLz4Raw / (1024.0*1024.0),
-                    tDecodeMs, tOtherMs, ranks.size(), cc);
+        double tAccountedMs = tReadMs + tLz4Ms + tHeaderMs + tPass1Ms + tDecodeMs + tRankMs + tCullMs;
+        double tOtherMs = tTotalMs - tAccountedMs;
+        std::printf("[Loader] LOD %d  total=%.1fms  read=%.1f  lz4=%.1f  hdr=%.1f  pass1=%.1f  pass3=%.1f  rank=%.1f  cull=%.1f  other=%.1f  ranked=%zu/%u  bytes=%.1f/%.1fMB\n",
+                    L, tTotalMs, tReadMs, tLz4Ms, tHeaderMs, tPass1Ms,
+                    tDecodeMs, tRankMs, tCullMs, tOtherMs,
+                    ranks.size(), cc,
+                    bytesRead / (1024.0*1024.0), bytesLz4Raw / (1024.0*1024.0));
         std::fflush(stdout);
 
         // Notify caller this LOD is ready for upload.
