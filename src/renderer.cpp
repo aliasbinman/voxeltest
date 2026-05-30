@@ -532,6 +532,21 @@ bool Renderer::CreateRenderTargets()
         }
     }
 
+    // Godray (64x64 R8 — fixed size). [0] = mark, [1,2] = blur+EMA ping-pong.
+    for (int i = 0; i < 3; ++i) {
+        godrayTex_[i].Reset(); godrayRtv_[i].Reset(); godraySrv_[i].Reset();
+        D3D11_TEXTURE2D_DESC gt = {};
+        gt.Width = 64; gt.Height = 64;
+        gt.MipLevels = 1; gt.ArraySize = 1;
+        gt.Format = DXGI_FORMAT_R8_UNORM;
+        gt.SampleDesc.Count = 1;
+        gt.Usage = D3D11_USAGE_DEFAULT;
+        gt.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        device_->CreateTexture2D(&gt, nullptr, godrayTex_[i].GetAddressOf());
+        device_->CreateRenderTargetView(godrayTex_[i].Get(), nullptr, godrayRtv_[i].GetAddressOf());
+        device_->CreateShaderResourceView(godrayTex_[i].Get(), nullptr, godraySrv_[i].GetAddressOf());
+    }
+
     // Splat color RT + final UAV target.
     D3D11_TEXTURE2D_DESC sd2 = {};
     sd2.Width = width_;
@@ -659,6 +674,9 @@ bool Renderer::CreateShaders()
     if (!compile("psmain_taa",             "ps_5_0", psbTa))     return false;
     if (!compile("psmain_post",            "ps_5_0", psbPo))     return false;
     if (!compile("vsmain_blit",            "vs_5_0", vsbl))      return false;
+    ComPtr<ID3DBlob> psbGrMark, psbGrBlur;
+    if (!compile("psmain_godray_mark",     "ps_5_0", psbGrMark)) return false;
+    if (!compile("psmain_godray_blur",     "ps_5_0", psbGrBlur)) return false;
 
     hr = device_->CreateComputeShader(csbSp->GetBufferPointer(),     csbSp->GetBufferSize(),     nullptr, csSplat_.GetAddressOf());           if (FAILED(hr)) return false;
     hr = device_->CreateComputeShader(csbSpFill->GetBufferPointer(), csbSpFill->GetBufferSize(), nullptr, csSplatFill_.GetAddressOf());       if (FAILED(hr)) return false;
@@ -668,6 +686,8 @@ bool Renderer::CreateShaders()
     hr = device_->CreatePixelShader  (psbTa->GetBufferPointer(),     psbTa->GetBufferSize(),     nullptr, psTaa_.GetAddressOf());             if (FAILED(hr)) return false;
     hr = device_->CreatePixelShader  (psbPo->GetBufferPointer(),     psbPo->GetBufferSize(),     nullptr, psPost_.GetAddressOf());            if (FAILED(hr)) return false;
     hr = device_->CreateVertexShader (vsbl->GetBufferPointer(),      vsbl->GetBufferSize(),      nullptr, vsBlit_.GetAddressOf());            if (FAILED(hr)) return false;
+    hr = device_->CreatePixelShader  (psbGrMark->GetBufferPointer(), psbGrMark->GetBufferSize(), nullptr, psGodrayMark_.GetAddressOf());        if (FAILED(hr)) return false;
+    hr = device_->CreatePixelShader  (psbGrBlur->GetBufferPointer(), psbGrBlur->GetBufferSize(), nullptr, psGodrayBlur_.GetAddressOf());        if (FAILED(hr)) return false;
     {
         D3D11_SAMPLER_DESC sm = {};
         sm.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -742,6 +762,9 @@ bool Renderer::CreateShaders()
         // CBLwBounds: 2 * (float3 + float pad) = 32 bytes.
         bd.ByteWidth = 32;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwBounds_.GetAddressOf()))) return false;
+        // CBGodray: 48 bytes (sunNdc+flags / halfScreenUV+pad / tint+strength)
+        bd.ByteWidth = 48;
+        if (FAILED(device_->CreateBuffer(&bd, nullptr, cbGodray_.GetAddressOf()))) return false;
     }
 
     return true;
@@ -1644,7 +1667,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     {
         MICROPROFILE_SCOPEGPUI("LW/Composite", 0xffff8040);
         ID3D11RenderTargetView* sceneRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
-        ctx_->ClearRenderTargetView(sceneRtv, lastClear_);
+        // Scene RT alpha = sky mask. Post pass replaces alpha<0.5 pixels with
+        // SkyColor(rayDir). Scene PS writes alpha=1 wherever it covers.
+        float sceneClear[4] = { lastClear_[0], lastClear_[1], lastClear_[2], postEnabled ? 0.0f : lastClear_[3] };
+        ctx_->ClearRenderTargetView(sceneRtv, sceneClear);
         ctx_->ClearDepthStencilView(dsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
         ID3D11RenderTargetView* compositeRtv[] = { sceneRtv };
         ctx_->OMSetRenderTargets(1, compositeRtv, dsv_.Get());
@@ -1808,7 +1834,102 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             postInput = taaSceneSrv_.Get();
         }
 
-        // Final post: sky/sharpen/tonemap to backbuffer.
+        // ---- Godrays: mark + radial blur into 64x64 ----
+        {
+            MICROPROFILE_SCOPEGPUI("LW/Godray", 0xfffff080);
+            // Project sun into NDC via a far point along light direction.
+            float cp[3]; hlslpp::store(cp, cam.position);
+            float dx = args.sunDir[0], dy = args.sunDir[1], dz = args.sunDir[2];
+            float farK = 1.0e6f;
+            float sxw = cp[0] + dx * farK;
+            float syw = cp[1] + dy * farK;
+            float szw = cp[2] + dz * farK;
+            float vpS[16]; hlslpp::store(vpS, vpUnjittered);
+            auto col = [&](int j) { return sxw*vpS[0+j] + syw*vpS[4+j] + szw*vpS[8+j] + 1.0f*vpS[12+j]; };
+            float cxv = col(0), cyv = col(1), cwv = col(3);
+            float sunNdcX = 0.0f, sunNdcY = 0.0f;
+            float onScreen = 0.0f;
+            if (cwv > 1e-3f) {
+                sunNdcX = cxv / cwv;
+                sunNdcY = cyv / cwv;
+                if (fabsf(sunNdcX) <= 1.0f && fabsf(sunNdcY) <= 1.0f) onScreen = 1.0f;
+            }
+            struct CBG {
+                float sunNdc[2]; float onScreen; float emaAlpha;
+                float halfScreenUV[2]; float _padG1[2];
+                float tint[3];   float strength;
+            } cbg;
+            cbg.sunNdc[0] = sunNdcX; cbg.sunNdc[1] = sunNdcY;
+            cbg.onScreen = onScreen;
+            cbg.emaAlpha = args.godrayEmaAlpha;
+            // Texture covers exactly args.godrayAngleDeg of arc around the
+            // sun, square in screen pixels. Perspective math:
+            //   halfPx = (screenH / 2) * tan(angle/2) / tan(fov/2)
+            const float kDeg2Rad = 3.14159265358979f / 180.0f;
+            float halfPx = (float)height_ * 0.5f
+                         * tanf(args.godrayAngleDeg * 0.5f * kDeg2Rad)
+                         / tanf(cam.fovDeg * 0.5f * kDeg2Rad);
+            cbg.halfScreenUV[0] = halfPx / (float)width_;
+            cbg.halfScreenUV[1] = halfPx / (float)height_;
+            cbg._padG1[0] = cbg._padG1[1] = 0.0f;
+            cbg.tint[0]  = args.godrayTint[0];
+            cbg.tint[1]  = args.godrayTint[1];
+            cbg.tint[2]  = args.godrayTint[2];
+            cbg.strength = args.godrayStrength;
+            D3D11_MAPPED_SUBRESOURCE mmg;
+            ctx_->Map(cbGodray_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mmg);
+            memcpy(mmg.pData, &cbg, sizeof(cbg));
+            ctx_->Unmap(cbGodray_.Get(), 0);
+
+            D3D11_VIEWPORT vp64 = {};
+            vp64.Width = 64.0f; vp64.Height = 64.0f;
+            vp64.MaxDepth = 1.0f;
+            ctx_->RSSetViewports(1, &vp64);
+            ctx_->RSSetState(rsNoCull_.Get());
+            ctx_->OMSetDepthStencilState(dsAlways_.Get(), 0);
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx_->IASetInputLayout(nullptr);
+            ID3D11Buffer* nVbG[] = { nullptr }; UINT vSG=0, vOG=0;
+            ctx_->IASetVertexBuffers(0, 1, nVbG, &vSG, &vOG);
+            ctx_->VSSetShader(vsTaa_.Get(), nullptr, 0);
+            ID3D11Buffer* grCbs[4] = { cbPerFrame_.Get(), nullptr, nullptr, cbGodray_.Get() };
+            ctx_->PSSetConstantBuffers(0, 4, grCbs);
+            ctx_->PSSetSamplers(0, 1, linearClampSampler_.GetAddressOf());
+
+            // Mark
+            ctx_->PSSetShader(psGodrayMark_.Get(), nullptr, 0);
+            ID3D11RenderTargetView* mark0[] = { godrayRtv_[0].Get() };
+            ctx_->OMSetRenderTargets(1, mark0, nullptr);
+            ID3D11ShaderResourceView* dsrv[] = { depthSrv_.Get() };
+            ctx_->PSSetShaderResources(6, 1, dsrv);
+            ctx_->Draw(3, 0);
+            ID3D11ShaderResourceView* nullDsrv[] = { nullptr };
+            ctx_->PSSetShaderResources(6, 1, nullDsrv);
+
+            // Blur+EMA: read mark + previous frame's blend, write to other slot.
+            uint32_t prevIdx = godrayCurrIdx_;             // last frame's output
+            uint32_t writeIdx = (prevIdx == 1u) ? 2u : 1u;
+            ctx_->PSSetShader(psGodrayBlur_.Get(), nullptr, 0);
+            ID3D11RenderTargetView* blurRtv[] = { godrayRtv_[writeIdx].Get() };
+            ctx_->OMSetRenderTargets(1, blurRtv, nullptr);
+            ID3D11ShaderResourceView* grSrv[]  = { godraySrv_[0].Get() };       // mark @ t9
+            ID3D11ShaderResourceView* grHist[] = { godraySrv_[prevIdx].Get() }; // history @ t10
+            ctx_->PSSetShaderResources(9, 1, grSrv);
+            ctx_->PSSetShaderResources(10, 1, grHist);
+            ctx_->Draw(3, 0);
+            ID3D11ShaderResourceView* nullGrSrv[] = { nullptr };
+            ctx_->PSSetShaderResources(9, 1, nullGrSrv);
+            ctx_->PSSetShaderResources(10, 1, nullGrSrv);
+            godrayCurrIdx_ = writeIdx;
+
+            // Restore main viewport.
+            D3D11_VIEWPORT vpFull = {};
+            vpFull.Width = (float)width_; vpFull.Height = (float)height_;
+            vpFull.MaxDepth = 1.0f;
+            ctx_->RSSetViewports(1, &vpFull);
+        }
+
+        // Final post: sky/sharpen/tonemap + godrays to backbuffer.
         {
             MICROPROFILE_SCOPEGPUI("LW/FinalPost", 0xffff8040);
             ID3D11RenderTargetView* bRtv = rtv_.Get();
@@ -1817,7 +1938,14 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->PSSetShader(psPost_.Get(), nullptr, 0);
             ID3D11ShaderResourceView* postSrvs[] = { depthSrv_.Get(), postInput };
             ctx_->PSSetShaderResources(6, 2, postSrvs);
+            ID3D11ShaderResourceView* grPostSrv[] = { godraySrv_[godrayCurrIdx_].Get() };
+            ctx_->PSSetShaderResources(9, 1, grPostSrv);
+            ID3D11Buffer* postCbs[4] = { cbPerFrame_.Get(), nullptr, nullptr, cbGodray_.Get() };
+            ctx_->PSSetConstantBuffers(0, 4, postCbs);
+            ctx_->PSSetSamplers(0, 1, linearClampSampler_.GetAddressOf());
             ctx_->Draw(3, 0);
+            ID3D11ShaderResourceView* nullGr[] = { nullptr };
+            ctx_->PSSetShaderResources(9, 1, nullGr);
         }
         ctx_->RSSetState(rsSolid_.Get());
 

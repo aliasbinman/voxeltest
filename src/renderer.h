@@ -65,6 +65,10 @@ struct DrawSceneParams {
     bool           shadowBlur       = false;
     bool           lwShowBounds     = false;
     bool           lwPolyAxis       = false;
+    float          godrayStrength   = 0.55f;
+    float          godrayAngleDeg   = 10.0f;  // angular extent of texture; real sun = 0.5° (tiny), 10° = nice halo
+    float          godrayEmaAlpha   = 0.15f;  // 1 = no smoothing, lower = more temporal damping
+    float          godrayTint[3]    = { 1.00f, 0.85f, 0.45f };
 };
 
 class Renderer {
@@ -107,6 +111,8 @@ public:
     uint64_t SplatRtBytes() const { return splatRtBytes_; }
     ID3D11ShaderResourceView* ShadowSrv()        const { return shadowSrv_.Get(); }
     ID3D11ShaderResourceView* ShadowFilledSrv()  const { return shadowFilledSrv_.Get(); }
+    ID3D11ShaderResourceView* GodraySrv()        const { return godraySrv_[godrayCurrIdx_].Get(); }
+    ID3D11ShaderResourceView* GodrayMarkSrv()    const { return godraySrv_[0].Get(); }
     uint32_t                  ShadowMapSize()    const { return shadowSize_; }
     uint32_t LastDrawnCount() const { return lastDrawn_; }
     uint64_t LastPointCount() const { return lastPointCount_; }
@@ -212,6 +218,18 @@ private:
     ComPtr<ID3D11PixelShader>        psPost_;
     ComPtr<ID3D11VertexShader>       vsBlit_;
     ComPtr<ID3D11SamplerState>       linearClampSampler_;
+
+    // ---- God rays (64x64 R8) ----
+    // [0]   = mark output (transient each frame)
+    // [1,2] = ping-pong blur+EMA output (sampled by post; previous frame's
+    //         blend used by next frame's blur via EMA history input)
+    ComPtr<ID3D11Texture2D>          godrayTex_[3];
+    ComPtr<ID3D11RenderTargetView>   godrayRtv_[3];
+    ComPtr<ID3D11ShaderResourceView> godraySrv_[3];
+    ComPtr<ID3D11PixelShader>        psGodrayMark_;
+    ComPtr<ID3D11PixelShader>        psGodrayBlur_;
+    ComPtr<ID3D11Buffer>             cbGodray_;
+    uint32_t                         godrayCurrIdx_ = 1;   // most recent blur write target
     uint32_t taaHistIdx_ = 0;
     uint32_t taaFrame_   = 0;
     bool     taaHistValid_[2] = { false, false };

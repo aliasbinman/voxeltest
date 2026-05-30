@@ -137,6 +137,10 @@ struct AppState {
     float    heightFogDensity = 4.5f;        // 0 = off
     float    heightFogFalloff = 0.05f;       // exp falloff per unit height
     float    heightFogStart   = -6.5f;        // world Y of fog ground plane
+    float    godrayStrength   = 0.55f;
+    float    godrayAngleDeg   = 10.0f;
+    float    godrayEmaAlpha   = 0.15f;
+    float    godrayTint[3]    = { 1.00f, 0.85f, 0.45f };
     bool     rmbDown = false;
     POINT    lastMouse = { 0, 0 };
     bool     keys[256] = {};
@@ -438,18 +442,6 @@ void FrameControlsWindow()
     ImGui::Checkbox("Splat CS filter", &g_app.splatFilter);
     ImGui::Checkbox("Splat 2-pass dilate", &g_app.splatDilate2Pass);
     ImGui::SliderInt("Splat radius", &g_app.splatRadius, 1, 16);
-    if (ImGui::CollapsingHeader("Fog")) {
-        const char* fogModes[] = { "Off", "Depth" };
-        int fm = g_app.fogMode;
-        if (ImGui::Combo("Mode", &fm, fogModes, IM_ARRAYSIZE(fogModes))) {
-            g_app.fogMode = fm;
-        }
-        ImGui::SliderFloat("Density", &g_app.fogDensity, 0.0f, 0.005f, "%.5f", ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("Height density", &g_app.heightFogDensity, 0.0f, 5.0f, "%.3f");
-        ImGui::SliderFloat("Height falloff", &g_app.heightFogFalloff, 0.0f, 0.2f, "%.4f");
-        ImGui::SliderFloat("Height start Y", &g_app.heightFogStart,   -100.0f, 200.0f, "%.1f");
-        ImGui::ColorEdit3("Color", g_app.fogColor);
-    }
     const char* pls[] = { "Simple", "Complex" };
     int pli = (int)g_app.pointLight;
     if (ImGui::Combo("Point lighting", &pli, pls, IM_ARRAYSIZE(pls))) {
@@ -542,6 +534,34 @@ void FrameControlsWindow()
             } else {
                 ImGui::TextUnformatted("(no shadow map — enable Sun shadows)");
             }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Fog")) {
+            const char* fogModes[] = { "Off", "Depth" };
+            int fm = g_app.fogMode;
+            if (ImGui::Combo("Mode", &fm, fogModes, IM_ARRAYSIZE(fogModes))) {
+                g_app.fogMode = fm;
+            }
+            ImGui::SliderFloat("Density", &g_app.fogDensity, 0.0f, 0.005f, "%.5f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Height density", &g_app.heightFogDensity, 0.0f, 5.0f, "%.3f");
+            ImGui::SliderFloat("Height falloff", &g_app.heightFogFalloff, 0.0f, 0.2f, "%.4f");
+            ImGui::SliderFloat("Height start Y", &g_app.heightFogStart, -100.0f, 200.0f, "%.1f");
+            ImGui::ColorEdit3("Color", g_app.fogColor);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("GodRays")) {
+            ImGui::SliderFloat("Strength", &g_app.godrayStrength, 0.0f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Angle (deg)", &g_app.godrayAngleDeg, 0.05f, 30.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Temporal blend", &g_app.godrayEmaAlpha, 0.02f, 1.0f, "%.2f (1 = none)");
+            ImGui::ColorEdit3 ("Tint",      g_app.godrayTint);
+            ImGui::Separator();
+            ImGui::TextUnformatted("Mark (pre-blur):");
+            if (auto* s = g_app.renderer.GodrayMarkSrv()) ImGui::Image((ImTextureID)s, ImVec2(192, 192));
+            ImGui::SameLine();
+            ImGui::BeginGroup();
+            ImGui::TextUnformatted("Blurred (sampled):");
+            if (auto* s = g_app.renderer.GodraySrv()) ImGui::Image((ImTextureID)s, ImVec2(192, 192));
+            ImGui::EndGroup();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -899,6 +919,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.heightFogDensity = effHeightFogDen;
             ps.heightFogFalloff = g_app.heightFogFalloff;
             ps.heightFogStart   = g_app.heightFogStart;
+            ps.godrayStrength   = g_app.godrayStrength;
+            ps.godrayAngleDeg   = g_app.godrayAngleDeg;
+            ps.godrayEmaAlpha   = g_app.godrayEmaAlpha;
+            ps.godrayTint[0]    = g_app.godrayTint[0];
+            ps.godrayTint[1]    = g_app.godrayTint[1];
+            ps.godrayTint[2]    = g_app.godrayTint[2];
             ps.splatRadius      = g_app.splatRadius;
             ps.taa              = g_app.taa;
             ps.sunDir[0]        = sunDir[0];

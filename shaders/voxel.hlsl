@@ -422,6 +422,57 @@ float4 psmain_taa(VTaaOut i) : SV_Target
 Texture2D<float>  gPostDepth : register(t6);
 Texture2D<float4> gPostIn    : register(t7);
 
+// ---------------- God rays ----------------
+// 64x64 occlusion texture centered on sun in NDC. Mark pass writes 1.0 if
+// the corresponding screen pixel is sky (reverse-Z depth == 0), 0 if blocked
+// or off-screen. Radial blur smears toward center. Post pass samples by
+// computing offset from sun screen pos and adds yellow tint.
+cbuffer cbGodray : register(b3)
+{
+    float2 gSunScreenNdc;        // -1..1 NDC sun position (xy)
+    float  gSunOnScreen;         // 0 = sun behind cam or NDC outside; 1 = on screen
+    float  gGodrayEmaAlpha;      // 0..1: how much of the new frame to mix in (1 = no smoothing)
+    float2 gGodrayHalfScreenUV;  // half-extent in screen-UV space (square in pixels)
+    float2 _padG1;
+    float3 gGodrayTint;
+    float  gGodrayStrength;      // 0 = off
+};
+Texture2D<float> gGodrayTex     : register(t9);   // mark (in blur) / blur+EMA (in post)
+Texture2D<float> gGodrayHistTex : register(t10);  // previous frame's blur+EMA (blur input only)
+
+float4 psmain_godray_mark(VTaaOut i) : SV_Target
+{
+    if (gSunOnScreen < 0.5) return 0.0;
+    int2 tex = (int2)i.pos.xy;
+    float2 local = (float2(tex) + 0.5) / 64.0 * 2.0 - 1.0;  // -1..1 in tex space
+    // Circle mask.
+    if (dot(local, local) > 1.0) return 0.0;
+    // Map to screen UV: square is gGodrayHalfScreenUV (x,y) around sun.
+    float2 sunScreenUV = gSunScreenNdc * float2(0.5, -0.5) + 0.5;
+    float2 uv = sunScreenUV + local * gGodrayHalfScreenUV;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+    int2 px = int2(uv * gScreenSize);
+    px = clamp(px, int2(0,0), int2((int)gScreenSize.x - 1, (int)gScreenSize.y - 1));
+    float d = gPostDepth.Load(int3(px, 0));   // reverse-Z: 0 = far / sky
+    return (d <= 0.0001) ? 1.0 : 0.0;
+}
+
+float4 psmain_godray_blur(VTaaOut i) : SV_Target
+{
+    int2 tex = (int2)i.pos.xy;
+    float2 uv = (float2(tex) + 0.5) / 64.0;
+    float2 toCenter = float2(0.5, 0.5) - uv;
+    const int N = 24;
+    float sum = 0.0;
+    [unroll] for (int s = 0; s < N; ++s) {
+        float t = (float)s / (float)N;
+        sum += gGodrayTex.SampleLevel(gTaaSamp, uv + toCenter * t, 0);
+    }
+    float curr = sum / (float)N;
+    float prev = gGodrayHistTex.SampleLevel(gTaaSamp, uv, 0);
+    return lerp(prev, curr, gGodrayEmaAlpha);
+}
+
 float3 PostPixelWorldDir(int2 pix, int W, int H)
 {
     float ndcX = ((float)pix.x + 0.5) / (float)W * 2.0 - 1.0;
@@ -433,18 +484,13 @@ float3 PostPixelWorldDir(int2 pix, int W, int H)
 
 float3 SkyColor(float3 rd)
 {
-    float3 sunDir = normalize(gLightDir);
+    // Gradient only — sun disc + glow are added by the godray post pass.
     float  t = saturate(rd.y * 0.5 + 0.5);
     float3 horizon = float3(0.70, 0.75, 0.85);
     float3 zenith  = float3(0.20, 0.40, 0.80);
     float3 ground  = gFogColor;
-    float3 above = lerp(horizon, zenith, smoothstep(0.5, 1.0, t));
-    float3 sky   = lerp(ground, above, smoothstep(0.48, 0.52, t));
-    float sunDot = max(0.0, dot(rd, sunDir));
-    float disc   = smoothstep(0.9990, 0.9996, sunDot);
-    float glow   = pow(sunDot, 6.0) * 0.6;
-    sky += float3(1.10, 0.95, 0.75) * (disc + glow);
-    return sky;
+    float3 above   = lerp(horizon, zenith, smoothstep(0.5, 1.0, t));
+    return lerp(ground, above, smoothstep(0.48, 0.52, t));
 }
 
 float4 psmain_post(VTaaOut i) : SV_Target
@@ -467,6 +513,23 @@ float4 psmain_post(VTaaOut i) : SV_Target
         float3 avg = (gPostIn.Load(int3(pL, 0)).rgb + gPostIn.Load(int3(pR, 0)).rgb +
                       gPostIn.Load(int3(pU, 0)).rgb + gPostIn.Load(int3(pD, 0)).rgb) * 0.25;
         c = c + 0.5 * (c - avg);   // unsharp mask
+    }
+    // Add godrays. Every pixel samples the blurred occlusion texture at its
+    // sun-relative offset (in screen-UV space), clamped to the unit circle
+    // so there's no hard rectangle edge. Fades with screen distance from sun.
+    if (gSunOnScreen > 0.5 && gGodrayStrength > 0.0) {
+        float2 sunScreenUV = gSunScreenNdc * float2(0.5, -0.5) + 0.5;
+        float2 screenUV    = (float2(pix) + 0.5) / float2(W, H);
+        float2 off         = (screenUV - sunScreenUV) / gGodrayHalfScreenUV;   // -1..1 = inside square
+        float  rOff        = length(off);
+        if (rOff > 1.0) off *= (1.0 / rOff);
+        float2 godrayUV    = 0.5 + off * 0.5;
+        float  gr          = saturate(gGodrayTex.SampleLevel(gTaaSamp, godrayUV, 0));
+        float  aspect      = gScreenSize.x / gScreenSize.y;
+        float2 dScreen     = (screenUV - sunScreenUV) * float2(aspect, 1.0);
+        float  dist        = length(dScreen);
+        float  fade        = saturate(1.0 - dist * 1.5);
+        c += gGodrayTint * gr * gGodrayStrength * fade;
     }
     return float4(c, 1.0);
 }
