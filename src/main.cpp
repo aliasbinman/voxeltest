@@ -140,6 +140,7 @@ struct AppState {
     float    godrayStrength   = 0.55f;
     float    godrayAngleDeg   = 10.0f;
     float    godrayEmaAlpha   = 0.15f;
+    float    lastGodrayCamPos[3] = { 0, 0, 0 };
     float    godrayTint[3]    = { 1.00f, 0.85f, 0.45f };
     bool     rmbDown = false;
     POINT    lastMouse = { 0, 0 };
@@ -921,7 +922,27 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.heightFogStart   = g_app.heightFogStart;
             ps.godrayStrength   = g_app.godrayStrength;
             ps.godrayAngleDeg   = g_app.godrayAngleDeg;
-            ps.godrayEmaAlpha   = g_app.godrayEmaAlpha;
+            {
+                // Boost alpha (less smoothing) on translation. Rotation is
+                // fine — sun stays at same world dir, just on different screen
+                // pixel; small history error. Translation shifts parallax so
+                // depth pixels under each godray texel change → history stale.
+                float cx, cy, cz;
+                {
+                    float tmp[3];
+                    hlslpp::store(tmp, g_app.camera.position);
+                    cx = tmp[0]; cy = tmp[1]; cz = tmp[2];
+                }
+                float dx = cx - g_app.lastGodrayCamPos[0];
+                float dy = cy - g_app.lastGodrayCamPos[1];
+                float dz = cz - g_app.lastGodrayCamPos[2];
+                float delta = std::sqrt(dx*dx + dy*dy + dz*dz);
+                float boost = std::min(1.0f, delta / 2.0f);   // 2 units/frame = no history
+                ps.godrayEmaAlpha = std::max(g_app.godrayEmaAlpha, boost);
+                g_app.lastGodrayCamPos[0] = cx;
+                g_app.lastGodrayCamPos[1] = cy;
+                g_app.lastGodrayCamPos[2] = cz;
+            }
             ps.godrayTint[0]    = g_app.godrayTint[0];
             ps.godrayTint[1]    = g_app.godrayTint[1];
             ps.godrayTint[2]    = g_app.godrayTint[2];
