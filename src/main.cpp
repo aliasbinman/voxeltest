@@ -105,8 +105,8 @@ struct AppState {
     Renderer renderer;
     Camera   camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech  tech    = RenderTech::PolyAxis;  // close tech
-    RenderTech  techFar = RenderTech::Splat;     // far tech
+    RenderTech  tech    = RenderTech::PointCS;   // close tech
+    RenderTech  techFar = RenderTech::PointCS;   // far tech
     bool        closeEnabled = true;
     bool        farEnabled   = true;
     float    sunPitchDeg = 60.0f;
@@ -124,7 +124,7 @@ struct AppState {
     float    roughness      = 0.6f;
     bool     vsync = false;
     int      gridSize = 1;
-    bool     taa = true;
+    bool     taa = false;
     PointLighting pointLight = PointLighting::Complex;
     PointLod pointLod = PointLod::Auto;
     float    pointLodScale = 1.0f;
@@ -169,6 +169,7 @@ struct AppState {
     std::atomic<bool>       loaderQuit{ false };
     std::atomic<bool>       loaderTrigger{ false };
     std::atomic<float>      streamRadiusScale{ 1.0f };   // 1.0 = default; higher = wider shells, less pop-in
+    bool                    skipBackbufferClear = false; // skip swapchain RTV clear (post pass covers all pixels)
     std::mutex              loaderMu;
     std::condition_variable loaderCv;
     std::thread             loaderThread;
@@ -400,10 +401,12 @@ void FrameControlsWindow()
     }
     struct TechEntry { const char* name; RenderTech val; };
     static const TechEntry kTechList[] = {
-        { "Splat",        RenderTech::Splat        },
-        { "PolyAxis",     RenderTech::PolyAxis     },
-        { "PolyAxisInst", RenderTech::PolyAxisInstanced },
-        { "HexSprite",    RenderTech::HexSprite    },
+        { "Splat",         RenderTech::Splat        },
+        { "PolyAxis",      RenderTech::PolyAxis     },
+        { "PolyAxisInst",  RenderTech::PolyAxisInstanced },
+        { "HexSprite",     RenderTech::HexSprite    },
+        { "PointCS",       RenderTech::PointCS      },
+        { "PointCS_LDS",   RenderTech::PointCS_LDS  },
     };
     const int kTechCount = (int)(sizeof(kTechList) / sizeof(kTechList[0]));
     auto techIdxFrom = [&](RenderTech v) -> int {
@@ -492,6 +495,7 @@ void FrameControlsWindow()
                     g_app.loaderCv.notify_one();
                 }
             }
+            ImGui::Checkbox("Skip backbuffer clear (post writes all px)", &g_app.skipBackbufferClear);
             ImGui::Separator();
             ImGui::Text("Camera");
             ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -883,7 +887,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             clear[2] = g_app.bgColor[2];
             clear[3] = g_app.bgColor[3];
         }
-        g_app.renderer.BeginFrame(clear);
+        g_app.renderer.BeginFrame(clear, g_app.skipBackbufferClear);
         // Draw as soon as ANY LOD is uploaded — streaming flips sceneReady on
         // first LOD ready. loadOk only flips after the worker has finished
         // every LOD; gating on it hides the coarse scene until full load.

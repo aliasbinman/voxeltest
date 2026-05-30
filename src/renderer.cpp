@@ -547,6 +547,59 @@ bool Renderer::CreateRenderTargets()
         device_->CreateShaderResourceView(godrayTex_[i].Get(), nullptr, godraySrv_[i].GetAddressOf());
     }
 
+    // Compute rasterizer vis buffer (R32_UINT, fullscreen, UAV + SRV).
+    visBufTex_.Reset(); visBufUav_.Reset(); visBufSrv_.Reset();
+    {
+        D3D11_TEXTURE2D_DESC vd = {};
+        vd.Width = width_; vd.Height = height_;
+        vd.MipLevels = 1; vd.ArraySize = 1;
+        vd.Format = DXGI_FORMAT_R32_UINT;
+        vd.SampleDesc.Count = 1;
+        vd.Usage = D3D11_USAGE_DEFAULT;
+        vd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        device_->CreateTexture2D(&vd, nullptr, visBufTex_.GetAddressOf());
+        device_->CreateUnorderedAccessView(visBufTex_.Get(), nullptr, visBufUav_.GetAddressOf());
+        device_->CreateShaderResourceView(visBufTex_.Get(), nullptr, visBufSrv_.GetAddressOf());
+    }
+
+    // Tile binning buffers (per-tile counter + list of point refs).
+    tileCounterBuf_.Reset(); tileCounterUav_.Reset();
+    tileListBuf_.Reset();    tileListUav_.Reset();
+    numTilesX_ = (width_  + tileW_ - 1) / tileW_;
+    numTilesY_ = (height_ + tileH_ - 1) / tileH_;
+    const uint32_t numTiles = numTilesX_ * numTilesY_;
+    {
+        // tileCounter: typed Buffer<uint>.
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth = numTiles * sizeof(uint32_t);
+        cbd.Usage = D3D11_USAGE_DEFAULT;
+        cbd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        cbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        // Typed UAV with R32_UINT format below.
+        device_->CreateBuffer(&cbd, nullptr, tileCounterBuf_.GetAddressOf());
+        D3D11_UNORDERED_ACCESS_VIEW_DESC cuav = {};
+        cuav.Format = DXGI_FORMAT_R32_UINT;
+        cuav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        cuav.Buffer.NumElements = numTiles;
+        device_->CreateUnorderedAccessView(tileCounterBuf_.Get(), &cuav, tileCounterUav_.GetAddressOf());
+
+        // tileList: structured buffer of uint2.
+        struct U2 { uint32_t x, y; };
+        const uint32_t listCount = numTiles * tileMaxPerTile_;
+        D3D11_BUFFER_DESC lbd = {};
+        lbd.ByteWidth = listCount * sizeof(U2);
+        lbd.Usage = D3D11_USAGE_DEFAULT;
+        lbd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        lbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        lbd.StructureByteStride = sizeof(U2);
+        device_->CreateBuffer(&lbd, nullptr, tileListBuf_.GetAddressOf());
+        D3D11_UNORDERED_ACCESS_VIEW_DESC luav = {};
+        luav.Format = DXGI_FORMAT_UNKNOWN;
+        luav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        luav.Buffer.NumElements = listCount;
+        device_->CreateUnorderedAccessView(tileListBuf_.Get(), &luav, tileListUav_.GetAddressOf());
+    }
+
     // Splat color RT + final UAV target.
     D3D11_TEXTURE2D_DESC sd2 = {};
     sd2.Width = width_;
@@ -729,6 +782,12 @@ bool Renderer::CreateShaders()
         if (!compileLw("psmain_lw_bounds",          "ps_5_0", bpsB))     return false;
         if (!compileLw("vsmain_lw_polyaxis",        "vs_5_0", bvsPa))    return false;
         if (!compileLw("psmain_lw_polyaxis_lit",    "ps_5_0", bpsPaLit)) return false;
+        ComPtr<ID3DBlob> bcsAtom, bcsBin, bcsTr, bvsR, bpsR;
+        if (!compileLw("csmain_lw_point_atomic",    "cs_5_0", bcsAtom))  return false;
+        if (!compileLw("csmain_lw_point_bin",       "cs_5_0", bcsBin))   return false;
+        if (!compileLw("csmain_lw_tile_raster",     "cs_5_0", bcsTr))    return false;
+        if (!compileLw("vsmain_lw_resolve",         "vs_5_0", bvsR))     return false;
+        if (!compileLw("psmain_lw_resolve",         "ps_5_0", bpsR))     return false;
         hr = device_->CreateVertexShader(bvs->GetBufferPointer(),   bvs->GetBufferSize(),   nullptr, vsLwPoints_.GetAddressOf());
         if (FAILED(hr)) return false;
         hr = device_->CreatePixelShader (bps->GetBufferPointer(),   bps->GetBufferSize(),   nullptr, psLwSplatAlbedo_.GetAddressOf());
@@ -744,6 +803,16 @@ bool Renderer::CreateShaders()
         hr = device_->CreateVertexShader(bvsPa->GetBufferPointer(), bvsPa->GetBufferSize(), nullptr, vsLwPolyAxis_.GetAddressOf());
         if (FAILED(hr)) return false;
         hr = device_->CreatePixelShader (bpsPaLit->GetBufferPointer(), bpsPaLit->GetBufferSize(), nullptr, psLwPolyAxisLit_.GetAddressOf());
+        if (FAILED(hr)) return false;
+        hr = device_->CreateComputeShader(bcsAtom->GetBufferPointer(),bcsAtom->GetBufferSize(),nullptr, csLwAtomic_.GetAddressOf());
+        if (FAILED(hr)) return false;
+        hr = device_->CreateComputeShader(bcsBin->GetBufferPointer(), bcsBin->GetBufferSize(), nullptr, csLwBin_.GetAddressOf());
+        if (FAILED(hr)) return false;
+        hr = device_->CreateComputeShader(bcsTr->GetBufferPointer(),  bcsTr->GetBufferSize(),  nullptr, csLwTileRaster_.GetAddressOf());
+        if (FAILED(hr)) return false;
+        hr = device_->CreateVertexShader(bvsR->GetBufferPointer(),  bvsR->GetBufferSize(),  nullptr, vsLwResolve_.GetAddressOf());
+        if (FAILED(hr)) return false;
+        hr = device_->CreatePixelShader (bpsR->GetBufferPointer(),  bpsR->GetBufferSize(),  nullptr, psLwResolve_.GetAddressOf());
         if (FAILED(hr)) return false;
 
         // CBs.
@@ -765,6 +834,9 @@ bool Renderer::CreateShaders()
         // CBGodray: 48 bytes (sunNdc+flags / halfScreenUV+pad / tint+strength)
         bd.ByteWidth = 48;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbGodray_.GetAddressOf()))) return false;
+        // CBLwCS: 32 bytes (vw_xy / count / maxPerTile / tileW / tileH / numTilesXY)
+        bd.ByteWidth = 32;
+        if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwCS_.GetAddressOf()))) return false;
     }
 
     return true;
@@ -901,7 +973,7 @@ void Renderer::TryHotReloadShaders()
     shaderMtime_ = mtime;
 }
 
-void Renderer::BeginFrame(float clear[4])
+void Renderer::BeginFrame(float clear[4], bool skipClear)
 {
     TryHotReloadShaders();
     lastClear_[0] = clear[0];
@@ -910,7 +982,9 @@ void Renderer::BeginFrame(float clear[4])
     lastClear_[3] = clear[3];
     ID3D11RenderTargetView* rtvs[] = { rtv_.Get() };
     ctx_->OMSetRenderTargets(1, rtvs, dsv_.Get());
-    ctx_->ClearRenderTargetView(rtv_.Get(), clear);
+    if (!skipClear) {
+        ctx_->ClearRenderTargetView(rtv_.Get(), clear);
+    }
     ctx_->ClearDepthStencilView(dsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
 
     D3D11_VIEWPORT vp = {};
@@ -1297,11 +1371,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
     ctx_->RSSetState(rsSolid_.Get());
 
-    float clr[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
-    ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clr);
-    const float zeroClr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    ctx_->ClearRenderTargetView(splatMaskRtv_.Get(), zeroClr);
-    ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+    // Splat clears only needed if Splat tech actually in use this frame.
+    const bool needSplat = (args.tech == RenderTech::Splat) || (args.techFar == RenderTech::Splat);
+    if (needSplat) {
+        float clr[4] = { lastClear_[0], lastClear_[1], lastClear_[2], 0.0f };
+        ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clr);
+        const float zeroClr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        ctx_->ClearRenderTargetView(splatMaskRtv_.Get(), zeroClr);
+        ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+    }
     ID3D11RenderTargetView* mrt[] = { splatColorRtv_.Get(), splatMaskRtv_.Get() };
     ctx_->OMSetRenderTargets(2, mrt, splatDsv_.Get());
 
@@ -1366,6 +1444,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     struct DrawItem { uint32_t slot; uint32_t drawBase; uint32_t drawCount; };
     std::vector<DrawItem> drawListSplat[lw::kLodCount];
     std::vector<DrawItem> drawListPoly [lw::kLodCount];
+    std::vector<DrawItem> drawListAtomic[lw::kLodCount];   // PointCS (global atomic)
+    std::vector<DrawItem> drawListLDS   [lw::kLodCount];   // PointCS_LDS (tile + LDS)
 
     // Per-chunk tech pick: distance-based close/far ring. LOD-independent so
     // recursion can't flip a chunk's classification mid-traversal.
@@ -1379,6 +1459,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         if (isClose && !args.closeEnabled) return nullptr;
         if (!isClose && !args.farEnabled) return nullptr;
         RenderTech tech = isClose ? args.tech : args.techFar;
+        if (tech == RenderTech::PointCS)     return &drawListAtomic[L];
+        if (tech == RenderTech::PointCS_LDS) return &drawListLDS[L];
         bool usePoly = (tech == RenderTech::PolyAxis) || args.lwPolyAxis;
         return usePoly ? &drawListPoly[L] : &drawListSplat[L];
     };
@@ -1554,6 +1636,29 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     uint32_t drawCount = 0;
     uint64_t pointCountTotal = 0;
     uint64_t splatVoxels = 0;
+
+    // Compute rasterizer: clear vis buffer if either CS tech in use.
+    bool anyAtomic = false;
+    bool anyLDS    = false;
+    for (int Li = 0; Li < lw::kLodCount; ++Li) {
+        if (!drawListAtomic[Li].empty()) anyAtomic = true;
+        if (!drawListLDS   [Li].empty()) anyLDS    = true;
+    }
+    bool anyCS = anyAtomic || anyLDS;
+    if (anyCS && visBufUav_) {
+        MICROPROFILE_SCOPEGPUI("LW/PointCS/Clear", 0xff404060);
+        ID3D11RenderTargetView* nullRtvsA[] = { nullptr, nullptr };
+        ctx_->OMSetRenderTargets(2, nullRtvsA, nullptr);
+        uint32_t clearVis[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+        ctx_->ClearUnorderedAccessViewUint(visBufUav_.Get(), clearVis);
+        if (anyLDS && tileCounterUav_) {
+            uint32_t zero4[4] = { 0u, 0u, 0u, 0u };
+            ctx_->ClearUnorderedAccessViewUint(tileCounterUav_.Get(), zero4);
+        }
+        // Restore splat RTs for the splat draws inside the loop.
+        ID3D11RenderTargetView* mrtA[] = { splatColorRtv_.Get(), splatMaskRtv_.Get() };
+        ctx_->OMSetRenderTargets(2, mrtA, splatDsv_.Get());
+    }
     uint64_t polyVoxels  = 0;
     uint64_t triCount    = 0;
     uint32_t splatDraws  = 0;
@@ -1564,7 +1669,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         0xffff6060, 0xffffa030, 0xff60c060, 0xff6098c0, 0xffc060ff
     };
     for (int L = topL; L >= 0; --L) {
-        if (drawListSplat[L].empty() && drawListPoly[L].empty()) continue;
+        if (drawListSplat[L].empty() && drawListPoly[L].empty()
+            && drawListAtomic[L].empty() && drawListLDS[L].empty()) continue;
         const LwGpu& g = lwGpu_[L];
         if (g.slotCount == 0 || !g.pointSrv) continue;
         const lw::LODWorld& lwL = lwWorld_.lods[L];
@@ -1611,11 +1717,98 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             }
             flushSplat();
         }
+
+        // Helper to write the compute CB for this LOD's dispatches.
+        auto writeCbLwCS = [&](uint32_t curCount) {
+            D3D11_MAPPED_SUBRESOURCE mm;
+            ctx_->Map(cbLwCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+            struct {
+                uint32_t w, h, cnt, maxPer;
+                uint32_t tileW, tileH, numTx, numTy;
+            } cbcs;
+            cbcs.w = width_; cbcs.h = height_; cbcs.cnt = curCount;
+            cbcs.maxPer = tileMaxPerTile_;
+            cbcs.tileW = tileW_; cbcs.tileH = tileH_;
+            cbcs.numTx = numTilesX_; cbcs.numTy = numTilesY_;
+            memcpy(mm.pData, &cbcs, sizeof(cbcs));
+            ctx_->Unmap(cbLwCS_.Get(), 0);
+        };
+
+        auto runCsDispatches = [&](std::vector<DrawItem>& list,
+                                   ID3D11ComputeShader* cs,
+                                   ID3D11UnorderedAccessView* const* uavs,
+                                   uint32_t uavCount,
+                                   UINT* initCounts) {
+            if (list.empty() || !cs) return;
+            ID3D11RenderTargetView* nullRtvsCS[] = { nullptr, nullptr };
+            ctx_->OMSetRenderTargets(2, nullRtvsCS, nullptr);
+            ID3D11ShaderResourceView* nullVsX[3] = { nullptr, nullptr, nullptr };
+            ctx_->VSSetShaderResources(0, 3, nullVsX);
+
+            ctx_->CSSetShader(cs, nullptr, 0);
+            ctx_->CSSetShaderResources(0, 3, vsSrvs);
+            ctx_->CSSetUnorderedAccessViews(0, uavCount, uavs, initCounts);
+            ID3D11Buffer* csCbs[] = { cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get() };
+            ctx_->CSSetConstantBuffers(0, 4, csCbs);
+
+            std::sort(list.begin(), list.end(),
+                      [](const DrawItem& a, const DrawItem& b) {
+                          if (a.slot != b.slot) return a.slot < b.slot;
+                          return a.drawBase < b.drawBase;
+                      });
+            uint32_t curSlot = 0xFFFFFFFFu, curBase = 0, curCount = 0;
+            auto flush = [&]() {
+                if (curCount == 0) return;
+                const lw::RuntimeChunk& rc = lwL.chunks[curSlot];
+                setLodCbForLod(L, rc.slotIdx, curBase);
+                writeCbLwCS(curCount);
+                uint32_t groups = (curCount + 63) / 64;
+                ctx_->Dispatch(groups, 1, 1);
+                ++drawCount;
+                curCount = 0;
+            };
+            for (const DrawItem& it : list) {
+                if (it.slot == curSlot && curBase + curCount == it.drawBase) {
+                    curCount += it.drawCount;
+                } else {
+                    flush();
+                    curSlot = it.slot; curBase = it.drawBase; curCount = it.drawCount;
+                }
+            }
+            flush();
+
+            ID3D11UnorderedAccessView* nullUavs[] = { nullptr, nullptr, nullptr };
+            ctx_->CSSetUnorderedAccessViews(0, uavCount, nullUavs, initCounts);
+            ID3D11ShaderResourceView* nullCsSrv[3] = { nullptr, nullptr, nullptr };
+            ctx_->CSSetShaderResources(0, 3, nullCsSrv);
+            ID3D11RenderTargetView* mrtRestore[] = { splatColorRtv_.Get(), splatMaskRtv_.Get() };
+            ctx_->OMSetRenderTargets(2, mrtRestore, splatDsv_.Get());
+            ctx_->VSSetShaderResources(0, 3, vsSrvs);
+        };
+
+        // PointCS (global atomic) — bind visBuf UAV only.
+        if (!drawListAtomic[L].empty()) {
+            MICROPROFILE_SCOPEGPUI("LW/PointCS", 0xff60a0ff);
+            ID3D11UnorderedAccessView* uavs[] = { visBufUav_.Get() };
+            UINT init[] = { 0 };
+            runCsDispatches(drawListAtomic[L], csLwAtomic_.Get(), uavs, 1, init);
+        }
+        // PointCS_LDS (tile binning) — bind visBuf + tileCounter + tileList.
+        if (!drawListLDS[L].empty()) {
+            MICROPROFILE_SCOPEGPUI("LW/PointCS_LDS/Bin", 0xffa060ff);
+            ID3D11UnorderedAccessView* uavs[] = {
+                visBufUav_.Get(), tileCounterUav_.Get(), tileListUav_.Get()
+            };
+            UINT init[] = { 0, 0, 0 };
+            runCsDispatches(drawListLDS[L], csLwBin_.Get(), uavs, 3, init);
+        }
     }
     (void)pointCountTotal;   // stats consolidated below after polyaxis pass
 
     // ---- Splat dilate CS (csSplat_) — fills holes, lighting, shadow lookup ----
-    if (args.splatFilter && csSplat_) {
+    bool anySplat = false;
+    for (int Ls = 0; Ls < lw::kLodCount; ++Ls) if (!drawListSplat[Ls].empty()) { anySplat = true; break; }
+    if (anySplat && args.splatFilter && csSplat_) {
         MICROPROFILE_SCOPEGPUI("LW/SplatCS", 0xffffa030);
         ID3D11RenderTargetView* nullRtvs[] = { nullptr, nullptr };
         ctx_->OMSetRenderTargets(2, nullRtvs, nullptr);
@@ -1663,39 +1856,93 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->CSSetShader(nullptr, nullptr, 0);
     }
 
-    // ---- Composite splat onto scene RT (taaScene or backbuffer) ----
+    // ---- Scene RT clear + (optional) splat composite ----
     {
         MICROPROFILE_SCOPEGPUI("LW/Composite", 0xffff8040);
         ID3D11RenderTargetView* sceneRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
-        // Scene RT alpha = sky mask. Post pass replaces alpha<0.5 pixels with
-        // SkyColor(rayDir). Scene PS writes alpha=1 wherever it covers.
+        // Scene RT alpha = sky mask (post pass draws sky/godrays where alpha<0.5).
         float sceneClear[4] = { lastClear_[0], lastClear_[1], lastClear_[2], postEnabled ? 0.0f : lastClear_[3] };
         ctx_->ClearRenderTargetView(sceneRtv, sceneClear);
-        ctx_->ClearDepthStencilView(dsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        // dsv already cleared in BeginFrame; no other path writes it before here.
         ID3D11RenderTargetView* compositeRtv[] = { sceneRtv };
         ctx_->OMSetRenderTargets(1, compositeRtv, dsv_.Get());
-        ctx_->OMSetDepthStencilState(dsAlwaysWrite_.Get(), 0);
+        if (anySplat) {
+            ctx_->OMSetDepthStencilState(dsAlwaysWrite_.Get(), 0);
+            ctx_->RSSetState(rsNoCull_.Get());
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx_->IASetInputLayout(nullptr);
+            ID3D11Buffer* nVb[] = { nullptr }; UINT zz = 0;
+            ctx_->IASetVertexBuffers(0, 1, nVb, &zz, &zz);
+            ctx_->VSSetShader(vsBlit_.Get(), nullptr, 0);
+            ctx_->PSSetShader(psSplatComposite_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* compSrv[] = {
+                args.splatFilter ? splatFinalSrv_.Get() : splatColorSrv_.Get()
+            };
+            ctx_->PSSetShaderResources(8, 1, compSrv);
+            ID3D11ShaderResourceView* compDepthSrv[] = {
+                args.splatFilter ? splatFinalDepthSrv_.Get() : splatDepthSrv_.Get()
+            };
+            ctx_->PSSetShaderResources(7, 1, compDepthSrv);
+            ctx_->OMSetBlendState(bsAlphaOver_.Get(), nullptr, 0xFFFFFFFFu);
+            ctx_->Draw(3, 0);
+            ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+            ID3D11ShaderResourceView* nullCSrv[] = { nullptr };
+            ctx_->PSSetShaderResources(8, 1, nullCSrv);
+            ctx_->PSSetShaderResources(7, 1, nullCSrv);
+        }
+        ctx_->RSSetState(rsSolid_.Get());
+        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+    }
+
+    // ---- Compute rasterizer raster pass: tile groups, LDS atomic-min ----
+    if (anyLDS && csLwTileRaster_) {
+        MICROPROFILE_SCOPEGPUI("LW/PointCS_LDS/Raster", 0xffc06070);
+        ID3D11RenderTargetView* nullRtvsTr[] = { nullptr, nullptr };
+        ctx_->OMSetRenderTargets(2, nullRtvsTr, nullptr);
+        ctx_->CSSetShader(csLwTileRaster_.Get(), nullptr, 0);
+        ID3D11UnorderedAccessView* trUavs[] = {
+            visBufUav_.Get(), tileCounterUav_.Get(), tileListUav_.Get()
+        };
+        UINT initTr[] = { 0, 0, 0 };
+        ctx_->CSSetUnorderedAccessViews(0, 3, trUavs, initTr);
+        ID3D11Buffer* trCbs[] = { cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get() };
+        ctx_->CSSetConstantBuffers(0, 4, trCbs);
+        // Write a final CB snapshot with current tile params (cnt unused here).
+        D3D11_MAPPED_SUBRESOURCE mmTr;
+        ctx_->Map(cbLwCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mmTr);
+        struct {
+            uint32_t w, h, cnt, maxPer;
+            uint32_t tileW, tileH, numTx, numTy;
+        } cbcs;
+        cbcs.w = width_; cbcs.h = height_; cbcs.cnt = 0;
+        cbcs.maxPer = tileMaxPerTile_;
+        cbcs.tileW = tileW_; cbcs.tileH = tileH_;
+        cbcs.numTx = numTilesX_; cbcs.numTy = numTilesY_;
+        memcpy(mmTr.pData, &cbcs, sizeof(cbcs));
+        ctx_->Unmap(cbLwCS_.Get(), 0);
+        ctx_->Dispatch(numTilesX_, numTilesY_, 1);
+        ID3D11UnorderedAccessView* nullUavTr[] = { nullptr, nullptr, nullptr };
+        ctx_->CSSetUnorderedAccessViews(0, 3, nullUavTr, initTr);
+    }
+
+    // ---- Compute rasterizer resolve: visBuf → scene RT (after composite) ----
+    if (anyCS && psLwResolve_ && vsLwResolve_) {
+        MICROPROFILE_SCOPEGPUI("LW/PointCS/Resolve", 0xff8040c0);
+        ID3D11RenderTargetView* sceneRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
+        ctx_->OMSetRenderTargets(1, &sceneRtv, nullptr);
+        ctx_->OMSetDepthStencilState(dsAlways_.Get(), 0);
         ctx_->RSSetState(rsNoCull_.Get());
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx_->IASetInputLayout(nullptr);
-        ID3D11Buffer* nVb[] = { nullptr }; UINT zz = 0;
-        ctx_->IASetVertexBuffers(0, 1, nVb, &zz, &zz);
-        ctx_->VSSetShader(vsBlit_.Get(), nullptr, 0);
-        ctx_->PSSetShader(psSplatComposite_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* compSrv[] = {
-            args.splatFilter ? splatFinalSrv_.Get() : splatColorSrv_.Get()
-        };
-        ctx_->PSSetShaderResources(8, 1, compSrv);
-        ID3D11ShaderResourceView* compDepthSrv[] = {
-            args.splatFilter ? splatFinalDepthSrv_.Get() : splatDepthSrv_.Get()
-        };
-        ctx_->PSSetShaderResources(7, 1, compDepthSrv);
-        ctx_->OMSetBlendState(bsAlphaOver_.Get(), nullptr, 0xFFFFFFFFu);
+        ID3D11Buffer* nvb[] = { nullptr }; UINT zz = 0;
+        ctx_->IASetVertexBuffers(0, 1, nvb, &zz, &zz);
+        ctx_->VSSetShader(vsLwResolve_.Get(), nullptr, 0);
+        ctx_->PSSetShader(psLwResolve_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* rSrv[] = { visBufSrv_.Get() };
+        ctx_->PSSetShaderResources(3, 1, rSrv);
         ctx_->Draw(3, 0);
-        ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
-        ID3D11ShaderResourceView* nullCSrv[] = { nullptr };
-        ctx_->PSSetShaderResources(8, 1, nullCSrv);
-        ctx_->PSSetShaderResources(7, 1, nullCSrv);
+        ID3D11ShaderResourceView* nullR[] = { nullptr };
+        ctx_->PSSetShaderResources(3, 1, nullR);
         ctx_->RSSetState(rsSolid_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
     }

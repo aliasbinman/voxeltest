@@ -301,3 +301,184 @@ float4 psmain_lw_bounds(VSBoundsOut i) : SV_Target
 {
     return float4(i.col, 1.0);
 }
+
+// ============================================================
+// Compute rasterizer (Schütz-style atomic min).
+// Packed payload: (invDepth16 << 16) | rgb565. Lowest packed = closest.
+// 0xFFFFFFFFu = sky/no-point (clear value).
+// Per-chunk dispatch: 1 thread per voxel.
+// ============================================================
+cbuffer CBLwCS : register(b3)
+{
+    uint2 gVwSize;             // viewport pixels
+    uint  gLwPointCount;       // points in this dispatch
+    uint  gTileMaxPerTile;     // capacity of per-tile list
+    uint  gTileW;              // tile width (pixels)
+    uint  gTileH;              // tile height (pixels)
+    uint  gNumTilesX;
+    uint  gNumTilesY;
+};
+
+RWTexture2D<uint>         gLwVisUav      : register(u0);
+RWBuffer<uint>            gTileCounter   : register(u1);
+RWStructuredBuffer<uint2> gTileList      : register(u2);
+
+// ---- Phase 0 atomic pass: per-point → InterlockedMin direct to global visBuf.
+// Simpler than tile-binned variant; useful for perf comparison.
+[numthreads(64, 1, 1)]
+void csmain_lw_point_atomic(uint3 dt : SV_DispatchThreadID)
+{
+    uint vid = dt.x;
+    if (vid >= gLwPointCount) return;
+
+    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
+    LwPoint p = gLwPoints[ci.poolBase + vid + gLwDrawBase];
+
+    uint px = (p.pack0 >>  0) & 0xFFu;
+    uint py = (p.pack0 >>  8) & 0xFFu;
+    uint pz = (p.pack0 >> 16) & 0xFFu;
+    uint palIdx = (p.pack0 >> 24) & 0xFFu;
+
+    float3 local = float3((float)px, (float)py, (float)pz) + 0.5;
+    float3 world = ci.worldOrigin + local * ci.lodScale;
+    float4 clip = mul(float4(world, 1.0), gViewProj);
+    if (clip.w <= 0.0) return;
+    float3 ndc = clip.xyz / clip.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 ||
+        ndc.y < -1.0 || ndc.y > 1.0 ||
+        ndc.z <  0.0 || ndc.z > 1.0) return;
+
+    int2 pix;
+    pix.x = (int)((ndc.x * 0.5 + 0.5) * (float)gVwSize.x);
+    pix.y = (int)((-ndc.y * 0.5 + 0.5) * (float)gVwSize.y);
+    if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
+        pix.y < 0 || pix.y >= (int)gVwSize.y) return;
+
+    uint colPck = gLwPalette[ci.paletteBase + palIdx];
+    uint r = (colPck         & 0xFFu) >> 3;
+    uint g = ((colPck >>  8) & 0xFFu) >> 2;
+    uint b = ((colPck >> 16) & 0xFFu) >> 3;
+    uint rgb565 = (r << 11) | (g << 5) | b;
+    uint depthU16 = (uint)(saturate(ndc.z) * 65535.0);
+    uint invDepth = 0xFFFFu - depthU16;
+    uint packed   = (invDepth << 16) | rgb565;
+    InterlockedMin(gLwVisUav[pix], packed);
+}
+
+// ---- Phase 2 bin pass: per-point → atomic-add to tile counter, scatter ref.
+// ref.x = pixel-in-tile index (low 8 bits), ref.y = packed depth+color.
+[numthreads(64, 1, 1)]
+void csmain_lw_point_bin(uint3 dt : SV_DispatchThreadID)
+{
+    uint vid = dt.x;
+    if (vid >= gLwPointCount) return;
+
+    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
+    LwPoint p = gLwPoints[ci.poolBase + vid + gLwDrawBase];
+
+    uint px = (p.pack0 >>  0) & 0xFFu;
+    uint py = (p.pack0 >>  8) & 0xFFu;
+    uint pz = (p.pack0 >> 16) & 0xFFu;
+    uint palIdx = (p.pack0 >> 24) & 0xFFu;
+
+    float3 local = float3((float)px, (float)py, (float)pz) + 0.5;
+    float3 world = ci.worldOrigin + local * ci.lodScale;
+    float4 clip = mul(float4(world, 1.0), gViewProj);
+    if (clip.w <= 0.0) return;
+    float3 ndc = clip.xyz / clip.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 ||
+        ndc.y < -1.0 || ndc.y > 1.0 ||
+        ndc.z <  0.0 || ndc.z > 1.0) return;
+
+    int2 pix;
+    pix.x = (int)((ndc.x * 0.5 + 0.5) * (float)gVwSize.x);
+    pix.y = (int)((-ndc.y * 0.5 + 0.5) * (float)gVwSize.y);
+    if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
+        pix.y < 0 || pix.y >= (int)gVwSize.y) return;
+
+    uint colPck = gLwPalette[ci.paletteBase + palIdx];
+    uint r = (colPck         & 0xFFu) >> 3;
+    uint g = ((colPck >>  8) & 0xFFu) >> 2;
+    uint b = ((colPck >> 16) & 0xFFu) >> 3;
+    uint rgb565 = (r << 11) | (g << 5) | b;
+    uint depthU16 = (uint)(saturate(ndc.z) * 65535.0);
+    uint invDepth = 0xFFFFu - depthU16;
+    uint packed   = (invDepth << 16) | rgb565;
+
+    uint tileX = (uint)pix.x / gTileW;
+    uint tileY = (uint)pix.y / gTileH;
+    uint tileIdx = tileY * gNumTilesX + tileX;
+    uint lx = (uint)pix.x - tileX * gTileW;
+    uint ly = (uint)pix.y - tileY * gTileH;
+    uint pixIdx = lx + ly * gTileW;   // pixel index within tile (row-major)
+
+    uint slot;
+    InterlockedAdd(gTileCounter[tileIdx], 1u, slot);
+    if (slot >= gTileMaxPerTile) return;   // overflow drop
+
+    uint2 ref;
+    ref.x = pixIdx;
+    ref.y = packed;
+    gTileList[tileIdx * gTileMaxPerTile + slot] = ref;
+}
+
+// ---- Phase 2 raster pass: per-tile group, LDS atomic-min, flush to global.
+// Tile size compile-time constant (must match CPU dispatch + CB values).
+// 32x32 = 1024 threads (DX11 group max). LDS = 4 KB.
+#define TILE_W 32
+#define TILE_H 32
+#define TILE_PIX (TILE_W * TILE_H)
+
+groupshared uint sTileBuf[TILE_PIX];
+
+[numthreads(TILE_W, TILE_H, 1)]
+void csmain_lw_tile_raster(uint3 gid : SV_GroupID, uint gix : SV_GroupIndex)
+{
+    uint tileIdx = gid.y * gNumTilesX + gid.x;
+    sTileBuf[gix] = 0xFFFFFFFFu;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint count = min(gTileCounter[tileIdx], gTileMaxPerTile);
+    if (count > 0u) {
+        uint base = tileIdx * gTileMaxPerTile;
+        for (uint i = gix; i < count; i += TILE_PIX) {
+            uint2 ref = gTileList[base + i];
+            uint  pixIdx = ref.x;
+            uint  packed = ref.y;
+            InterlockedMin(sTileBuf[pixIdx], packed);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint2 outPix = uint2(gid.x * TILE_W + (gix % TILE_W),
+                         gid.y * TILE_H + (gix / TILE_W));
+    if (outPix.x < gVwSize.x && outPix.y < gVwSize.y) {
+        gLwVisUav[outPix] = sTileBuf[gix];
+    }
+}
+
+// Resolve PS: full-screen pass, reads visBuf via SRV, outputs to scene RT.
+// alpha = 0 for sky pixels so the post pass draws sky / godrays for them.
+Texture2D<uint> gLwVisSrv : register(t3);
+
+struct VLwResolveOut { float4 pos : SV_Position; };
+VLwResolveOut vsmain_lw_resolve(uint vid : SV_VertexID)
+{
+    float2 p = float2((vid == 1u) ? 3.0 : -1.0,
+                      (vid == 2u) ? 3.0 : -1.0);
+    VLwResolveOut o;
+    o.pos = float4(p, 0.0, 1.0);
+    return o;
+}
+
+float4 psmain_lw_resolve(VLwResolveOut i) : SV_Target
+{
+    int2 pix = int2(i.pos.xy);
+    uint pack = gLwVisSrv.Load(int3(pix, 0));
+    if (pack == 0xFFFFFFFFu) discard;          // preserve existing pixel (sky / splat)
+    uint rgb565 = pack & 0xFFFFu;
+    uint r = (rgb565 >> 11) & 0x1Fu;
+    uint g = (rgb565 >>  5) & 0x3Fu;
+    uint b =  rgb565        & 0x1Fu;
+    return float4((float)r / 31.0, (float)g / 63.0, (float)b / 31.0, 1.0);
+}

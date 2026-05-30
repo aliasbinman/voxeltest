@@ -26,6 +26,8 @@ enum class RenderTech : int {
     PolyAxis          = 11,
     PolyAxisInstanced = 12,
     HexSprite         = 3,
+    PointCS           = 13,   // Schütz-style compute rasterizer (global atomic min)
+    PointCS_LDS       = 14,   // tile-binned + LDS atomic (phase 2)
 };
 
 enum class PointLighting : int { Simple = 0, Complex = 1 };
@@ -65,6 +67,7 @@ struct DrawSceneParams {
     bool           shadowBlur       = false;
     bool           lwShowBounds     = false;
     bool           lwPolyAxis       = false;
+    bool           skipBackbufferClear = false;   // post pass writes every pixel
     float          godrayStrength   = 0.55f;
     float          godrayAngleDeg   = 10.0f;  // angular extent of texture; real sun = 0.5° (tiny), 10° = nice halo
     float          godrayEmaAlpha   = 0.15f;  // 1 = no smoothing, lower = more temporal damping
@@ -100,7 +103,7 @@ public:
     }
 
     void Resize(uint32_t w, uint32_t h);
-    void BeginFrame(float clear[4]);
+    void BeginFrame(float clear[4], bool skipClear = false);
     void EndFrame(bool vsync);
 
     ID3D11Device*        Device()  const { return device_.Get(); }
@@ -266,6 +269,27 @@ private:
     bool                       tearingSupported_ = false;
     ComPtr<ID3D11Buffer>       lwIdentityIb_;
     uint32_t                   lwIdentityIbCount_ = 0;
+
+    // ---- Compute rasterizer (PointAtomicCS) ----
+    ComPtr<ID3D11Texture2D>            visBufTex_;     // R32_UINT, fullscreen
+    ComPtr<ID3D11UnorderedAccessView>  visBufUav_;
+    ComPtr<ID3D11ShaderResourceView>   visBufSrv_;
+    ComPtr<ID3D11Buffer>               cbLwCS_;        // tile params + dispatch count
+    ComPtr<ID3D11ComputeShader>        csLwAtomic_;    // (unused — bin replaces)
+    ComPtr<ID3D11ComputeShader>        csLwBin_;       // phase 2 bin pass
+    ComPtr<ID3D11ComputeShader>        csLwTileRaster_;// phase 2 raster pass
+    ComPtr<ID3D11VertexShader>         vsLwResolve_;
+    ComPtr<ID3D11PixelShader>          psLwResolve_;
+    // Tile binning buffers (recreated on resize).
+    ComPtr<ID3D11Buffer>               tileCounterBuf_;
+    ComPtr<ID3D11UnorderedAccessView>  tileCounterUav_;
+    ComPtr<ID3D11Buffer>               tileListBuf_;
+    ComPtr<ID3D11UnorderedAccessView>  tileListUav_;
+    uint32_t                           tileW_ = 32;
+    uint32_t                           tileH_ = 32;
+    uint32_t                           tileMaxPerTile_ = 1024;
+    uint32_t                           numTilesX_ = 0;
+    uint32_t                           numTilesY_ = 0;
 
     ComPtr<ID3D11Buffer> cbPerFrame_;
 
