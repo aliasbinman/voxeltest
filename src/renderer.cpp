@@ -129,24 +129,23 @@ void Renderer::ClearLwWorld()
     lwHasWorld_ = false;
 }
 
-bool Renderer::UploadLwWorld(const lw::World& w)
+bool Renderer::UploadLwLod(const lw::World& w, int L)
 {
     if (!device_) return false;
-    ClearLwWorld();
+    if (L < 0 || L >= lw::kLodCount) return false;
+    const lw::LODWorld& src = w.lods[L];
+    LwGpu& g = lwGpu_[L];
+    g = LwGpu{};
+    const uint32_t slotCount = (uint32_t)src.chunks.size();
+    if (slotCount == 0) return true;
+    if (slotCount > lw::kMaxResidentChunksPerLod) {
+        std::fprintf(stderr, "[lw] LOD %d has %u chunks > max %u\n",
+                     L, slotCount, lw::kMaxResidentChunksPerLod);
+        return false;
+    }
 
-    for (int L = 0; L < lw::kLodCount; ++L) {
-        const lw::LODWorld& src = w.lods[L];
-        LwGpu& g = lwGpu_[L];
-        const uint32_t slotCount = (uint32_t)src.chunks.size();
-        if (slotCount == 0) continue;
-        if (slotCount > lw::kMaxResidentChunksPerLod) {
-            std::fprintf(stderr, "[lw] LOD %d has %u chunks > max %u (startVertex slot bits)\n",
-                         L, slotCount, lw::kMaxResidentChunksPerLod);
-            return false;
-        }
-
-        // ---- Point pool ----
-        const uint64_t pointBytes = (uint64_t)src.pointPool.size() * sizeof(lw::DiskPoint);
+    // ---- Point pool ----
+    const uint64_t pointBytes = (uint64_t)src.pointPool.size() * sizeof(lw::DiskPoint);
         if (pointBytes > 0xFFFFFFFFull) {
             std::fprintf(stderr, "[lw] LOD %d point pool %llu bytes > 4 GB.\n",
                          L, (unsigned long long)pointBytes);
@@ -226,21 +225,57 @@ bool Renderer::UploadLwWorld(const lw::World& w)
             device_->CreateShaderResourceView(g.paletteSb.Get(), &sv, g.paletteSrv.GetAddressOf());
         }
 
-        g.slotCount  = slotCount;
-        g.pointCount = (uint32_t)src.pointPool.size();
-        g.bytes      = pointBytes
-                     + infos.size() * sizeof(lw::GpuChunkInfo)
-                     + atlas.size() * sizeof(uint32_t);
-        std::printf("[lw] LOD %d uploaded: %u slots, %u points, %.2f MB GPU\n",
-                    L, g.slotCount, g.pointCount, g.bytes / (1024.0 * 1024.0));
-    }
-    // Stash world for cull / metadata. Drop the heavy CPU point pools — GPU
-    // owns the data now.
+    g.slotCount  = slotCount;
+    g.pointCount = (uint32_t)src.pointPool.size();
+    g.bytes      = pointBytes
+                 + infos.size() * sizeof(lw::GpuChunkInfo)
+                 + atlas.size() * sizeof(uint32_t);
+    std::printf("[lw] LOD %d uploaded: %u slots, %u points, %.2f MB GPU\n",
+                L, g.slotCount, g.pointCount, g.bytes / (1024.0 * 1024.0));
+    return true;
+}
+
+bool Renderer::UploadLwWorld(const lw::World& w)
+{
+    if (!device_) return false;
+    ClearLwWorld();
+    // Stash world metadata (chunk AABBs, childId, cull arrays). Per-LOD point
+    // data uploaded below; CPU pointPool dropped afterward to free memory.
     lwWorld_ = w;
     for (int L = 0; L < lw::kLodCount; ++L) {
+        if (!UploadLwLod(w, L)) return false;
         lwWorld_.lods[L].pointPool.clear();
         lwWorld_.lods[L].pointPool.shrink_to_fit();
     }
+    return RebuildLwIdentityIb();
+}
+
+bool Renderer::UploadLwLodOnly(const lw::World& w, int L)
+{
+    // Streaming entry: copies this LOD's metadata into lwWorld_, uploads GPU
+    // buffers, refreshes identity IB. Caller must have already called
+    // PrepLwWorld with the file's AABB (other LODs may still be loading).
+    if (L < 0 || L >= lw::kLodCount) return false;
+    lwWorld_.lods[L] = w.lods[L];           // copy this LOD only (safe to read)
+    if (!UploadLwLod(w, L)) return false;
+    lwWorld_.lods[L].pointPool.clear();
+    lwWorld_.lods[L].pointPool.shrink_to_fit();
+    return RebuildLwIdentityIb();
+}
+
+void Renderer::PrepLwWorld(const lw::World& w)
+{
+    ClearLwWorld();
+    // Copy just AABB; per-LOD data filled by subsequent UploadLwLodOnly calls.
+    for (int i = 0; i < 3; ++i) {
+        lwWorld_.worldAabbMin[i] = w.worldAabbMin[i];
+        lwWorld_.worldAabbMax[i] = w.worldAabbMax[i];
+    }
+    lwHasWorld_ = true;
+}
+
+bool Renderer::RebuildLwIdentityIb()
+{
 
     // ---- Identity IB ----
     // Size = max chunk poolCount across all LODs (each draw indexes 0..N-1).
@@ -1355,8 +1390,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
         uint32_t childChunkId = rc.childId[oct];
 
+        // Treat "child chunk not resident" (streaming/shell) as no-child so
+        // we render this coarser LOD instead of dropping the chunk entirely.
+        bool childLoaded = (L > 0)
+                        && (childChunkId != lw::kNoChild)
+                        && (childChunkId < lwWorld_.lods[L - 1].chunks.size())
+                        && (lwWorld_.lods[L - 1].chunks[childChunkId].poolCount > 0);
+
         // Terminal: this LOD fine enough, or no child to descend into.
-        if (des >= L || childChunkId == lw::kNoChild || L == 0) {
+        if (des >= L || !childLoaded || L == 0) {
             std::vector<DrawItem>* dl = pickListForChunk(L,
                 0.5f * (mnx + mxx), 0.5f * (mny + mxy), 0.5f * (mnz + mxz));
             if (dl) dl->push_back({ chunkSlot, cl.pointFirst, cl.numPoints });
@@ -1412,13 +1454,22 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                 if (dl) dl->push_back({ slot, 0u, rc.poolCount });
                 return;
             }
-            // Need finer LOD. Per-octant: recurse where child exists, draw
-            // parent's clusters in that octant where child is missing.
+            // Need finer LOD. Per-octant: recurse where child exists AND is
+            // actually resident (poolCount > 0); otherwise draw parent's
+            // clusters. Streaming/shell-cull leaves un-loaded chunks with
+            // poolCount=0 in the full-sized chunks vector.
             bool fallbackOct[8];
             bool anyFallback = false;
+            const auto& childChunks = (L > 0) ? lwWorld_.lods[L - 1].chunks
+                                              : std::vector<lw::RuntimeChunk>{};
             for (int c = 0; c < 8; ++c) {
-                if (rc.childId[c] != lw::kNoChild) {
-                    visit(L - 1, rc.childId[c]);
+                uint32_t cid = rc.childId[c];
+                bool childLoaded = (L > 0)
+                                && (cid != lw::kNoChild)
+                                && (cid < childChunks.size())
+                                && (childChunks[cid].poolCount > 0);
+                if (childLoaded) {
+                    visit(L - 1, cid);
                     fallbackOct[c] = false;
                 } else {
                     fallbackOct[c] = true;

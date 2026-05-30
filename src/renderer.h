@@ -75,6 +75,13 @@ public:
     static std::vector<std::string> EnumerateAdapters();
 
     bool UploadLwWorld(const lw::World& w);
+    // Streaming entry points:
+    //   PrepLwWorld    — stash world metadata (chunk AABBs / childId / cull arrays).
+    //   UploadLwLodOnly — upload one LOD's GPU buffers (points/chunkInfo/palette),
+    //                     drop its CPU pointPool, refresh identity IB.
+    // Use these when loading LODs incrementally; render starts once any LOD is up.
+    void PrepLwWorld(const lw::World& w);
+    bool UploadLwLodOnly(const lw::World& w, int L);
     void ClearLwWorld();
     bool HasLwWorld() const { return lwHasWorld_; }
     void DrawLwScene(const Camera& cam, const DrawSceneParams& args);
@@ -116,6 +123,8 @@ private:
     bool CreateShaders();
     bool CreatePipelineState();
     void TryHotReloadShaders();
+    bool UploadLwLod(const lw::World& w, int L);
+    bool RebuildLwIdentityIb();
     void FillCbPerFrame(const Camera& cam,
                         const DrawSceneParams& args,
                         const hlslpp::float4x4& vp,

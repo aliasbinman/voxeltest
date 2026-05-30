@@ -8,10 +8,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "lodworld.h"
 #include "lz4.h"
+#include "microprofile.h"
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <chrono>
 
 namespace lw {
 
@@ -26,6 +29,12 @@ static bool ReadAt(FILE* f, uint64_t off, void* dst, size_t n)
 }
 
 bool LoadWorld(const char* path, World& out, std::string& err)
+{
+    return LoadWorldStreaming(path, out, err, nullptr, nullptr, nullptr);
+}
+
+bool LoadWorldStreaming(const char* path, World& out, std::string& err,
+                        LodReadyFn onLodReady, void* user, const StreamCfg* cfg)
 {
     FILE* f = fopen(path, "rb");
     if (!f) { err = "open failed"; return false; }
@@ -53,8 +62,21 @@ bool LoadWorld(const char* path, World& out, std::string& err)
         fclose(f); err = "lod header read"; return false;
     }
 
-    // ---- Per-LOD: read ChunkEntry table, then load each chunk blob ----
-    for (int L = 0; L < kLodCount; ++L) {
+    // ---- Per-LOD load order ----
+    // 1) Coarsest (kLodCount-1) first  -> instant whole-world coarse view.
+    // 2) Finest (LOD0) next             -> high detail near camera (tightest shell, fewest chunks).
+    // 3) Mid LODs in ascending order    -> progressive refinement of the middle distance band.
+    // Total chunks ordered so the user sees coarse + sharpest detail quickly.
+    using clk = std::chrono::steady_clock;
+    int lodOrder[kLodCount];
+    lodOrder[0] = kLodCount - 1;
+    for (int i = 1; i < kLodCount; ++i) lodOrder[i] = i - 1;
+    for (int oi = 0; oi < kLodCount; ++oi) {
+        int L = lodOrder[oi];
+        MICROPROFILE_SCOPEI("Loader", "LOD", 0xff80a0ff);
+        auto tLodStart = clk::now();
+        double tReadMs = 0, tLz4Ms = 0, tDecodeMs = 0;
+        uint64_t bytesRead = 0, bytesLz4Raw = 0;
         LODWorld& lw = out.lods[L];
         lw.lodLevel = (uint8_t)L;
         lw.lodScale = 1u << L;
@@ -72,15 +94,76 @@ bool LoadWorld(const char* path, World& out, std::string& err)
         std::vector<uint8_t> diskBlob;
         std::vector<uint8_t> rawBlob;
 
+        // Per-LOD shell + frustum priority. Pre-classify chunks into:
+        //   priority 0 = in view frustum (load first)
+        //   priority 1 = in radius shell but out of frustum (load after)
+        //   skipped    = neither
+        // Within each priority bucket, sort by distance (nearest first).
+        const float shellRadius = (cfg && cfg->radius[L] > 0.0f) ? cfg->radius[L] : 0.0f;
+        const float chunkW = (float)kChunkVoxX * (float)lw.lodScale;
+        const float chunkH = (float)kChunkVoxY * (float)lw.lodScale;
+        const float chunkD = (float)kChunkVoxZ * (float)lw.lodScale;
+        struct ChunkRank { uint32_t idx; float dist2; int prio; };
+        std::vector<ChunkRank> ranks;
+        ranks.reserve(cc);
+        auto aabbInFrustum = [&](float mnx, float mny, float mnz,
+                                  float mxx, float mxy, float mxz) -> bool {
+            for (int pi = 0; pi < 5; ++pi) {   // sides + near, skip far
+                float a = cfg->frustumPlanes[pi][0], b = cfg->frustumPlanes[pi][1];
+                float c = cfg->frustumPlanes[pi][2], d = cfg->frustumPlanes[pi][3];
+                float px = a >= 0 ? mxx : mnx;
+                float py = b >= 0 ? mxy : mny;
+                float pz = c >= 0 ? mxz : mnz;
+                if (a*px + b*py + c*pz + d < 0.0f) return false;
+            }
+            return true;
+        };
         for (uint32_t i = 0; i < cc; ++i) {
             const ChunkEntry& ce = entries[i];
-            diskBlob.resize(ce.blobBytes);
-            if (!ReadAt(f, ce.blobOffset, diskBlob.data(), ce.blobBytes)) {
-                fclose(f); err = "chunk blob read"; return false;
+            float mnx = (float)ce.gridX * chunkW;
+            float mny = (float)ce.gridY * chunkH;
+            float mnz = (float)ce.gridZ * chunkD;
+            float mxx = mnx + chunkW, mxy = mny + chunkH, mxz = mnz + chunkD;
+            float cx = mnx + chunkW * 0.5f;
+            float cy = mny + chunkH * 0.5f;
+            float cz = mnz + chunkD * 0.5f;
+            float dx = cx - (cfg ? cfg->camX : 0.0f);
+            float dy = cy - (cfg ? cfg->camY : 0.0f);
+            float dz = cz - (cfg ? cfg->camZ : 0.0f);
+            float d2 = dx*dx + dy*dy + dz*dz;
+            // Shell decides INCLUSION; frustum decides PRIORITY within shell.
+            // Without this gate, in-frustum chunks loaded the entire view
+            // direction regardless of distance (LOD0 ended up loading every
+            // chunk the camera could see = several GB).
+            bool inShell = (shellRadius <= 0.0f) || (d2 <= shellRadius * shellRadius);
+            if (!inShell) continue;
+            bool inFrust = cfg && cfg->hasFrustum && aabbInFrustum(mnx,mny,mnz,mxx,mxy,mxz);
+            ranks.push_back({ i, d2, inFrust ? 0 : 1 });
+        }
+        std::sort(ranks.begin(), ranks.end(), [](const ChunkRank& a, const ChunkRank& b) {
+            if (a.prio != b.prio) return a.prio < b.prio;
+            return a.dist2 < b.dist2;
+        });
+
+        for (size_t r = 0; r < ranks.size(); ++r) {
+            MICROPROFILE_SCOPEI("Loader", "Chunk", 0xffffd060);
+            uint32_t i = ranks[r].idx;
+            const ChunkEntry& ce = entries[i];
+            {
+                MICROPROFILE_SCOPEI("Loader", "ReadBlob", 0xffd08040);
+                auto t0 = clk::now();
+                diskBlob.resize(ce.blobBytes);
+                if (!ReadAt(f, ce.blobOffset, diskBlob.data(), ce.blobBytes)) {
+                    fclose(f); err = "chunk blob read"; return false;
+                }
+                tReadMs += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+                bytesRead += ce.blobBytes;
             }
             const uint8_t* blobPtr = diskBlob.data();
             size_t blobSize = diskBlob.size();
             if (ce.flags & kFlagLz4) {
+                MICROPROFILE_SCOPEI("Loader", "LZ4", 0xff60d060);
+                auto t0 = clk::now();
                 rawBlob.resize(ce.blobBytesRaw);
                 int dec = LZ4_decompress_safe((const char*)diskBlob.data(),
                                               (char*)rawBlob.data(),
@@ -91,6 +174,8 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                 }
                 blobPtr = rawBlob.data();
                 blobSize = rawBlob.size();
+                tLz4Ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+                bytesLz4Raw += ce.blobBytesRaw;
             }
             // Parse common header.
             const uint8_t* p = blobPtr;
@@ -243,6 +328,8 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                     return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
                 };
 
+                MICROPROFILE_SCOPEI("Loader", "Pass3", 0xffe080e0);
+                auto tD0 = clk::now();
                 // Pass 3: emit DiskPoints. visMask recomputed from chunk
                 // bit-grid; per-face AO unpacked from variable-length nibble
                 // stream (one nibble per set visMask bit, packed back-to-back).
@@ -305,6 +392,7 @@ bool LoadWorld(const char* path, World& out, std::string& err)
                         clMn[0], clMn[1], clMn[2], clMx[0], clMx[1], clMx[2]);
                     writePos += emitted;
                 }
+                tDecodeMs += std::chrono::duration<double, std::milli>(clk::now() - tD0).count();
             } else {
                 // Legacy raw format (no compression).
                 const size_t clusterBytes = sizeof(DiskCluster) * kClustersPerChunk;
@@ -338,6 +426,18 @@ bool LoadWorld(const char* path, World& out, std::string& err)
             lw.cull.maxY[i] = (float)rc.worldOriginY + ((float)rc.aabbMax[1] + 1.0f) * s;
             lw.cull.maxZ[i] = (float)rc.worldOriginZ + ((float)rc.aabbMax[2] + 1.0f) * s;
         }
+
+        // Per-LOD timing summary.
+        double tTotalMs = std::chrono::duration<double, std::milli>(clk::now() - tLodStart).count();
+        double tOtherMs = tTotalMs - tReadMs - tLz4Ms - tDecodeMs;
+        std::printf("[Loader] LOD %d  total=%.1fms  read=%.1f (%.1f MB)  lz4=%.1f (%.1f MB raw)  decode=%.1f  other=%.1f  ranked=%zu/%u\n",
+                    L, tTotalMs, tReadMs, bytesRead / (1024.0*1024.0),
+                    tLz4Ms, bytesLz4Raw / (1024.0*1024.0),
+                    tDecodeMs, tOtherMs, ranks.size(), cc);
+        std::fflush(stdout);
+
+        // Notify caller this LOD is ready for upload.
+        if (onLodReady) onLodReady(user, L);
     }
 
     fclose(f);

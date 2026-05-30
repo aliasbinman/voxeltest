@@ -19,6 +19,8 @@
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -153,6 +155,22 @@ struct AppState {
     bool        everLoaded = false;
     std::atomic<bool> reloadRequested{ false };
     std::atomic<bool> loadDone{ false };
+    // Per-LOD streaming flags: -1=not loaded, 0=loaded but not uploaded, 1=uploaded.
+    std::atomic<int>  lodReadyFlag[lw::kLodCount] = { {-1},{-1},{-1},{-1},{-1} };
+    // Phase 2a continuous streaming.
+    std::atomic<float>      camPosAtomic[3]  = { {0.0f},{0.0f},{0.0f} };
+    std::atomic<float>      frustumAtomic[24] = {};   // 6 planes × 4 floats
+    std::atomic<bool>       frustumValid{ false };
+    std::atomic<bool>       loaderQuit{ false };
+    std::atomic<bool>       loaderTrigger{ false };
+    std::mutex              loaderMu;
+    std::condition_variable loaderCv;
+    std::thread             loaderThread;
+    float                   lastTriggerCam[3] = { 0, 0, 0 };
+    // Per-LOD mutex guards pendingLwWorld.lods[L] across the loader/main
+    // boundary — worker holds while moving fresh LOD in, main holds while
+    // reading during UploadLwLodOnly.
+    std::mutex              lodMu[lw::kLodCount];
     std::atomic<bool> loadOk{ false };
     std::string loadErr;
     float    bgColor[4] = { 0.10f, 0.12f, 0.16f, 1.0f };
@@ -527,6 +545,15 @@ void FrameControlsWindow()
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 {
+    // Attach a console window so printf / fprintf(stderr) become visible.
+    // Reuse parent console if launched from one (e.g. bash); otherwise allocate.
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
+    FILE* fOut = nullptr; FILE* fErr = nullptr;
+    freopen_s(&fOut, "CONOUT$", "w", stdout);
+    freopen_s(&fErr, "CONOUT$", "w", stderr);
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
     SetCwdToProjectRoot();
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -583,26 +610,113 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         }
     }
 
-    auto kickLoader = []() {
-        std::thread([] {
-            std::string err;
-            if (g_app.datasetPaths.empty()) {
-                g_app.loadErr = "no .vox files found in assets/";
-                g_app.loadOk.store(false);
-                g_app.loadDone.store(true);
-                return;
+    // Continuous loader thread (Phase 2a): runs forever, re-streams when
+    // main signals a meaningful camera move. Per-LOD shell radii decide
+    // which chunks load each cycle. No eviction yet — Phase 2b adds slot
+    // pool + per-chunk deltas.
+    auto pickDataset = []() -> std::string {
+        if (g_app.datasetPaths.empty()) return "";
+        int idx = g_app.datasetIdx;
+        if (idx < 0 || idx >= (int)g_app.datasetPaths.size()) idx = 0;
+        return g_app.datasetPaths[idx];
+    };
+
+    auto loaderBody = []() {
+        MicroProfileOnThreadCreate("LwLoader");
+        const std::string voxPath = g_app.currentVoxPath;
+        bool firstCycle = true;
+        while (!g_app.loaderQuit.load()) {
+            MICROPROFILE_SCOPEI("Loader", "Cycle", 0xff40c0ff);
+            auto tCycleStart = std::chrono::steady_clock::now();
+            lw::StreamCfg cfg{};
+            cfg.camX = g_app.camPosAtomic[0].load();
+            cfg.camY = g_app.camPosAtomic[1].load();
+            cfg.camZ = g_app.camPosAtomic[2].load();
+            // Per-LOD shell radii (world units). Tighter than before so each
+            // cycle finishes faster + finer LODs aren't dragged down by huge
+            // LOD3 shells. LOD4 always full (small world-wide coarse view).
+            cfg.radius[4] = 0.0f;                                       // full
+            cfg.radius[3] = 2.0f * (float)lw::kChunkVoxX * 8.0f;        // 4096
+            cfg.radius[2] = 2.0f * (float)lw::kChunkVoxX * 4.0f;        // 2048
+            cfg.radius[1] = 2.0f * (float)lw::kChunkVoxX * 2.0f;        // 1024
+            cfg.radius[0] = 2.0f * (float)lw::kChunkVoxX * 1.0f;        // 512
+            cfg.hasFrustum = g_app.frustumValid.load();
+            if (cfg.hasFrustum) {
+                for (int i = 0; i < 24; ++i) {
+                    ((float*)cfg.frustumPlanes)[i] = g_app.frustumAtomic[i].load();
+                }
             }
-            int idx = g_app.datasetIdx;
-            if (idx < 0 || idx >= (int)g_app.datasetPaths.size()) idx = 0;
-            const std::string& voxPath = g_app.datasetPaths[idx];
-            g_app.currentVoxPath = voxPath;
-            g_app.loadStatus = std::string("Loading ") + voxPath + "...";
-            bool ok = lw::LoadWorld(voxPath.c_str(), g_app.pendingLwWorld, err);
-            if (!ok && err.empty()) err = "lw load failed";
+            // First cycle: AABB might not be primed if main hasn't placed
+            // the camera yet. Use file header AABB center as fallback.
+            if (firstCycle) {
+                FILE* fHdr = fopen(voxPath.c_str(), "rb");
+                if (fHdr) {
+                    lw::FileHeader fh{};
+                    if (fread(&fh, sizeof(fh), 1, fHdr) == 1 && fh.magic == lw::kFileMagic) {
+                        cfg.camX = 0.5f * (float)(fh.worldAabbMin[0] + fh.worldAabbMax[0]);
+                        cfg.camY = (float)fh.worldAabbMax[1];
+                        cfg.camZ = 0.5f * (float)(fh.worldAabbMin[2] + fh.worldAabbMax[2]);
+                    }
+                    fclose(fHdr);
+                }
+                firstCycle = false;
+            }
+            // Reset per-LOD ready flags so main waits for the new load.
+            for (int L = 0; L < lw::kLodCount; ++L) g_app.lodReadyFlag[L].store(-1);
+            std::string err;
+            // Decode into a thread-local World, then per-LOD move into the
+            // shared pendingLwWorld under that LOD's mutex. Keeps the lock
+            // held only for the move + signal, not the full decode.
+            static thread_local lw::World tlsWorld;
+            tlsWorld = lw::World{};
+            auto onLod = [](void* user, int L) {
+                lw::World* tls = (lw::World*)user;
+                {
+                    std::lock_guard<std::mutex> lk(g_app.lodMu[L]);
+                    g_app.pendingLwWorld.worldAabbMin[0] = tls->worldAabbMin[0];
+                    g_app.pendingLwWorld.worldAabbMin[1] = tls->worldAabbMin[1];
+                    g_app.pendingLwWorld.worldAabbMin[2] = tls->worldAabbMin[2];
+                    g_app.pendingLwWorld.worldAabbMax[0] = tls->worldAabbMax[0];
+                    g_app.pendingLwWorld.worldAabbMax[1] = tls->worldAabbMax[1];
+                    g_app.pendingLwWorld.worldAabbMax[2] = tls->worldAabbMax[2];
+                    g_app.pendingLwWorld.lods[L] = std::move(tls->lods[L]);
+                }
+                g_app.lodReadyFlag[L].store(0);
+            };
+            bool ok = lw::LoadWorldStreaming(voxPath.c_str(), tlsWorld, err,
+                                             onLod, &tlsWorld, &cfg);
             g_app.loadErr = err;
             g_app.loadOk.store(ok);
             g_app.loadDone.store(true);
-        }).detach();
+            double tCycleMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tCycleStart).count();
+            std::printf("[Loader] cycle done in %.1fms\n", tCycleMs);
+            std::fflush(stdout);
+            // Wait for main to trigger re-stream (cam moved) or quit.
+            std::unique_lock<std::mutex> lk(g_app.loaderMu);
+            g_app.loaderCv.wait(lk, []{
+                return g_app.loaderTrigger.load() || g_app.loaderQuit.load();
+            });
+            g_app.loaderTrigger.store(false);
+        }
+    };
+
+    auto kickLoader = [&loaderBody, &pickDataset]() {
+        if (g_app.loaderThread.joinable()) {
+            g_app.loaderQuit.store(true);
+            g_app.loaderCv.notify_all();
+            g_app.loaderThread.join();
+            g_app.loaderQuit.store(false);
+        }
+        g_app.currentVoxPath = pickDataset();
+        if (g_app.currentVoxPath.empty()) {
+            g_app.loadErr = "no .vox files found in assets/";
+            g_app.loadOk.store(false);
+            g_app.loadDone.store(true);
+            return;
+        }
+        g_app.loadStatus = std::string("Loading ") + g_app.currentVoxPath + "...";
+        g_app.loaderThread = std::thread(loaderBody);
     };
     kickLoader();
 
@@ -626,45 +740,96 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         if (g_app.reloadRequested.load() && g_app.sceneReady) {
             g_app.reloadRequested.store(false);
             g_app.sceneReady = false;
+            g_app.everLoaded = false;
             g_app.loadDone.store(false);
             g_app.loadOk.store(false);
+            for (int L = 0; L < lw::kLodCount; ++L) g_app.lodReadyFlag[L].store(-1);
             kickLoader();
         }
 
-        // upload world once loader done
-        if (g_app.loadDone.load() && !g_app.sceneReady) {
-            if (g_app.loadOk.load()) {
-                g_app.renderer.UploadLwWorld(g_app.pendingLwWorld);
-                {
-                    const auto& w = g_app.pendingLwWorld;
-                    float cx = 0.5f * (float)(w.worldAabbMin[0] + w.worldAabbMax[0]);
-                    float cz = 0.5f * (float)(w.worldAabbMin[2] + w.worldAabbMax[2]);
-                    float dx = (float)(w.worldAabbMax[0] - w.worldAabbMin[0]);
-                    float dz = (float)(w.worldAabbMax[2] - w.worldAabbMin[2]);
-                    float ext = (dx > dz ? dx : dz);
-                    // Tallest LOD0 chunk top.
-                    int32_t maxTop = w.worldAabbMin[1];
-                    for (const auto& rc : w.lods[0].chunks) {
-                        int32_t t = rc.worldOriginY + lw::kChunkVoxY;
-                        if (t > maxTop) maxTop = t;
-                    }
-                    g_app.camera.position = hlslpp::float3(cx, (float)maxTop, cz - ext * 0.5f);
-                    g_app.camera.yaw   = 0.0f;
-                    g_app.camera.pitch = -0.5f;
-                    g_app.camera.moveSpeed = ext * 0.05f;
-                    g_app.camera.farZ = ext * 4.0f + 1000.0f;
-                }
-                g_app.pendingLwWorld = lw::World{};
+        // Per-LOD streaming: upload at most ONE ready LOD per frame so the
+        // user sees coarse->fine progression instead of a single batch flash
+        // when the worker thread finishes all LODs faster than the render
+        // catches up.
+        for (int L = lw::kLodCount - 1; L >= 0; --L) {
+            int v = g_app.lodReadyFlag[L].load();
+            if (v != 0) continue;
+            if (!g_app.everLoaded || !g_app.sceneReady) {
+                // First LOD to arrive: stash world metadata + place camera.
+                g_app.renderer.PrepLwWorld(g_app.pendingLwWorld);
+                const auto& w = g_app.pendingLwWorld;
+                float cx = 0.5f * (float)(w.worldAabbMin[0] + w.worldAabbMax[0]);
+                float cz = 0.5f * (float)(w.worldAabbMin[2] + w.worldAabbMax[2]);
+                float dx = (float)(w.worldAabbMax[0] - w.worldAabbMin[0]);
+                float dz = (float)(w.worldAabbMax[2] - w.worldAabbMin[2]);
+                float ext = (dx > dz ? dx : dz);
+                float topY = (float)w.worldAabbMax[1] + ext * 0.3f;
+                g_app.camera.position = hlslpp::float3(cx, topY, cz - ext * 0.5f);
+                g_app.camera.yaw   = 0.0f;
+                g_app.camera.pitch = -0.5f;
+                g_app.camera.moveSpeed = ext * 0.05f;
+                g_app.camera.farZ = ext * 4.0f + 1000.0f;
                 g_app.everLoaded = true;
                 g_app.sceneReady = true;
-                g_app.loadStatus = "Loaded.";
-            } else {
-                g_app.loadStatus = "Load failed: " + g_app.loadErr;
-                g_app.sceneReady = true;
+                g_app.loadStatus = "Streaming...";
             }
+            {
+                std::lock_guard<std::mutex> lk(g_app.lodMu[L]);
+                g_app.renderer.UploadLwLodOnly(g_app.pendingLwWorld, L);
+            }
+            g_app.lodReadyFlag[L].store(1);
+            break;   // one LOD per frame
+        }
+
+        // Loader thread completion: free CPU world struct + finalize status.
+        if (g_app.loadDone.load() && g_app.loadStatus == "Streaming...") {
+            g_app.pendingLwWorld = lw::World{};
+            g_app.loadStatus = "Loaded.";
+        } else if (g_app.loadDone.load() && !g_app.everLoaded && !g_app.loadOk.load()) {
+            g_app.loadStatus = "Load failed: " + g_app.loadErr;
+            g_app.sceneReady = true;
         }
 
         UpdateCamera(dt);
+
+        // Publish cam pos + frustum planes for streaming loader; trigger
+        // re-stream when moved > 1 chunk width.
+        {
+            float cp[3];
+            hlslpp::store(cp, g_app.camera.position);
+            g_app.camPosAtomic[0].store(cp[0]);
+            g_app.camPosAtomic[1].store(cp[1]);
+            g_app.camPosAtomic[2].store(cp[2]);
+            // Frustum planes from view*proj (same extraction as renderer's).
+            float aspect = (float)g_app.renderer.Width() / (float)std::max(1u, g_app.renderer.Height());
+            hlslpp::float4x4 vM = g_app.camera.view();
+            hlslpp::float4x4 pM = g_app.camera.proj(aspect);
+            hlslpp::float4x4 vp = hlslpp::mul(vM, pM);
+            float M[16]; hlslpp::store(M, vp);
+            // Same Gribb-Hartmann (row-major / vector*matrix) extraction as
+            // renderer.cpp ExtractFrustumPlanes — 6 planes packed as ax+by+cz+d.
+            float pl[6][4] = {
+                { M[0]+M[3],  M[4]+M[7],  M[8]+M[11], M[12]+M[15] },   // left
+                { M[3]-M[0],  M[7]-M[4],  M[11]-M[8], M[15]-M[12] },   // right
+                { M[1]+M[3],  M[5]+M[7],  M[9]+M[11], M[13]+M[15] },   // bottom
+                { M[3]-M[1],  M[7]-M[5],  M[11]-M[9], M[15]-M[13] },   // top
+                { M[2],       M[6],       M[10],      M[14]       },   // near
+                { M[3]-M[2],  M[7]-M[6],  M[11]-M[10],M[15]-M[14] },   // far
+            };
+            for (int i = 0; i < 24; ++i) g_app.frustumAtomic[i].store(((float*)pl)[i]);
+            g_app.frustumValid.store(true);
+            float dx = cp[0] - g_app.lastTriggerCam[0];
+            float dy = cp[1] - g_app.lastTriggerCam[1];
+            float dz = cp[2] - g_app.lastTriggerCam[2];
+            const float kReStreamDist = (float)lw::kChunkVoxX;   // 1 LOD0 chunk
+            if (dx*dx + dy*dy + dz*dz > kReStreamDist * kReStreamDist) {
+                g_app.lastTriggerCam[0] = cp[0];
+                g_app.lastTriggerCam[1] = cp[1];
+                g_app.lastTriggerCam[2] = cp[2];
+                g_app.loaderTrigger.store(true);
+                g_app.loaderCv.notify_one();
+            }
+        }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -688,7 +853,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             clear[3] = g_app.bgColor[3];
         }
         g_app.renderer.BeginFrame(clear);
-        if (g_app.sceneReady && g_app.loadOk.load()) {
+        // Draw as soon as ANY LOD is uploaded — streaming flips sceneReady on
+        // first LOD ready. loadOk only flips after the worker has finished
+        // every LOD; gating on it hides the coarse scene until full load.
+        if (g_app.sceneReady) {
             // LodViz forces fog off so the per-LOD colors aren't dimmed/tinted.
             const bool fogOff = (g_app.fogMode == 0) || (g_app.mode == ShadingMode::LodViz);
             float effFogDensity   = fogOff ? 0.0f : g_app.fogDensity;
@@ -762,6 +930,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    // Stop loader thread.
+    if (g_app.loaderThread.joinable()) {
+        g_app.loaderQuit.store(true);
+        g_app.loaderCv.notify_all();
+        g_app.loaderThread.join();
+    }
     g_app.renderer.Shutdown();
     DestroyWindow(hwnd);
     return 0;

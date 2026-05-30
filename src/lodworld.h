@@ -420,6 +420,23 @@ inline constexpr uint32_t kMaxResidentChunksPerLod = 65536;
 // per-chunk seeks.
 // =====================================================================
 bool LoadWorld(const char* path, World& out, std::string& err);
+// Streaming load: LODs in reverse order (coarsest first), per-LOD callback.
+// Optional StreamCfg restricts which chunks load per LOD by distance to the
+// given world-space camera point. LOD with radius <= 0 = load everything.
+struct StreamCfg {
+    float camX, camY, camZ;          // world-space camera position (LOD0 voxel units)
+    float radius[kLodCount];         // per-LOD max chunk-center distance, 0 = unlimited
+    // Frustum planes (a,b,c,d) for in-frustum priority. Chunks inside the
+    // frustum load before chunks only inside the radius shell. Both still load
+    // within the same LOD — main can render whichever arrives first. Set
+    // hasFrustum=false to disable; loader then only uses radius shell.
+    bool  hasFrustum;
+    float frustumPlanes[6][4];
+};
+using LodReadyFn = void(*)(void* user, int L);
+bool LoadWorldStreaming(const char* path, World& out, std::string& err,
+                        LodReadyFn onLodReady, void* user,
+                        const StreamCfg* cfg = nullptr);
 bool SaveWorld(const char* path, const World& w, std::string& err);
 
 } // namespace lw
