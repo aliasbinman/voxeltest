@@ -103,7 +103,22 @@ struct DiskBlock {
 #pragma pack(pop)
 static_assert(sizeof(DiskBlock) == 16, "");
 
-// kFlag for chunk blob: per-chunk DiskBlock stream is present at end.
+// kFlag for chunk blob: compact per-chunk OCTET stream at end of blob.
+// Format (V2):
+//   stream of clusters until clusterID byte has bit 7 set:
+//     uint8 clusterID                ;  bits 0..6 = cluster idx, bit 7 = last in chunk
+//     stream of octets until octet with run-bits == 15:
+//       uint16 octetID               ;  bits 0..11 = octet idx (Y-major in cluster)
+//                                       bits 12..15 = run-bits:
+//                                         0      = no implicit follow; next byte is fresh octetID
+//                                         1..14  = N implicit octets follow (no octetID; idx = prev+1)
+//                                         15     = this is final octet of cluster
+//       uint8  voxelMask             ;  bit i = voxel i present (i = lx | (ly<<1) | (lz<<2))
+//       uint8  voxelID[popcount(voxelMask)]
+//       (for each implicit follow: voxelMask + voxelID[] only, no octetID)
+// Cluster idx encoding: idx = (cz * kClustersY + cy) * kClustersX + cx
+// Octet idx in cluster (Y-major): idx = (oy * 16 + oz) * 16 + ox
+//   ox/oy/oz in [0..16) covering 2-voxel octets across 32-voxel cluster.
 inline constexpr uint32_t kFlagBlocks = 1u << 5;
 
 // =====================================================================

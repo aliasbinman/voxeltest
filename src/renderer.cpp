@@ -1728,7 +1728,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             && drawListAtomic[L].empty() && drawListLDS[L].empty()
             && drawListBlock[L].empty()) continue;
         const LwGpu& g = lwGpu_[L];
-        if (g.slotCount == 0 || !g.pointSrv) continue;
+        if (g.slotCount == 0) continue;
+        // pointSrv may be null in block-only mode; only required by splat/poly paths.
+        if (!g.pointSrv && !g.blockSrv) continue;
         const lw::LODWorld& lwL = lwWorld_.lods[L];
         MICROPROFILE_SCOPEGPUI("LW/Points/LOD", kLodColors[L < 5 ? L : 4]);
         ID3D11ShaderResourceView* vsSrvs[] = {

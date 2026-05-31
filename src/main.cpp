@@ -105,11 +105,11 @@ struct AppState {
     Renderer renderer;
     Camera   camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech  tech    = RenderTech::PointCS;   // close tech
-    RenderTech  techFar = RenderTech::PointCS;   // far tech
+    RenderTech  tech    = RenderTech::PointCS_Block;   // close tech
+    RenderTech  techFar = RenderTech::PointCS_Block;   // far tech
     bool        closeEnabled = true;
     bool        farEnabled   = true;
-    float    sunPitchDeg = 60.0f;
+    float    sunPitchDeg = 10.0f;
     float    sunYawDeg   = 63.0f;
     float    sunIntensityEV = 0.0f;     // log2 stops; linear = 2^EV
     bool     sunShadows  = true;

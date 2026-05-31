@@ -19,6 +19,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <map>
 #include <atomic>
 #include <unordered_set>
 #include <algorithm>
@@ -1290,82 +1291,102 @@ int main(int argc, char** argv)
             };
             push(&bc.hdr, sizeof(bc.hdr));
             if (!bc.palette.empty()) push(bc.palette.data(), bc.palette.size() * sizeof(uint32_t));
-            push(clusterMask, sizeof(clusterMask));
-            for (int s = 0; s < lw::kClustersPerChunk; ++s) {
-                const lw::DiskCluster& cl = bc.clusters[s];
-                if (cl.numPoints == 0) continue;
-                const ClusterEnc& ce = ces[s];
-                blob.push_back(ce.orderMode);
-                lw::Leb128PutU32(blob, (uint32_t)cl.numPoints);
-                lw::Leb128PutU32(blob, (uint32_t)ce.bitGrid.size());
-                if (!ce.bitGrid.empty()) push(ce.bitGrid.data(), ce.bitGrid.size());
-                if (!ce.colors.empty()) push(ce.colors.data(), ce.colors.size());
-                if (g_storeAo) {
-                    // Variable-length AO stream (packed nibbles per visMask). Prefix size.
-                    lw::Leb128PutU32(blob, (uint32_t)ce.ao.size());
-                    if (!ce.ao.empty()) push(ce.ao.data(), ce.ao.size());
-                }
-                if (g_storeVisMask && !ce.visMask.empty()) push(ce.visMask.data(), ce.visMask.size());
-                if (g_storeCellAo) {
-                    lw::Leb128PutU32(blob, ce.cellAoCount);
-                    if (!ce.cellAo.empty()) push(ce.cellAo.data(), ce.cellAo.size());
-                }
-            }
+            // Cluster bit-grid + colors + AO/visMask/cellAO streams dropped
+            // — PointCS_Block (V2 octets below) is the only consumer now.
 
-            // ---- 2x2x2 BLOCK stream for PointCS_Block ----
+            // ---- V2 compact octet stream for PointCS_Block ----
+            //   per cluster: clusterID + octet stream (see lodworld.h for layout).
             if (g_storeBlocks) {
-                std::unordered_map<uint32_t, lw::DiskBlock> blockMap;
-                blockMap.reserve(bc.points.size() / 8 + 64);
+                // Group points by (clusterIdx, octetIdx) → voxelMask + palIdx[8].
+                struct OctetEnc {
+                    uint8_t mask = 0;
+                    uint8_t pal[8] = {};
+                };
+                // Per-cluster: map octetIdx -> OctetEnc.
+                std::vector<std::map<uint32_t, OctetEnc>> perCluster(lw::kClustersPerChunk);
                 for (const auto& p : bc.points) {
-                    uint32_t bx = (uint32_t)p.posX >> 1;
-                    uint32_t by = (uint32_t)p.posY >> 1;
-                    uint32_t bz = (uint32_t)p.posZ >> 1;
-                    uint32_t key = bx | (by << 8) | (bz << 16);
-                    uint32_t lx = (uint32_t)p.posX & 1u;
-                    uint32_t ly = (uint32_t)p.posY & 1u;
-                    uint32_t lz = (uint32_t)p.posZ & 1u;
+                    // Cluster coords in chunk.
+                    uint32_t cx = (uint32_t)p.posX / lw::kClusterVoxX;
+                    uint32_t cy = (uint32_t)p.posY / lw::kClusterVoxY;
+                    uint32_t cz = (uint32_t)p.posZ / lw::kClusterVoxZ;
+                    uint32_t clusterIdx = (cz * lw::kClustersY + cy) * lw::kClustersX + cx;
+                    // Voxel coords within cluster.
+                    uint32_t vxInCluster = (uint32_t)p.posX - cx * lw::kClusterVoxX;  // 0..31
+                    uint32_t vyInCluster = (uint32_t)p.posY - cy * lw::kClusterVoxY;
+                    uint32_t vzInCluster = (uint32_t)p.posZ - cz * lw::kClusterVoxZ;
+                    // Octet coords in cluster (2 voxels per octet axis → 16 octets per axis).
+                    uint32_t ox = vxInCluster >> 1;
+                    uint32_t oy = vyInCluster >> 1;
+                    uint32_t oz = vzInCluster >> 1;
+                    uint32_t octetIdx = (oy * 16u + oz) * 16u + ox;     // Y-major
+                    // Voxel-in-octet bit (i = lx | (ly<<1) | (lz<<2)).
+                    uint32_t lx = vxInCluster & 1u;
+                    uint32_t ly = vyInCluster & 1u;
+                    uint32_t lz = vzInCluster & 1u;
                     uint32_t vi = lx | (ly << 1) | (lz << 2);
-                    auto it = blockMap.find(key);
-                    if (it == blockMap.end()) {
-                        lw::DiskBlock b{};
-                        b.blockX = (uint8_t)bx;
-                        b.blockY = (uint8_t)by;
-                        b.blockZ = (uint8_t)bz;
-                        it = blockMap.emplace(key, b).first;
-                    }
-                    it->second.occupancy   |= (uint8_t)(1u << vi);
-                    it->second.palIdx[vi]   = p.palIdx;
+                    OctetEnc& oe = perCluster[clusterIdx][octetIdx];
+                    oe.mask    |= (uint8_t)(1u << vi);
+                    oe.pal[vi]  = p.palIdx;
                 }
-                std::vector<lw::DiskBlock> blocks;
-                blocks.reserve(blockMap.size());
-                for (auto& kv : blockMap) {
-                    lw::DiskBlock& b = kv.second;
-                    uint32_t sumR = 0, sumG = 0, sumB = 0, cnt = 0;
+                // Collect non-empty clusters and emit.
+                std::vector<uint32_t> nonEmpty;
+                for (int ci = 0; ci < lw::kClustersPerChunk; ++ci) {
+                    if (!perCluster[ci].empty()) nonEmpty.push_back((uint32_t)ci);
+                }
+                auto emitOctet = [&](const OctetEnc& oe) {
+                    push(&oe.mask, 1);
                     for (int vi = 0; vi < 8; ++vi) {
-                        if (!(b.occupancy & (1u << vi))) continue;
-                        uint32_t c = bc.palette.empty() ? 0u : bc.palette[b.palIdx[vi]];
-                        sumR += (c >>  0) & 0xFFu;
-                        sumG += (c >>  8) & 0xFFu;
-                        sumB += (c >> 16) & 0xFFu;
-                        ++cnt;
+                        if (oe.mask & (1u << vi)) push(&oe.pal[vi], 1);
                     }
-                    uint32_t r  = cnt ? (sumR / cnt) : 0u;
-                    uint32_t g  = cnt ? (sumG / cnt) : 0u;
-                    uint32_t bl = cnt ? (sumB / cnt) : 0u;
-                    b.parentRgb565 = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (bl >> 3));
-                    blocks.push_back(b);
+                };
+                for (size_t ki = 0; ki < nonEmpty.size(); ++ki) {
+                    uint32_t ci = nonEmpty[ki];
+                    bool isLastCluster = (ki + 1 == nonEmpty.size());
+                    uint8_t clusterID = (uint8_t)(ci & 0x7Fu);
+                    if (isLastCluster) clusterID |= 0x80u;
+                    push(&clusterID, 1);
+
+                    auto& octets = perCluster[ci];   // std::map → sorted by idx
+                    auto it = octets.begin();
+                    while (it != octets.end()) {
+                        auto peek = std::next(it);
+                        // If this is the cluster's final octet, emit with run=15.
+                        if (peek == octets.end()) {
+                            uint16_t octetID = (uint16_t)((it->first & 0x0FFFu) | (15u << 12));
+                            push(&octetID, 2);
+                            emitOctet(it->second);
+                            ++it;
+                            continue;
+                        }
+                        // Count consecutive implicit run (max 14), AND leave final octet
+                        // standalone so it can carry the run=15 terminator.
+                        uint32_t runCount = 0;
+                        auto runIt = it;
+                        while (runCount < 14u) {
+                            auto pk = std::next(runIt);
+                            if (pk == octets.end()) break;
+                            if (pk->first != runIt->first + 1u) break;
+                            auto pkNext = std::next(pk);
+                            if (pkNext == octets.end()) break;   // keep final for terminator
+                            ++runCount;
+                            runIt = pk;
+                        }
+                        uint16_t octetID = (uint16_t)((it->first & 0x0FFFu) | (runCount << 12));
+                        push(&octetID, 2);
+                        emitOctet(it->second);
+                        for (uint32_t k = 0; k < runCount; ++k) {
+                            ++it;
+                            emitOctet(it->second);
+                        }
+                        ++it;
+                    }
                 }
-                lw::Leb128PutU32(blob, (uint32_t)blocks.size());
-                if (!blocks.empty()) push(blocks.data(), blocks.size() * sizeof(lw::DiskBlock));
             }
 
             // LZ4 on top (header + cluster mask + RLE+colors residual redundancy).
             std::vector<uint8_t> cblob;
             uint32_t writeBytes;
-            uint32_t flags = lw::kFlagBitGrid;
-            if (g_storeAo)      flags |= lw::kFlagAo;
-            if (g_storeVisMask) flags |= lw::kFlagVisMask;
-            if (g_storeCellAo)  flags |= lw::kFlagCellAo;
+            uint32_t flags = 0;
             if (g_storeBlocks)  flags |= lw::kFlagBlocks;
             const int rawSize = (int)blob.size();
             const int cap = LZ4_compressBound(rawSize);

@@ -76,7 +76,8 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         MICROPROFILE_SCOPEI("Loader", "LOD", 0xff80a0ff);
         auto tLodStart = clk::now();
         double tReadMs = 0, tLz4Ms = 0, tDecodeMs = 0;
-        double tPass1Ms = 0, tRankMs = 0, tCullMs = 0, tHeaderMs = 0;
+        double tPass1Ms = 0, tRankMs = 0, tCullMs = 0, tHeaderMs = 0, tBlocksMs = 0;
+        uint64_t totalBlocks = 0;
         uint64_t bytesRead = 0, bytesLz4Raw = 0;
         LODWorld& lw = out.lods[L];
         lw.lodLevel = (uint8_t)L;
@@ -209,207 +210,140 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
             if (palBytes) memcpy(rc.palette, p, palBytes);
             p += palBytes;
 
-            rc.poolBase = (uint32_t)lw.pointPool.size();
-            rc.poolCount = dch.totalPoints;
-            rc.slotIdx = i;
-
-            if (ce.flags & kFlagBitGrid) {
-                if ((size_t)(end - p) < 16) { fclose(f); err = "blob short for clusterMask"; return false; }
-                uint8_t clusterMask[16];
-                memcpy(clusterMask, p, 16); p += 16;
-
-                memset(rc.clusters, 0, sizeof(rc.clusters));
-                lw.pointPool.resize(rc.poolBase + dch.totalPoints);
-                tHeaderMs += std::chrono::duration<double, std::milli>(clk::now() - tHdr0).count();
-                auto tP1_0 = clk::now();
-
-                // Pass 1: parse all sub-blobs, decode bit-grids.
-                // If kFlagVisMask is present we capture the stored visMask
-                // pointer and skip the chunk-wide bit-grid fill entirely
-                // (the bit-grid only existed to feed Pass3's visMask
-                // recompute via 6 neighbour lookups per voxel).
-                struct ClusterDec {
-                    uint8_t  orderMode;
-                    uint32_t nP;
-                    uint8_t  bits[kClusterCellCount];
-                    const uint8_t* colors;
-                    const uint8_t* ao;        // packed nibbles per set visMask bit
-                    const uint8_t* vm;        // 1 byte per emitted voxel (visMask)
-                    int oX, oY, oZ;
-                };
-                std::vector<ClusterDec> cds(kClustersPerChunk);
-                const int CW = kChunkVoxX, CH = kChunkVoxY, CD = kChunkVoxZ;
-                const bool haveVm = (ce.flags & kFlagVisMask) != 0;
-                std::vector<uint8_t> chunkBits;
-                if (!haveVm) chunkBits.assign((size_t)((CW * CH * CD + 7) / 8), 0);
-                auto cbSet = [&](int x, int y, int z) {
-                    size_t idx = (size_t)((y * CD + z) * CW + x);
-                    chunkBits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
-                };
-                auto cbGet = [&](int x, int y, int z) -> bool {
-                    if (x < 0 || y < 0 || z < 0 || x >= CW || y >= CH || z >= CD) return false;
-                    size_t idx = (size_t)((y * CD + z) * CW + x);
-                    return (chunkBits[idx >> 3] >> (idx & 7)) & 1u;
-                };
-
-                for (int s = 0; s < kClustersPerChunk; ++s) {
-                    if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
-                    if (p >= end) { fclose(f); err = "blob short cluster stream"; return false; }
-                    ClusterDec& cd = cds[s];
-                    cd.orderMode = *p++;
-                    cd.nP = Leb128GetU32(p);
-                    uint32_t bgSize = Leb128GetU32(p);
-                    if (bgSize > (uint32_t)(end - p)) { fclose(f); err = "bgSize remaining"; return false; }
-                    RleDecodeBitGrid(p, bgSize, cd.bits);
-                    p += bgSize;
-                    if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "colors remaining"; return false; }
-                    cd.colors = p; p += cd.nP;
-                    if (ce.flags & kFlagAo) {
-                        uint32_t aoBytes = Leb128GetU32(p);
-                        if (aoBytes > (uint32_t)(end - p)) { fclose(f); err = "ao remaining"; return false; }
-                        cd.ao = p;
-                        p += aoBytes;
-                    } else {
-                        cd.ao = nullptr;
-                    }
-                    if (haveVm) {
-                        if (cd.nP > (uint32_t)(end - p)) { fclose(f); err = "vm remaining"; return false; }
-                        cd.vm = p;
-                        p += cd.nP;
-                    } else {
-                        cd.vm = nullptr;
-                    }
-                    if (ce.flags & kFlagCellAo) {
-                        // Skip cellAo bytes (unused by runtime).
-                        uint32_t cellAoCount = Leb128GetU32(p);
-                        uint32_t cellAoBytes = (cellAoCount + 1) / 2;
-                        if (cellAoBytes > (uint32_t)(end - p)) { fclose(f); err = "cellao remaining"; return false; }
-                        p += cellAoBytes;
-                    }
-                    cd.oZ = (s / (kClustersX * kClustersY)) * kClusterVoxZ;
-                    cd.oY = ((s / kClustersX) % kClustersY) * kClusterVoxY;
-                    cd.oX = (s % kClustersX) * kClusterVoxX;
-                    // Fill chunk-wide bit-grid only if we'll need it for
-                    // visMask recompute in Pass3.
-                    if (!haveVm) {
-                        for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
-                            if (!cd.bits[cidx]) continue;
-                            uint32_t lx, ly, lz;
-                            LwCellCoord((LwOrderMode)cd.orderMode, cidx, lx, ly, lz);
-                            cbSet(cd.oX + lx, cd.oY + ly, cd.oZ + lz);
-                        }
-                    }
-                }
-
-                tPass1Ms += std::chrono::duration<double, std::milli>(clk::now() - tP1_0).count();
-
-                // ---- DiskBlock stream (PointCS_Block) ----
-                if (ce.flags & kFlagBlocks) {
-                    uint32_t blockCount = Leb128GetU32(p);
-                    size_t bytes = (size_t)blockCount * sizeof(DiskBlock);
-                    if (bytes > (size_t)(end - p)) { fclose(f); err = "block stream remaining"; return false; }
-                    rc.blockBase  = (uint32_t)lw.blockPool.size();
-                    rc.blockCount = blockCount;
-                    if (blockCount) {
-                        lw.blockPool.resize(lw.blockPool.size() + blockCount);
-                        memcpy(lw.blockPool.data() + rc.blockBase, p, bytes);
-                        p += bytes;
-                    }
-                } else {
-                    rc.blockBase  = 0;
-                    rc.blockCount = 0;
-                }
-
-                MICROPROFILE_SCOPEI("Loader", "Pass3", 0xffe080e0);
-                auto tD0 = clk::now();
-                // Pass 3: emit DiskPoints. visMask recomputed from chunk
-                // bit-grid; per-face AO unpacked from variable-length nibble
-                // stream (one nibble per set visMask bit, packed back-to-back).
-                uint32_t writePos = rc.poolBase;
-                for (int s = 0; s < kClustersPerChunk; ++s) {
-                    if (!(clusterMask[s >> 3] & (1u << (s & 7)))) continue;
-                    const ClusterDec& cd = cds[s];
-                    uint8_t clMn[3] = { 31, 31, 31 };
-                    uint8_t clMx[3] = { 0, 0, 0 };
-                    rc.clusters[s].pointFirst = writePos - rc.poolBase;
-                    rc.clusters[s].numPoints  = (uint16_t)cd.nP;
-                    rc.clusters[s]._pad = 0;
-                    uint32_t emitted = 0;
-                    uint32_t aoBitPos = 0;       // per-cluster nibble cursor
-                    for (uint32_t cidx = 0; cidx < kClusterCellCount; ++cidx) {
-                        if (!cd.bits[cidx]) continue;
-                        uint32_t lx, ly, lz;
-                        LwCellCoord((LwOrderMode)cd.orderMode, cidx, lx, ly, lz);
-                        int wx = cd.oX + lx, wy = cd.oY + ly, wz = cd.oZ + lz;
-                        DiskPoint dp;
-                        dp.posX = (uint8_t)wx;
-                        dp.posY = (uint8_t)wy;
-                        dp.posZ = (uint8_t)wz;
-                        dp.palIdx = cd.colors[emitted];
-                        uint8_t mask;
-                        if (cd.vm) {
-                            mask = cd.vm[emitted];
-                        } else {
-                            mask = 0;
-                            if (!cbGet(wx+1,wy,wz)) mask |= 0x01;
-                            if (!cbGet(wx-1,wy,wz)) mask |= 0x02;
-                            if (!cbGet(wx,wy+1,wz)) mask |= 0x04;
-                            if (!cbGet(wx,wy-1,wz)) mask |= 0x08;
-                            if (!cbGet(wx,wy,wz+1)) mask |= 0x10;
-                            if (!cbGet(wx,wy,wz-1)) mask |= 0x20;
-                        }
-                        dp.visMask = mask;
-                        // Unpack variable-length AO nibbles per visMask bit.
-                        // Hidden faces get nibble 0 (never sampled at runtime).
-                        uint32_t ap = 0;
-                        if (cd.ao) {
-                            for (int fi = 0; fi < 6; ++fi) {
-                                if (!((mask >> fi) & 1u)) continue;
-                                uint8_t byte = cd.ao[aoBitPos >> 1];
-                                uint8_t nib  = (aoBitPos & 1u) ? (byte >> 4) : (byte & 0x0F);
-                                ap |= (uint32_t)nib << (fi * 4);
-                                ++aoBitPos;
-                            }
-                        } else {
-                            ap = 0xFFFFFFu;   // all 15 = bright fallback
-                        }
-                        dp.aoPacked[0] = (uint8_t)(ap & 0xFF);
-                        dp.aoPacked[1] = (uint8_t)((ap >> 8) & 0xFF);
-                        dp.aoPacked[2] = (uint8_t)((ap >> 16) & 0xFF);
-                        lw.pointPool[writePos + emitted] = dp;
-                        if (lx < clMn[0]) clMn[0] = (uint8_t)lx;
-                        if (ly < clMn[1]) clMn[1] = (uint8_t)ly;
-                        if (lz < clMn[2]) clMn[2] = (uint8_t)lz;
-                        if (lx > clMx[0]) clMx[0] = (uint8_t)lx;
-                        if (ly > clMx[1]) clMx[1] = (uint8_t)ly;
-                        if (lz > clMx[2]) clMx[2] = (uint8_t)lz;
-                        ++emitted;
-                    }
-                    rc.clusters[s].bounds = PackClusterBounds(
-                        clMn[0], clMn[1], clMn[2], clMx[0], clMx[1], clMx[2]);
-                    writePos += emitted;
-                }
-                tDecodeMs += std::chrono::duration<double, std::milli>(clk::now() - tD0).count();
-            } else {
-                // Legacy raw format (no compression).
-                const size_t clusterBytes = sizeof(DiskCluster) * kClustersPerChunk;
-                const size_t pointBytes = (size_t)dch.totalPoints * sizeof(DiskPoint);
-                if ((size_t)(end - p) < clusterBytes + pointBytes) {
-                    fclose(f); err = "blob too small for raw body"; return false;
-                }
-                memcpy(rc.clusters, p, clusterBytes); p += clusterBytes;
-                if (pointBytes) {
-                    lw.pointPool.resize(lw.pointPool.size() + dch.totalPoints);
-                    memcpy(lw.pointPool.data() + rc.poolBase, p, pointBytes);
-                    p += pointBytes;
-                }
+            rc.poolBase  = 0;
+            rc.poolCount = 1;     // dummy non-zero so visit()/childChunks check passes
+            rc.slotIdx   = i;
+            memset(rc.clusters, 0, sizeof(rc.clusters));
+            // HACK: visit() recursion uses cluster.numPoints>0 to descend.
+            // Now that pass3 is gone there are no real per-cluster counts.
+            // Mark all clusters non-empty with dummy data so visit() walks
+            // every chunk and routes to drawListBlock via pickListForChunk.
+            // Block dispatch dedups by slot and dispatches chunk's full
+            // blockCount once — bogus per-cluster counts never reach a draw.
+            for (int s = 0; s < kClustersPerChunk; ++s) {
+                rc.clusters[s].numPoints = 1;
+                rc.clusters[s].pointFirst = 0;
+                rc.clusters[s].bounds = PackClusterBounds(0, 0, 0,
+                    kClusterVoxX - 1, kClusterVoxY - 1, kClusterVoxZ - 1);
             }
+            tHeaderMs += std::chrono::duration<double, std::milli>(clk::now() - tHdr0).count();
+
+            // ---- V2 compact octet stream (PointCS_Block) — only payload now ----
+            rc.blockBase  = (uint32_t)lw.blockPool.size();
+            rc.blockCount = 0;
+            auto tBlk0 = clk::now();
+            if (ce.flags & kFlagBlocks) {
+                MICROPROFILE_SCOPEI("Loader", "BlocksV2", 0xff80c0c0);
+                {
+                    bool clusterDone = false;
+                    while (!clusterDone) {
+                        if (p >= end) { fclose(f); err = "block clusterID eof"; return false; }
+                        uint8_t cid = *p++;
+                        bool lastCluster = (cid & 0x80u) != 0;
+                        uint32_t ci = (uint32_t)(cid & 0x7Fu);
+                        uint32_t cx = ci % kClustersX;
+                        uint32_t cy = (ci / kClustersX) % kClustersY;
+                        uint32_t cz = ci / (kClustersX * kClustersY);
+                        uint32_t clusterOriginVoxX = cx * kClusterVoxX;
+                        uint32_t clusterOriginVoxY = cy * kClusterVoxY;
+                        uint32_t clusterOriginVoxZ = cz * kClusterVoxZ;
+
+                        // Walk octets in this cluster.
+                        bool clusterEnd = false;
+                        uint32_t implicitRemaining = 0;
+                        uint32_t curOctetIdx = 0;
+                        while (!clusterEnd) {
+                            if (implicitRemaining == 0) {
+                                if ((size_t)(end - p) < 2) { fclose(f); err = "octetID eof"; return false; }
+                                uint16_t oid; 
+                                memcpy(&oid, p, 2); 
+                                p += 2;
+                                curOctetIdx = (uint32_t)(oid & 0x0FFFu);
+                                uint32_t runBits = (uint32_t)((oid >> 12) & 0x0Fu);
+                                if (runBits == 15u) {
+                                    clusterEnd = true;       // terminator after emitting this octet
+                                    implicitRemaining = 0;
+                                } else {
+                                    implicitRemaining = runBits;
+                                }
+                            } else {
+                                curOctetIdx += 1u;
+                                --implicitRemaining;
+                            }
+                            // Emit one block.
+                            if ((size_t)(end - p) < 1) { fclose(f); err = "voxelMask eof"; return false; }
+                            uint8_t mask = *p++;
+                            uint32_t pop = 0;
+                            for (uint8_t m = mask; m; m &= m - 1) 
+                                ++pop;
+
+                            if ((size_t)(end - p) < pop) 
+                            { 
+                                fclose(f); 
+                                err = "voxelID stream eof"; 
+                                return false; 
+                            }
+                            uint8_t palBytes[8] = {};
+                            const uint8_t* src = p;
+                            p += pop;
+                            // Expand to 8-slot palIdx[] using mask.
+                            uint8_t palFull[8] = {};
+                            uint32_t k = 0;
+                            for (int vi = 0; vi < 8; ++vi) {
+                                if (mask & (1u << vi)) palFull[vi] = src[k++];
+                            }
+                            // Decode octet idx (Y-major) to (ox, oy, oz) in cluster.
+                            uint32_t ox = curOctetIdx & 0xFu;
+                            uint32_t oz = (curOctetIdx >> 4) & 0xFu;
+                            uint32_t oy = (curOctetIdx >> 8) & 0xFu;
+                            // Block coord in CHUNK = (clusterOriginVox + octet*2) / 2 = clusterOriginVox/2 + octet.
+                            uint32_t blockX = (clusterOriginVoxX >> 1) + ox;
+                            uint32_t blockY = (clusterOriginVoxY >> 1) + oy;
+                            uint32_t blockZ = (clusterOriginVoxZ >> 1) + oz;
+                            DiskBlock b{};
+                            b.blockX = (uint8_t)blockX;
+                            b.blockY = (uint8_t)blockY;
+                            b.blockZ = (uint8_t)blockZ;
+                            b.occupancy = mask;
+                            for (int vi = 0; vi < 8; ++vi) 
+                                b.palIdx[vi] = palFull[vi];
+                            // parentRgb565 = avg of voxel palette colors.
+                            uint32_t sumR = 0, sumG = 0, sumB = 0, cnt = 0;
+                            for (int vi = 0; vi < 8; ++vi) {
+                                if (!(mask & (1u << vi))) continue;
+                                uint32_t cPal = rc.palette[palFull[vi]];
+                                sumR += (cPal >>  0) & 0xFFu;
+                                sumG += (cPal >>  8) & 0xFFu;
+                                sumB += (cPal >> 16) & 0xFFu;
+                                ++cnt;
+                            }
+                            uint32_t rr = cnt ? (sumR / cnt) : 0u;
+                            uint32_t gg = cnt ? (sumG / cnt) : 0u;
+                            uint32_t bb = cnt ? (sumB / cnt) : 0u;
+                            b.parentRgb565 = (uint16_t)(((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3));
+                            lw.blockPool.push_back(b);
+                            ++rc.blockCount;
+                            if (clusterEnd && implicitRemaining == 0) break;
+                        }
+                        if (lastCluster) clusterDone = true;
+                    }
+                }
+            tBlocksMs += std::chrono::duration<double, std::milli>(clk::now() - tBlk0).count();
+            totalBlocks += rc.blockCount;
+            // Reflect block count into poolCount so visit() / childLoaded
+            // gating treats this chunk as resident only when it has blocks.
+            rc.poolCount = rc.blockCount;
         }
+        }   // end of for(size_t r ...) chunk loop
 
         // ---- Build SoA cull arrays (world float AABBs) ----
         auto tCull0 = clk::now();
-        lw.cull.minX.resize(cc); lw.cull.minY.resize(cc); lw.cull.minZ.resize(cc);
-        lw.cull.maxX.resize(cc); lw.cull.maxY.resize(cc); lw.cull.maxZ.resize(cc);
+        lw.cull.minX.resize(cc); 
+        lw.cull.minY.resize(cc); 
+        lw.cull.minZ.resize(cc);
+        lw.cull.maxX.resize(cc); 
+        lw.cull.maxY.resize(cc); 
+        lw.cull.maxZ.resize(cc);
         lw.cull.culled.assign(cc, 0);
         for (uint32_t i = 0; i < cc; ++i) {
             const RuntimeChunk& rc = lw.chunks[i];
@@ -428,11 +362,13 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
 
         // Per-LOD timing summary.
         double tTotalMs = std::chrono::duration<double, std::milli>(clk::now() - tLodStart).count();
-        double tAccountedMs = tReadMs + tLz4Ms + tHeaderMs + tPass1Ms + tDecodeMs + tRankMs + tCullMs;
+        double tAccountedMs = tReadMs + tLz4Ms + tHeaderMs + tPass1Ms + tDecodeMs
+                            + tRankMs + tCullMs + tBlocksMs;
         double tOtherMs = tTotalMs - tAccountedMs;
-        std::printf("[Loader] LOD %d  total=%.1fms  read=%.1f  lz4=%.1f  hdr=%.1f  pass1=%.1f  pass3=%.1f  rank=%.1f  cull=%.1f  other=%.1f  ranked=%zu/%u  bytes=%.1f/%.1fMB\n",
+        std::printf("[Loader] LOD %d  total=%.1fms  read=%.1f  lz4=%.1f  hdr=%.1f  pass1=%.1f  pass3=%.1f  blocks=%.1f (%llu)  rank=%.1f  cull=%.1f  other=%.1f  ranked=%zu/%u  bytes=%.1f/%.1fMB\n",
                     L, tTotalMs, tReadMs, tLz4Ms, tHeaderMs, tPass1Ms,
-                    tDecodeMs, tRankMs, tCullMs, tOtherMs,
+                    tDecodeMs, tBlocksMs, (unsigned long long)totalBlocks,
+                    tRankMs, tCullMs, tOtherMs,
                     ranks.size(), cc,
                     bytesRead / (1024.0*1024.0), bytesLz4Raw / (1024.0*1024.0));
         std::fflush(stdout);
