@@ -107,22 +107,39 @@ struct DiskBlock
 static_assert(sizeof(DiskBlock) == 16, "");
 
 // kFlag for chunk blob: compact per-chunk OCTET stream at end of blob.
-// Format (V2):
+// Format (V3, file version 2):
 //   stream of clusters until clusterID byte has bit 7 set:
 //     uint8 clusterID                ;  bits 0..6 = cluster idx, bit 7 = last in chunk
-//     stream of octets until octet with run-bits == 15:
-//       uint16 octetID               ;  bits 0..11 = octet idx (Y-major in cluster)
-//                                       bits 12..15 = run-bits:
-//                                         0      = no implicit follow; next byte is fresh octetID
-//                                         1..14  = N implicit octets follow (no octetID; idx = prev+1)
-//                                         15     = this is final octet of cluster
-//       uint8  voxelMask             ;  bit i = voxel i present (i = lx | (ly<<1) | (lz<<2))
-//       uint8  voxelID[popcount(voxelMask)]
-//       (for each implicit follow: voxelMask + voxelID[] only, no octetID)
+//     // Per cluster:
+//     //   modeByte at every 4th octet boundary (groups 4 modes, 2 bits each)
+//     //   octet group sequence ends when an octet has run-bits == 15
+//     For each octet (counting from 0 within cluster):
+//       if (octetCount % 4 == 0): uint8 modeByte
+//                                  ; 4 modes packed (low bits = mode for next octet)
+//                                  ;   mode 00 = uniform reuse (no colour payload; uses prev uniform colour)
+//                                  ;   mode 01 = uniform new   (1B palette idx follows; sets prev colour)
+//                                  ;   mode 10 = varied        (popcount(mask) palette bytes follow)
+//                                  ;   mode 11 = reserved
+//       if (not in implicit-run): uint16 octetID
+//                                  ;  bits 0..11 = octet idx (Y-major in cluster)
+//                                  ;  bits 12..15 = run-bits:
+//                                  ;    0      = next octet uses fresh octetID
+//                                  ;    1..14  = N implicit octets follow (no octetID; idx = prev+1)
+//                                  ;    15     = this is final octet of cluster
+//       uint8  voxelMask           ;  bit i = voxel i present
+//       payload depending on mode (see above)
+//
+//   prevUniformColour is per-cluster state, reset to "undefined" at clusterID.
+//   modeByte position resets at clusterID too.
+//
 // Cluster idx encoding: idx = (cz * kClustersY + cy) * kClustersX + cx
 // Octet idx in cluster (Y-major): idx = (oy * 16 + oz) * 16 + ox
-//   ox/oy/oz in [0..16) covering 2-voxel octets across 32-voxel cluster.
 inline constexpr uint32_t kFlagBlocks = 1u << 5;
+
+// Octet payload modes (2-bit values inside modeByte).
+inline constexpr uint8_t kOctetModeUniformReuse = 0u;
+inline constexpr uint8_t kOctetModeUniformNew = 1u;
+inline constexpr uint8_t kOctetModeVaried = 2u;
 
 // =====================================================================
 // Disk-resident cluster header (12 bytes).
@@ -207,7 +224,7 @@ static_assert(sizeof(DiskChunkHeader) == 60, "");
 // =====================================================================
 
 inline constexpr uint32_t kFileMagic = 0x31574F4Cu; // "LOW1" little-endian
-inline constexpr uint32_t kFileVersion = 1u;
+inline constexpr uint32_t kFileVersion = 2u;
 
 inline constexpr uint32_t kFlagLz4 = 1u << 0;
 inline constexpr uint32_t kFlagBitGrid = 1u << 1; // per-cluster bit-grid + color stream

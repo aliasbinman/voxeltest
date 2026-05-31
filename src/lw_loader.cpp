@@ -293,23 +293,18 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
             }
             tHeaderMs += std::chrono::duration<double, std::milli>(clk::now() - tHdr0).count();
 
-            // ---- V2 compact octet stream (PointCS_Block) — only payload now ----
+            // ---- V3 compact octet stream (PointCS_Block) — only payload now ----
             rc.blockBase = (uint32_t)lw.blockPool.size();
             rc.blockCount = 0;
             auto tBlk0 = clk::now();
             if (ce.flags & kFlagBlocks)
             {
-                MICROPROFILE_SCOPEI("Loader", "BlocksV2", 0xff80c0c0);
+                MICROPROFILE_SCOPEI("Loader", "BlocksV3", 0xff80c0c0);
                 {
                     bool clusterDone = false;
                     while (!clusterDone)
                     {
-                        if (p >= end)
-                        {
-                            fclose(f);
-                            err = "block clusterID eof";
-                            return false;
-                        }
+                        // EOF checks disabled for perf
                         uint8_t cid = *p++;
                         bool lastCluster = (cid & 0x80u) != 0;
                         uint32_t ci = (uint32_t)(cid & 0x7Fu);
@@ -320,20 +315,21 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                         uint32_t clusterOriginVoxY = cy * kClusterVoxY;
                         uint32_t clusterOriginVoxZ = cz * kClusterVoxZ;
 
-                        // Walk octets in this cluster.
+                        // Per-cluster state.
                         bool clusterEnd = false;
                         uint32_t implicitRemaining = 0;
                         uint32_t curOctetIdx = 0;
+                        uint32_t octetCount = 0;
+                        uint8_t modeByte = 0;
+                        int prevColor = -1;
                         while (!clusterEnd)
                         {
+                            if ((octetCount & 3u) == 0u)
+                                modeByte = *p++;
+                            uint8_t mode = (uint8_t)((modeByte >> ((octetCount & 3u) * 2u)) & 0x3u);
+
                             if (implicitRemaining == 0)
                             {
-                                if ((size_t)(end - p) < 2)
-                                {
-                                    fclose(f);
-                                    err = "octetID eof";
-                                    return false;
-                                }
                                 uint16_t oid;
                                 memcpy(&oid, p, 2);
                                 p += 2;
@@ -341,7 +337,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                                 uint32_t runBits = (uint32_t)((oid >> 12) & 0x0Fu);
                                 if (runBits == 15u)
                                 {
-                                    clusterEnd = true; // terminator after emitting this octet
+                                    clusterEnd = true;
                                     implicitRemaining = 0;
                                 }
                                 else
@@ -354,40 +350,47 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                                 curOctetIdx += 1u;
                                 --implicitRemaining;
                             }
-                            // Emit one block.
-                            if ((size_t)(end - p) < 1)
-                            {
-                                fclose(f);
-                                err = "voxelMask eof";
-                                return false;
-                            }
-                            uint8_t mask = *p++;
-                            uint32_t pop = 0;
-                            for (uint8_t m = mask; m; m &= m - 1)
-                                ++pop;
 
-                            if ((size_t)(end - p) < pop)
-                            {
-                                fclose(f);
-                                err = "voxelID stream eof";
-                                return false;
-                            }
-                            uint8_t palBytes[8] = {};
-                            const uint8_t* src = p;
-                            p += pop;
-                            // Expand to 8-slot palIdx[] using mask.
+                            uint8_t mask = *p++;
+
                             uint8_t palFull[8] = {};
-                            uint32_t k = 0;
-                            for (int vi = 0; vi < 8; ++vi)
+                            if (mode == kOctetModeUniformReuse)
                             {
-                                if (mask & (1u << vi))
-                                    palFull[vi] = src[k++];
+                                uint8_t col = (uint8_t)prevColor;
+                                for (int vi = 0; vi < 8; ++vi)
+                                {
+                                    if (mask & (1u << vi))
+                                        palFull[vi] = col;
+                                }
                             }
-                            // Decode octet idx (Y-major) to (ox, oy, oz) in cluster.
+                            else if (mode == kOctetModeUniformNew)
+                            {
+                                uint8_t col = *p++;
+                                prevColor = (int)col;
+                                for (int vi = 0; vi < 8; ++vi)
+                                {
+                                    if (mask & (1u << vi))
+                                        palFull[vi] = col;
+                                }
+                            }
+                            else // kOctetModeVaried (mode 3 reserved, treat same)
+                            {
+                                uint32_t pop = 0;
+                                for (uint8_t m = mask; m; m &= m - 1)
+                                    ++pop;
+                                const uint8_t* src = p;
+                                p += pop;
+                                uint32_t k = 0;
+                                for (int vi = 0; vi < 8; ++vi)
+                                {
+                                    if (mask & (1u << vi))
+                                        palFull[vi] = src[k++];
+                                }
+                            }
+
                             uint32_t ox = curOctetIdx & 0xFu;
                             uint32_t oz = (curOctetIdx >> 4) & 0xFu;
                             uint32_t oy = (curOctetIdx >> 8) & 0xFu;
-                            // Block coord in CHUNK = (clusterOriginVox + octet*2) / 2 = clusterOriginVox/2 + octet.
                             uint32_t blockX = (clusterOriginVoxX >> 1) + ox;
                             uint32_t blockY = (clusterOriginVoxY >> 1) + oy;
                             uint32_t blockZ = (clusterOriginVoxZ >> 1) + oz;
@@ -398,24 +401,10 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                             b.occupancy = mask;
                             for (int vi = 0; vi < 8; ++vi)
                                 b.palIdx[vi] = palFull[vi];
-                            // parentRgb565 = avg of voxel palette colors.
-                            uint32_t sumR = 0, sumG = 0, sumB = 0, cnt = 0;
-                            for (int vi = 0; vi < 8; ++vi)
-                            {
-                                if (!(mask & (1u << vi)))
-                                    continue;
-                                uint32_t cPal = rc.palette[palFull[vi]];
-                                sumR += (cPal >> 0) & 0xFFu;
-                                sumG += (cPal >> 8) & 0xFFu;
-                                sumB += (cPal >> 16) & 0xFFu;
-                                ++cnt;
-                            }
-                            uint32_t rr = cnt ? (sumR / cnt) : 0u;
-                            uint32_t gg = cnt ? (sumG / cnt) : 0u;
-                            uint32_t bb = cnt ? (sumB / cnt) : 0u;
-                            b.parentRgb565 = (uint16_t)(((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3));
+                            // parentRgb565 computed in shader now.
                             lw.blockPool.push_back(b);
                             ++rc.blockCount;
+                            ++octetCount;
                             if (clusterEnd && implicitRemaining == 0)
                                 break;
                         }

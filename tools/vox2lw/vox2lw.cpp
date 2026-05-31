@@ -1800,14 +1800,28 @@ int main(int argc, char** argv)
                     if (!perCluster[ci].empty())
                         nonEmpty.push_back((uint32_t)ci);
                 }
-                auto emitOctet = [&](const OctetEnc& oe)
+                // Classify an octet:
+                //   uniform >= 0 → all set bits have the same palIdx (= uniform)
+                //   uniform == -1 → varied (no single colour)
+                auto classify = [&](const OctetEnc& oe) -> int
                 {
-                    push(&oe.mask, 1);
+                    int u = -1;
+                    bool first = true;
                     for (int vi = 0; vi < 8; ++vi)
                     {
-                        if (oe.mask & (1u << vi))
-                            push(&oe.pal[vi], 1);
+                        if (!(oe.mask & (1u << vi)))
+                            continue;
+                        if (first)
+                        {
+                            u = oe.pal[vi];
+                            first = false;
+                        }
+                        else if (oe.pal[vi] != u)
+                        {
+                            return -1;
+                        }
                     }
+                    return u;
                 };
                 for (size_t ki = 0; ki < nonEmpty.size(); ++ki)
                 {
@@ -1818,46 +1832,111 @@ int main(int argc, char** argv)
                         clusterID |= 0x80u;
                     push(&clusterID, 1);
 
-                    auto& octets = perCluster[ci]; // std::map → sorted by idx
-                    auto it = octets.begin();
-                    while (it != octets.end())
+                    auto& octetsMap = perCluster[ci];
+                    // Flatten std::map (sorted) into a vector for indexed access.
+                    std::vector<std::pair<uint32_t, OctetEnc>> octs;
+                    octs.reserve(octetsMap.size());
+                    for (auto& kv : octetsMap)
+                        octs.push_back({kv.first, kv.second});
+
+                    // Pre-compute run-length / explicit flags per octet.
+                    std::vector<uint8_t> runBits(octs.size(), 0);
+                    std::vector<uint8_t> explicitFlag(octs.size(), 0);
+                    size_t ii = 0;
+                    while (ii < octs.size())
                     {
-                        auto peek = std::next(it);
-                        // If this is the cluster's final octet, emit with run=15.
-                        if (peek == octets.end())
+                        if (ii + 1 == octs.size())
                         {
-                            uint16_t octetID = (uint16_t)((it->first & 0x0FFFu) | (15u << 12));
-                            push(&octetID, 2);
-                            emitOctet(it->second);
-                            ++it;
-                            continue;
+                            explicitFlag[ii] = 1;
+                            runBits[ii] = 15; // terminator
+                            break;
                         }
-                        // Count consecutive implicit run (max 14), AND leave final octet
-                        // standalone so it can carry the run=15 terminator.
-                        uint32_t runCount = 0;
-                        auto runIt = it;
-                        while (runCount < 14u)
+                        uint32_t run = 0;
+                        size_t jj = ii;
+                        while (run < 14u)
                         {
-                            auto pk = std::next(runIt);
-                            if (pk == octets.end())
+                            size_t pk = jj + 1;
+                            if (pk >= octs.size())
                                 break;
-                            if (pk->first != runIt->first + 1u)
+                            if (octs[pk].first != octs[jj].first + 1u)
                                 break;
-                            auto pkNext = std::next(pk);
-                            if (pkNext == octets.end())
+                            if (pk + 1 == octs.size())
                                 break; // keep final for terminator
-                            ++runCount;
-                            runIt = pk;
+                            ++run;
+                            jj = pk;
                         }
-                        uint16_t octetID = (uint16_t)((it->first & 0x0FFFu) | (runCount << 12));
-                        push(&octetID, 2);
-                        emitOctet(it->second);
-                        for (uint32_t k = 0; k < runCount; ++k)
+                        explicitFlag[ii] = 1;
+                        runBits[ii] = (uint8_t)run;
+                        ii = jj + 1;
+                    }
+
+                    // Walk octets, interleaving modeByte every 4 octets.
+                    int prevColor = -1; // resets per cluster
+                    for (size_t oi = 0; oi < octs.size(); ++oi)
+                    {
+                        if ((oi & 3u) == 0u)
                         {
-                            ++it;
-                            emitOctet(it->second);
+                            // Pre-compute modeByte for next up-to-4 octets
+                            // (simulate prevColor updates without emitting payload).
+                            int simPrev = prevColor;
+                            uint8_t modeByte = 0;
+                            size_t end4 = std::min(oi + 4u, octs.size());
+                            for (size_t k = oi; k < end4; ++k)
+                            {
+                                int u = classify(octs[k].second);
+                                uint8_t mode;
+                                if (u >= 0)
+                                {
+                                    if (u == simPrev)
+                                        mode = lw::kOctetModeUniformReuse;
+                                    else
+                                    {
+                                        mode = lw::kOctetModeUniformNew;
+                                        simPrev = u;
+                                    }
+                                }
+                                else
+                                {
+                                    mode = lw::kOctetModeVaried;
+                                }
+                                modeByte |= (uint8_t)(mode << ((k - oi) * 2u));
+                            }
+                            push(&modeByte, 1);
                         }
-                        ++it;
+                        // Octet header (only on explicit / run-start).
+                        const auto& oe = octs[oi].second;
+                        if (explicitFlag[oi])
+                        {
+                            uint16_t octetID = (uint16_t)((octs[oi].first & 0x0FFFu)
+                                                          | ((uint32_t)runBits[oi] << 12));
+                            push(&octetID, 2);
+                        }
+                        // Mask is always emitted.
+                        push(&oe.mask, 1);
+                        // Mode-specific payload.
+                        int u = classify(oe);
+                        if (u >= 0)
+                        {
+                            if (u == prevColor)
+                            {
+                                // mode 0: nothing
+                            }
+                            else
+                            {
+                                uint8_t col = (uint8_t)u;
+                                push(&col, 1);
+                                prevColor = u;
+                            }
+                        }
+                        else
+                        {
+                            // mode 2: per-voxel palette bytes in bit order.
+                            for (int vi = 0; vi < 8; ++vi)
+                            {
+                                if (oe.mask & (1u << vi))
+                                    push(&oe.pal[vi], 1);
+                            }
+                        }
                     }
                 }
             }
