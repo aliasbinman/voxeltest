@@ -584,44 +584,6 @@ bool Renderer::CreateRenderTargets()
         device_->CreateShaderResourceView(visBufTex_.Get(), nullptr, visBufSrv_.GetAddressOf());
     }
 
-    // Tile binning buffers (per-tile counter + list of point refs).
-    tileCounterBuf_.Reset(); tileCounterUav_.Reset();
-    tileListBuf_.Reset();    tileListUav_.Reset();
-    numTilesX_ = (width_  + tileW_ - 1) / tileW_;
-    numTilesY_ = (height_ + tileH_ - 1) / tileH_;
-    const uint32_t numTiles = numTilesX_ * numTilesY_;
-    {
-        // tileCounter: typed Buffer<uint>.
-        D3D11_BUFFER_DESC cbd = {};
-        cbd.ByteWidth = numTiles * sizeof(uint32_t);
-        cbd.Usage = D3D11_USAGE_DEFAULT;
-        cbd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-        cbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-        // Typed UAV with R32_UINT format below.
-        device_->CreateBuffer(&cbd, nullptr, tileCounterBuf_.GetAddressOf());
-        D3D11_UNORDERED_ACCESS_VIEW_DESC cuav = {};
-        cuav.Format = DXGI_FORMAT_R32_UINT;
-        cuav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-        cuav.Buffer.NumElements = numTiles;
-        device_->CreateUnorderedAccessView(tileCounterBuf_.Get(), &cuav, tileCounterUav_.GetAddressOf());
-
-        // tileList: structured buffer of uint2.
-        struct U2 { uint32_t x, y; };
-        const uint32_t listCount = numTiles * tileMaxPerTile_;
-        D3D11_BUFFER_DESC lbd = {};
-        lbd.ByteWidth = listCount * sizeof(U2);
-        lbd.Usage = D3D11_USAGE_DEFAULT;
-        lbd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-        lbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        lbd.StructureByteStride = sizeof(U2);
-        device_->CreateBuffer(&lbd, nullptr, tileListBuf_.GetAddressOf());
-        D3D11_UNORDERED_ACCESS_VIEW_DESC luav = {};
-        luav.Format = DXGI_FORMAT_UNKNOWN;
-        luav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-        luav.Buffer.NumElements = listCount;
-        device_->CreateUnorderedAccessView(tileListBuf_.Get(), &luav, tileListUav_.GetAddressOf());
-    }
-
     // Splat color RT + final UAV target.
     D3D11_TEXTURE2D_DESC sd2 = {};
     sd2.Width = width_;
@@ -828,10 +790,7 @@ bool Renderer::CreateShaders()
         if (!compileLw("psmain_lw_bounds",          "ps_5_0", bpsB))     return false;
         if (!compileLw("vsmain_lw_polyaxis",        "vs_5_0", bvsPa))    return false;
         if (!compileLw("psmain_lw_polyaxis_lit",    "ps_5_0", bpsPaLit)) return false;
-        ComPtr<ID3DBlob> bcsAtom, bcsBin, bcsTr, bcsBlk, bvsR, bpsR;
-        if (!compileLw("csmain_lw_point_atomic",    "cs_5_0", bcsAtom))  return false;
-        if (!compileLw("csmain_lw_point_bin",       "cs_5_0", bcsBin))   return false;
-        if (!compileLw("csmain_lw_tile_raster",     "cs_5_0", bcsTr))    return false;
+        ComPtr<ID3DBlob> bcsBlk, bvsR, bpsR;
         if (!compileLw("csmain_lw_block_atomic",    "cs_5_0", bcsBlk))   return false;
         if (!compileLw("vsmain_lw_resolve",         "vs_5_0", bvsR))     return false;
         if (!compileLw("psmain_lw_resolve",         "ps_5_0", bpsR))     return false;
@@ -850,12 +809,6 @@ bool Renderer::CreateShaders()
         hr = device_->CreateVertexShader(bvsPa->GetBufferPointer(), bvsPa->GetBufferSize(), nullptr, vsLwPolyAxis_.GetAddressOf());
         if (FAILED(hr)) return false;
         hr = device_->CreatePixelShader (bpsPaLit->GetBufferPointer(), bpsPaLit->GetBufferSize(), nullptr, psLwPolyAxisLit_.GetAddressOf());
-        if (FAILED(hr)) return false;
-        hr = device_->CreateComputeShader(bcsAtom->GetBufferPointer(),bcsAtom->GetBufferSize(),nullptr, csLwAtomic_.GetAddressOf());
-        if (FAILED(hr)) return false;
-        hr = device_->CreateComputeShader(bcsBin->GetBufferPointer(), bcsBin->GetBufferSize(), nullptr, csLwBin_.GetAddressOf());
-        if (FAILED(hr)) return false;
-        hr = device_->CreateComputeShader(bcsTr->GetBufferPointer(),  bcsTr->GetBufferSize(),  nullptr, csLwTileRaster_.GetAddressOf());
         if (FAILED(hr)) return false;
         hr = device_->CreateComputeShader(bcsBlk->GetBufferPointer(), bcsBlk->GetBufferSize(), nullptr, csLwBlock_.GetAddressOf());
         if (FAILED(hr)) return false;
@@ -883,8 +836,8 @@ bool Renderer::CreateShaders()
         // CBGodray: 48 bytes (sunNdc+flags / halfScreenUV+pad / tint+strength)
         bd.ByteWidth = 48;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbGodray_.GetAddressOf()))) return false;
-        // CBLwCS: 48 bytes (vwSize / count / tile params / lodFadeStart/End / pad)
-        bd.ByteWidth = 48;
+        // CBLwCS: 32 bytes (vwSize+count+pad / fadeStart+fadeEnd+pad)
+        bd.ByteWidth = 32;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwCS_.GetAddressOf()))) return false;
     }
 
@@ -1495,9 +1448,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     struct DrawItem { uint32_t slot; uint32_t drawBase; uint32_t drawCount; };
     std::vector<DrawItem> drawListSplat[lw::kLodCount];
     std::vector<DrawItem> drawListPoly [lw::kLodCount];
-    std::vector<DrawItem> drawListAtomic[lw::kLodCount];   // PointCS (global atomic)
-    std::vector<DrawItem> drawListLDS   [lw::kLodCount];   // PointCS_LDS (tile + LDS)
-    std::vector<DrawItem> drawListBlock [lw::kLodCount];   // PointCS_Block (2x2x2 blocks)
+    std::vector<DrawItem> drawListBlock[lw::kLodCount];    // PointCS_Block (2x2x2 blocks)
 
     // Per-chunk tech pick: distance-based close/far ring. LOD-independent so
     // recursion can't flip a chunk's classification mid-traversal.
@@ -1511,8 +1462,6 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         if (isClose && !args.closeEnabled) return nullptr;
         if (!isClose && !args.farEnabled) return nullptr;
         RenderTech tech = isClose ? args.tech : args.techFar;
-        if (tech == RenderTech::PointCS)       return &drawListAtomic[L];
-        if (tech == RenderTech::PointCS_LDS)   return &drawListLDS[L];
         if (tech == RenderTech::PointCS_Block) return &drawListBlock[L];
         bool usePoly = (tech == RenderTech::PolyAxis) || args.lwPolyAxis;
         return usePoly ? &drawListPoly[L] : &drawListSplat[L];
@@ -1690,26 +1639,18 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     uint64_t pointCountTotal = 0;
     uint64_t splatVoxels = 0;
 
-    // Compute rasterizer: clear vis buffer if any CS tech in use.
-    bool anyAtomic = false;
-    bool anyLDS    = false;
-    bool anyBlock  = false;
+    // Compute rasterizer: clear vis buffer if block tech in use.
+    bool anyBlock = false;
     for (int Li = 0; Li < lw::kLodCount; ++Li) {
-        if (!drawListAtomic[Li].empty()) anyAtomic = true;
-        if (!drawListLDS   [Li].empty()) anyLDS    = true;
-        if (!drawListBlock [Li].empty()) anyBlock  = true;
+        if (!drawListBlock[Li].empty()) { anyBlock = true; break; }
     }
-    bool anyCS = anyAtomic || anyLDS || anyBlock;
+    bool anyCS = anyBlock;
     if (anyCS && visBufUav_) {
         MICROPROFILE_SCOPEGPUI("LW/PointCS/Clear", 0xff404060);
         ID3D11RenderTargetView* nullRtvsA[] = { nullptr, nullptr };
         ctx_->OMSetRenderTargets(2, nullRtvsA, nullptr);
         uint32_t clearVis[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
         ctx_->ClearUnorderedAccessViewUint(visBufUav_.Get(), clearVis);
-        if (anyLDS && tileCounterUav_) {
-            uint32_t zero4[4] = { 0u, 0u, 0u, 0u };
-            ctx_->ClearUnorderedAccessViewUint(tileCounterUav_.Get(), zero4);
-        }
         // Restore splat RTs for the splat draws inside the loop.
         ID3D11RenderTargetView* mrtA[] = { splatColorRtv_.Get(), splatMaskRtv_.Get() };
         ctx_->OMSetRenderTargets(2, mrtA, splatDsv_.Get());
@@ -1725,7 +1666,6 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     };
     for (int L = topL; L >= 0; --L) {
         if (drawListSplat[L].empty() && drawListPoly[L].empty()
-            && drawListAtomic[L].empty() && drawListLDS[L].empty()
             && drawListBlock[L].empty()) continue;
         const LwGpu& g = lwGpu_[L];
         if (g.slotCount == 0) continue;
@@ -1781,88 +1721,16 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             D3D11_MAPPED_SUBRESOURCE mm;
             ctx_->Map(cbLwCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
             struct {
-                uint32_t w, h, cnt, maxPer;
-                uint32_t tileW, tileH, numTx, numTy;
-                float    fadeStart, fadeEnd, _pad0, _pad1;
+                uint32_t w, h, cnt, _pad0;
+                float    fadeStart, fadeEnd, _pad1, _pad2;
             } cbcs;
             cbcs.w = width_; cbcs.h = height_; cbcs.cnt = curCount;
-            cbcs.maxPer = tileMaxPerTile_;
-            cbcs.tileW = tileW_; cbcs.tileH = tileH_;
-            cbcs.numTx = numTilesX_; cbcs.numTy = numTilesY_;
+            cbcs._pad0 = 0;
             cbcs.fadeStart = fadeStart; cbcs.fadeEnd = fadeEnd;
-            cbcs._pad0 = cbcs._pad1 = 0.0f;
+            cbcs._pad1 = cbcs._pad2 = 0.0f;
             memcpy(mm.pData, &cbcs, sizeof(cbcs));
             ctx_->Unmap(cbLwCS_.Get(), 0);
         };
-
-        auto runCsDispatches = [&](std::vector<DrawItem>& list,
-                                   ID3D11ComputeShader* cs,
-                                   ID3D11UnorderedAccessView* const* uavs,
-                                   uint32_t uavCount,
-                                   UINT* initCounts) {
-            if (list.empty() || !cs) return;
-            ID3D11RenderTargetView* nullRtvsCS[] = { nullptr, nullptr };
-            ctx_->OMSetRenderTargets(2, nullRtvsCS, nullptr);
-            ID3D11ShaderResourceView* nullVsX[3] = { nullptr, nullptr, nullptr };
-            ctx_->VSSetShaderResources(0, 3, nullVsX);
-
-            ctx_->CSSetShader(cs, nullptr, 0);
-            ctx_->CSSetShaderResources(0, 3, vsSrvs);
-            ctx_->CSSetUnorderedAccessViews(0, uavCount, uavs, initCounts);
-            ID3D11Buffer* csCbs[] = { cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get() };
-            ctx_->CSSetConstantBuffers(0, 4, csCbs);
-
-            std::sort(list.begin(), list.end(),
-                      [](const DrawItem& a, const DrawItem& b) {
-                          if (a.slot != b.slot) return a.slot < b.slot;
-                          return a.drawBase < b.drawBase;
-                      });
-            uint32_t curSlot = 0xFFFFFFFFu, curBase = 0, curCount = 0;
-            auto flush = [&]() {
-                if (curCount == 0) return;
-                const lw::RuntimeChunk& rc = lwL.chunks[curSlot];
-                setLodCbForLod(L, rc.slotIdx, curBase);
-                writeCbLwCS(curCount);
-                uint32_t groups = (curCount + 63) / 64;
-                ctx_->Dispatch(groups, 1, 1);
-                ++drawCount;
-                curCount = 0;
-            };
-            for (const DrawItem& it : list) {
-                if (it.slot == curSlot && curBase + curCount == it.drawBase) {
-                    curCount += it.drawCount;
-                } else {
-                    flush();
-                    curSlot = it.slot; curBase = it.drawBase; curCount = it.drawCount;
-                }
-            }
-            flush();
-
-            ID3D11UnorderedAccessView* nullUavs[] = { nullptr, nullptr, nullptr };
-            ctx_->CSSetUnorderedAccessViews(0, uavCount, nullUavs, initCounts);
-            ID3D11ShaderResourceView* nullCsSrv[3] = { nullptr, nullptr, nullptr };
-            ctx_->CSSetShaderResources(0, 3, nullCsSrv);
-            ID3D11RenderTargetView* mrtRestore[] = { splatColorRtv_.Get(), splatMaskRtv_.Get() };
-            ctx_->OMSetRenderTargets(2, mrtRestore, splatDsv_.Get());
-            ctx_->VSSetShaderResources(0, 3, vsSrvs);
-        };
-
-        // PointCS (global atomic) — bind visBuf UAV only.
-        if (!drawListAtomic[L].empty()) {
-            MICROPROFILE_SCOPEGPUI("LW/PointCS", 0xff60a0ff);
-            ID3D11UnorderedAccessView* uavs[] = { visBufUav_.Get() };
-            UINT init[] = { 0 };
-            runCsDispatches(drawListAtomic[L], csLwAtomic_.Get(), uavs, 1, init);
-        }
-        // PointCS_LDS (tile binning) — bind visBuf + tileCounter + tileList.
-        if (!drawListLDS[L].empty()) {
-            MICROPROFILE_SCOPEGPUI("LW/PointCS_LDS/Bin", 0xffa060ff);
-            ID3D11UnorderedAccessView* uavs[] = {
-                visBufUav_.Get(), tileCounterUav_.Get(), tileListUav_.Get()
-            };
-            UINT init[] = { 0, 0, 0 };
-            runCsDispatches(drawListLDS[L], csLwBin_.Get(), uavs, 3, init);
-        }
 
         // PointCS_Block — per-chunk dispatch over 2x2x2 blocks with LOD fade.
         if (!drawListBlock[L].empty() && csLwBlock_) {
@@ -2018,40 +1886,6 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         }
         ctx_->RSSetState(rsSolid_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
-    }
-
-    // ---- Compute rasterizer raster pass: tile groups, LDS atomic-min ----
-    if (anyLDS && csLwTileRaster_) {
-        MICROPROFILE_SCOPEGPUI("LW/PointCS_LDS/Raster", 0xffc06070);
-        ID3D11RenderTargetView* nullRtvsTr[] = { nullptr, nullptr };
-        ctx_->OMSetRenderTargets(2, nullRtvsTr, nullptr);
-        ctx_->CSSetShader(csLwTileRaster_.Get(), nullptr, 0);
-        ID3D11UnorderedAccessView* trUavs[] = {
-            visBufUav_.Get(), tileCounterUav_.Get(), tileListUav_.Get()
-        };
-        UINT initTr[] = { 0, 0, 0 };
-        ctx_->CSSetUnorderedAccessViews(0, 3, trUavs, initTr);
-        ID3D11Buffer* trCbs[] = { cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get() };
-        ctx_->CSSetConstantBuffers(0, 4, trCbs);
-        // Write a final CB snapshot with current tile params (cnt unused here).
-        D3D11_MAPPED_SUBRESOURCE mmTr;
-        ctx_->Map(cbLwCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mmTr);
-        struct {
-            uint32_t w, h, cnt, maxPer;
-            uint32_t tileW, tileH, numTx, numTy;
-            float    fadeStart, fadeEnd, _pad0, _pad1;
-        } cbcs;
-        cbcs.w = width_; cbcs.h = height_; cbcs.cnt = 0;
-        cbcs.maxPer = tileMaxPerTile_;
-        cbcs.tileW = tileW_; cbcs.tileH = tileH_;
-        cbcs.numTx = numTilesX_; cbcs.numTy = numTilesY_;
-        cbcs.fadeStart = cbcs.fadeEnd = 0.0f;
-        cbcs._pad0 = cbcs._pad1 = 0.0f;
-        memcpy(mmTr.pData, &cbcs, sizeof(cbcs));
-        ctx_->Unmap(cbLwCS_.Get(), 0);
-        ctx_->Dispatch(numTilesX_, numTilesY_, 1);
-        ID3D11UnorderedAccessView* nullUavTr[] = { nullptr, nullptr, nullptr };
-        ctx_->CSSetUnorderedAccessViews(0, 3, nullUavTr, initTr);
     }
 
     // ---- Compute rasterizer resolve: visBuf → scene RT (after composite) ----

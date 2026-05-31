@@ -26,9 +26,7 @@ enum class RenderTech : int {
     PolyAxis          = 11,
     PolyAxisInstanced = 12,
     HexSprite         = 3,
-    PointCS           = 13,   // Schütz-style compute rasterizer (global atomic min)
-    PointCS_LDS       = 14,   // tile-binned + LDS atomic (phase 2)
-    PointCS_Block     = 15,   // 2x2x2 block layout + LOD pop-hide fade
+    PointCS_Block     = 15,   // 2x2x2 block layout + LOD pop-hide fade (only working CS tech)
 };
 
 enum class PointLighting : int { Simple = 0, Complex = 1 };
@@ -279,22 +277,9 @@ private:
     ComPtr<ID3D11UnorderedAccessView>  visBufUav_;
     ComPtr<ID3D11ShaderResourceView>   visBufSrv_;
     ComPtr<ID3D11Buffer>               cbLwCS_;        // tile params + dispatch count
-    ComPtr<ID3D11ComputeShader>        csLwAtomic_;    // PointCS (global atomic min)
-    ComPtr<ID3D11ComputeShader>        csLwBin_;       // PointCS_LDS bin pass
-    ComPtr<ID3D11ComputeShader>        csLwTileRaster_;// PointCS_LDS tile-raster pass
     ComPtr<ID3D11ComputeShader>        csLwBlock_;     // PointCS_Block (2x2x2 blocks + LOD fade)
     ComPtr<ID3D11VertexShader>         vsLwResolve_;
     ComPtr<ID3D11PixelShader>          psLwResolve_;
-    // Tile binning buffers (recreated on resize).
-    ComPtr<ID3D11Buffer>               tileCounterBuf_;
-    ComPtr<ID3D11UnorderedAccessView>  tileCounterUav_;
-    ComPtr<ID3D11Buffer>               tileListBuf_;
-    ComPtr<ID3D11UnorderedAccessView>  tileListUav_;
-    uint32_t                           tileW_ = 32;
-    uint32_t                           tileH_ = 32;
-    uint32_t                           tileMaxPerTile_ = 1024;
-    uint32_t                           numTilesX_ = 0;
-    uint32_t                           numTilesY_ = 0;
 
     ComPtr<ID3D11Buffer> cbPerFrame_;
 

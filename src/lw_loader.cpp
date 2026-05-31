@@ -75,8 +75,8 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         int L = lodOrder[oi];
         MICROPROFILE_SCOPEI("Loader", "LOD", 0xff80a0ff);
         auto tLodStart = clk::now();
-        double tReadMs = 0, tLz4Ms = 0, tDecodeMs = 0;
-        double tPass1Ms = 0, tRankMs = 0, tCullMs = 0, tHeaderMs = 0, tBlocksMs = 0;
+        double tReadMs = 0, tLz4Ms = 0, tHeaderMs = 0;
+        double tRankMs = 0, tCullMs = 0, tBlocksMs = 0;
         uint64_t totalBlocks = 0;
         uint64_t bytesRead = 0, bytesLz4Raw = 0;
         LODWorld& lw = out.lods[L];
@@ -362,12 +362,11 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
 
         // Per-LOD timing summary.
         double tTotalMs = std::chrono::duration<double, std::milli>(clk::now() - tLodStart).count();
-        double tAccountedMs = tReadMs + tLz4Ms + tHeaderMs + tPass1Ms + tDecodeMs
-                            + tRankMs + tCullMs + tBlocksMs;
+        double tAccountedMs = tReadMs + tLz4Ms + tHeaderMs + tBlocksMs + tRankMs + tCullMs;
         double tOtherMs = tTotalMs - tAccountedMs;
-        std::printf("[Loader] LOD %d  total=%.1fms  read=%.1f  lz4=%.1f  hdr=%.1f  pass1=%.1f  pass3=%.1f  blocks=%.1f (%llu)  rank=%.1f  cull=%.1f  other=%.1f  ranked=%zu/%u  bytes=%.1f/%.1fMB\n",
-                    L, tTotalMs, tReadMs, tLz4Ms, tHeaderMs, tPass1Ms,
-                    tDecodeMs, tBlocksMs, (unsigned long long)totalBlocks,
+        std::printf("[Loader] LOD %d  total=%.1fms  read=%.1f  lz4=%.1f  hdr=%.1f  blocks=%.1f (%llu)  rank=%.1f  cull=%.1f  other=%.1f  ranked=%zu/%u  bytes=%.1f/%.1fMB\n",
+                    L, tTotalMs, tReadMs, tLz4Ms, tHeaderMs,
+                    tBlocksMs, (unsigned long long)totalBlocks,
                     tRankMs, tCullMs, tOtherMs,
                     ranks.size(), cc,
                     bytesRead / (1024.0*1024.0), bytesLz4Raw / (1024.0*1024.0));

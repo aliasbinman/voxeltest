@@ -405,8 +405,6 @@ void FrameControlsWindow()
         { "PolyAxis",      RenderTech::PolyAxis     },
         { "PolyAxisInst",  RenderTech::PolyAxisInstanced },
         { "HexSprite",     RenderTech::HexSprite    },
-        { "PointCS",       RenderTech::PointCS      },
-        { "PointCS_LDS",   RenderTech::PointCS_LDS  },
         { "PointCS_Block", RenderTech::PointCS_Block },
     };
     const int kTechCount = (int)(sizeof(kTechList) / sizeof(kTechList[0]));
