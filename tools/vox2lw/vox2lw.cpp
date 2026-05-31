@@ -110,6 +110,7 @@ static bool g_storeAo  = true;      // always on — per-face AO baked into .lw
 static bool g_bakeAo   = true;      // run hemisphere AO bake; off => default-bright AO
 static bool g_storeVisMask = false;
 static bool g_storeCellAo = false;
+static bool g_storeBlocks = true;   // emit 2x2x2 DiskBlock stream for PointCS_Block
 static uint64_t g_aoHisto[16] = {};
 static uint64_t g_aoCount = 0;
 
@@ -1311,6 +1312,53 @@ int main(int argc, char** argv)
                 }
             }
 
+            // ---- 2x2x2 BLOCK stream for PointCS_Block ----
+            if (g_storeBlocks) {
+                std::unordered_map<uint32_t, lw::DiskBlock> blockMap;
+                blockMap.reserve(bc.points.size() / 8 + 64);
+                for (const auto& p : bc.points) {
+                    uint32_t bx = (uint32_t)p.posX >> 1;
+                    uint32_t by = (uint32_t)p.posY >> 1;
+                    uint32_t bz = (uint32_t)p.posZ >> 1;
+                    uint32_t key = bx | (by << 8) | (bz << 16);
+                    uint32_t lx = (uint32_t)p.posX & 1u;
+                    uint32_t ly = (uint32_t)p.posY & 1u;
+                    uint32_t lz = (uint32_t)p.posZ & 1u;
+                    uint32_t vi = lx | (ly << 1) | (lz << 2);
+                    auto it = blockMap.find(key);
+                    if (it == blockMap.end()) {
+                        lw::DiskBlock b{};
+                        b.blockX = (uint8_t)bx;
+                        b.blockY = (uint8_t)by;
+                        b.blockZ = (uint8_t)bz;
+                        it = blockMap.emplace(key, b).first;
+                    }
+                    it->second.occupancy   |= (uint8_t)(1u << vi);
+                    it->second.palIdx[vi]   = p.palIdx;
+                }
+                std::vector<lw::DiskBlock> blocks;
+                blocks.reserve(blockMap.size());
+                for (auto& kv : blockMap) {
+                    lw::DiskBlock& b = kv.second;
+                    uint32_t sumR = 0, sumG = 0, sumB = 0, cnt = 0;
+                    for (int vi = 0; vi < 8; ++vi) {
+                        if (!(b.occupancy & (1u << vi))) continue;
+                        uint32_t c = bc.palette.empty() ? 0u : bc.palette[b.palIdx[vi]];
+                        sumR += (c >>  0) & 0xFFu;
+                        sumG += (c >>  8) & 0xFFu;
+                        sumB += (c >> 16) & 0xFFu;
+                        ++cnt;
+                    }
+                    uint32_t r  = cnt ? (sumR / cnt) : 0u;
+                    uint32_t g  = cnt ? (sumG / cnt) : 0u;
+                    uint32_t bl = cnt ? (sumB / cnt) : 0u;
+                    b.parentRgb565 = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (bl >> 3));
+                    blocks.push_back(b);
+                }
+                lw::Leb128PutU32(blob, (uint32_t)blocks.size());
+                if (!blocks.empty()) push(blocks.data(), blocks.size() * sizeof(lw::DiskBlock));
+            }
+
             // LZ4 on top (header + cluster mask + RLE+colors residual redundancy).
             std::vector<uint8_t> cblob;
             uint32_t writeBytes;
@@ -1318,6 +1366,7 @@ int main(int argc, char** argv)
             if (g_storeAo)      flags |= lw::kFlagAo;
             if (g_storeVisMask) flags |= lw::kFlagVisMask;
             if (g_storeCellAo)  flags |= lw::kFlagCellAo;
+            if (g_storeBlocks)  flags |= lw::kFlagBlocks;
             const int rawSize = (int)blob.size();
             const int cap = LZ4_compressBound(rawSize);
             cblob.resize((size_t)cap);

@@ -83,6 +83,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         lw.lodScale = 1u << L;
         lw.chunks.clear();
         lw.pointPool.clear();
+        lw.blockPool.clear();
         const uint32_t cc = lh[L].chunkCount;
         if (cc == 0) continue;
 
@@ -301,6 +302,24 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                 }
 
                 tPass1Ms += std::chrono::duration<double, std::milli>(clk::now() - tP1_0).count();
+
+                // ---- DiskBlock stream (PointCS_Block) ----
+                if (ce.flags & kFlagBlocks) {
+                    uint32_t blockCount = Leb128GetU32(p);
+                    size_t bytes = (size_t)blockCount * sizeof(DiskBlock);
+                    if (bytes > (size_t)(end - p)) { fclose(f); err = "block stream remaining"; return false; }
+                    rc.blockBase  = (uint32_t)lw.blockPool.size();
+                    rc.blockCount = blockCount;
+                    if (blockCount) {
+                        lw.blockPool.resize(lw.blockPool.size() + blockCount);
+                        memcpy(lw.blockPool.data() + rc.blockBase, p, bytes);
+                        p += bytes;
+                    }
+                } else {
+                    rc.blockBase  = 0;
+                    rc.blockCount = 0;
+                }
+
                 MICROPROFILE_SCOPEI("Loader", "Pass3", 0xffe080e0);
                 auto tD0 = clk::now();
                 // Pass 3: emit DiskPoints. visMask recomputed from chunk

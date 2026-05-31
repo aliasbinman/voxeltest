@@ -79,6 +79,34 @@ struct DiskPoint {
 static_assert(sizeof(DiskPoint) == 8, "");
 
 // =====================================================================
+// Disk-resident BLOCK (16 bytes). 2x2x2 voxels packed together.
+//   blockX/Y/Z   = chunk-local block coord (0..127 for 256-voxel chunk)
+//   occupancy    = 8-bit mask, bit i = voxel i present
+//                  voxel-i local offset = (i & 1, (i>>1)&1, (i>>2)&1)
+//   palIdx[i]    = chunk palette index for voxel i (valid where occupancy bit set)
+//   parentRgb565 = direct RGB565 of the coarser-LOD voxel covering this block's
+//                  centre. Used to LOD pop-hide via fade in the compute rasterizer.
+//                  Stored as colour (not palIdx) so the shader doesn't need
+//                  cross-LOD palette indirection.
+// Used by PointCS_Block path. Coexists with DiskPoint format.
+// =====================================================================
+#pragma pack(push, 1)
+struct DiskBlock {
+    uint8_t  blockX;
+    uint8_t  blockY;
+    uint8_t  blockZ;
+    uint8_t  occupancy;
+    uint8_t  palIdx[8];
+    uint16_t parentRgb565;
+    uint8_t  _pad[2];
+};
+#pragma pack(pop)
+static_assert(sizeof(DiskBlock) == 16, "");
+
+// kFlag for chunk blob: per-chunk DiskBlock stream is present at end.
+inline constexpr uint32_t kFlagBlocks = 1u << 5;
+
+// =====================================================================
 // Disk-resident cluster header (12 bytes).
 // bounds packs start/end XYZ in cluster-local voxel coords (5 bits each,
 // 30 bits total, top 2 spare). Used for tighter VFC than the nominal
@@ -343,6 +371,10 @@ struct RuntimeChunk {
     uint32_t slotIdx;      // index into LODWorld's ChunkInfo SRV; top byte
                            //  of startVertex during Draw.
 
+    // PointCS_Block: per-chunk DiskBlock range in this LOD's blockPool.
+    uint32_t blockBase;
+    uint32_t blockCount;
+
     // Per-chunk palette (uploaded once to per-LOD palette atlas).
     uint32_t paletteCount;
     uint32_t palette[kPaletteSize];
@@ -367,6 +399,8 @@ struct LODWorld {
     // poolBase serves both CPU+GPU. Loader fills; renderer can drop after
     // upload if it wants to.
     std::vector<DiskPoint> pointPool;
+    // Parallel block pool for PointCS_Block. Empty if .lw lacks block stream.
+    std::vector<DiskBlock> blockPool;
 };
 
 struct World {

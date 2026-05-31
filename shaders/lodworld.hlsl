@@ -311,17 +311,28 @@ float4 psmain_lw_bounds(VSBoundsOut i) : SV_Target
 cbuffer CBLwCS : register(b3)
 {
     uint2 gVwSize;             // viewport pixels
-    uint  gLwPointCount;       // points in this dispatch
+    uint  gLwPointCount;       // points in this dispatch (or block count for block path)
     uint  gTileMaxPerTile;     // capacity of per-tile list
     uint  gTileW;              // tile width (pixels)
     uint  gTileH;              // tile height (pixels)
     uint  gNumTilesX;
     uint  gNumTilesY;
+    float gLodFadeStart;       // world distance — fade to parent starts
+    float gLodFadeEnd;         // world distance — fully parent (LOD about to be replaced)
+    float2 _padCs;
+};
+
+struct LwBlock {
+    uint pack0;       // [0]=blockX [1]=blockY [2]=blockZ [3]=occupancy
+    uint pack1;       // 4 palIdx (bytes 0..3)
+    uint pack2;       // 4 palIdx (bytes 4..7)
+    uint pack3;       // [0..1]=parentRgb565  [2..3]=pad
 };
 
 RWTexture2D<uint>         gLwVisUav      : register(u0);
 RWBuffer<uint>            gTileCounter   : register(u1);
 RWStructuredBuffer<uint2> gTileList      : register(u2);
+StructuredBuffer<LwBlock> gLwBlocks      : register(t3);
 
 // ---- Phase 0 atomic pass: per-point → InterlockedMin direct to global visBuf.
 // Simpler than tile-binned variant; useful for perf comparison.
@@ -481,4 +492,76 @@ float4 psmain_lw_resolve(VLwResolveOut i) : SV_Target
     uint g = (rgb565 >>  5) & 0x3Fu;
     uint b =  rgb565        & 0x1Fu;
     return float4((float)r / 31.0, (float)g / 63.0, (float)b / 31.0, 1.0);
+}
+
+
+// ============================================================
+// PointCS_Block: 1 thread per 2x2x2 block. Up to 8 atomics.
+// Each block carries parentRgb565 (coarser-LOD voxel colour at
+// block centre) for distance-based pop-hide fade.
+// ============================================================
+[numthreads(64, 1, 1)]
+void csmain_lw_block_atomic(uint3 dt : SV_DispatchThreadID)
+{
+    uint bid = dt.x;
+    if (bid >= gLwPointCount) return;
+
+    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
+    LwBlock b = gLwBlocks[gLwDrawBase + bid];
+
+    uint bx  = (b.pack0 >>  0) & 0xFFu;
+    uint by  = (b.pack0 >>  8) & 0xFFu;
+    uint bz  = (b.pack0 >> 16) & 0xFFu;
+    uint occ = (b.pack0 >> 24) & 0xFFu;
+    uint parentRgb565 = b.pack3 & 0xFFFFu;
+
+    // LOD fade weight: 0 at block centre near, 1 at far → fully parent colour.
+    float3 blockCentre = ci.worldOrigin + (float3((float)bx, (float)by, (float)bz) * 2.0 + 1.0) * ci.lodScale;
+    float dist = length(blockCentre - gCamPos);
+    float fade = saturate((dist - gLodFadeStart) / max(gLodFadeEnd - gLodFadeStart, 1e-3));
+
+    uint pR = (parentRgb565 >> 11) & 0x1Fu;
+    uint pG = (parentRgb565 >>  5) & 0x3Fu;
+    uint pB =  parentRgb565        & 0x1Fu;
+    float3 parentCol = float3((float)pR / 31.0, (float)pG / 63.0, (float)pB / 31.0);
+
+    [unroll] for (uint i = 0; i < 8; ++i) {
+        if (((occ >> i) & 1u) == 0u) continue;
+        uint palIdx = (i < 4u) ? ((b.pack1 >> (i * 8u)) & 0xFFu)
+                                : ((b.pack2 >> ((i - 4u) * 8u)) & 0xFFu);
+        uint lx = (i >> 0) & 1u;
+        uint ly = (i >> 1) & 1u;
+        uint lz = (i >> 2) & 1u;
+        float3 local = float3((float)(bx * 2u + lx), (float)(by * 2u + ly), (float)(bz * 2u + lz)) + 0.5;
+        float3 world = ci.worldOrigin + local * ci.lodScale;
+
+        float4 clip = mul(float4(world, 1.0), gViewProj);
+        if (clip.w <= 0.0) continue;
+        float3 ndc = clip.xyz / clip.w;
+        if (ndc.x < -1.0 || ndc.x > 1.0 ||
+            ndc.y < -1.0 || ndc.y > 1.0 ||
+            ndc.z <  0.0 || ndc.z > 1.0) continue;
+        int2 pix;
+        pix.x = (int)((ndc.x * 0.5 + 0.5) * (float)gVwSize.x);
+        pix.y = (int)((-ndc.y * 0.5 + 0.5) * (float)gVwSize.y);
+        if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
+            pix.y < 0 || pix.y >= (int)gVwSize.y) continue;
+
+        uint colPck = gLwPalette[ci.paletteBase + palIdx];
+        float fr = (float)((colPck >>  0) & 0xFFu) / 255.0;
+        float fg = (float)((colPck >>  8) & 0xFFu) / 255.0;
+        float fb = (float)((colPck >> 16) & 0xFFu) / 255.0;
+        float3 fineCol = float3(fr, fg, fb);
+
+        float3 blended = lerp(fineCol, parentCol, fade);
+        uint rR = (uint)(saturate(blended.r) * 31.0);
+        uint rG = (uint)(saturate(blended.g) * 63.0);
+        uint rB = (uint)(saturate(blended.b) * 31.0);
+        uint rgb565 = (rR << 11) | (rG << 5) | rB;
+
+        uint depthU16 = (uint)(saturate(ndc.z) * 65535.0);
+        uint invDepth = 0xFFFFu - depthU16;
+        uint packed   = (invDepth << 16) | rgb565;
+        InterlockedMin(gLwVisUav[pix], packed);
+    }
 }

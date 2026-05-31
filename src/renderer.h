@@ -28,6 +28,7 @@ enum class RenderTech : int {
     HexSprite         = 3,
     PointCS           = 13,   // Schütz-style compute rasterizer (global atomic min)
     PointCS_LDS       = 14,   // tile-binned + LDS atomic (phase 2)
+    PointCS_Block     = 15,   // 2x2x2 block layout + LOD pop-hide fade
 };
 
 enum class PointLighting : int { Simple = 0, Complex = 1 };
@@ -247,8 +248,11 @@ private:
         ComPtr<ID3D11ShaderResourceView> chunkInfoSrv;
         ComPtr<ID3D11Buffer>             paletteSb;
         ComPtr<ID3D11ShaderResourceView> paletteSrv;
+        ComPtr<ID3D11Buffer>             blockSb;    // DiskBlock pool (PointCS_Block)
+        ComPtr<ID3D11ShaderResourceView> blockSrv;
         uint32_t slotCount = 0;
         uint32_t pointCount = 0;
+        uint32_t blockCount = 0;
         uint64_t bytes = 0;
     };
     LwGpu lwGpu_[lw::kLodCount];
@@ -275,9 +279,10 @@ private:
     ComPtr<ID3D11UnorderedAccessView>  visBufUav_;
     ComPtr<ID3D11ShaderResourceView>   visBufSrv_;
     ComPtr<ID3D11Buffer>               cbLwCS_;        // tile params + dispatch count
-    ComPtr<ID3D11ComputeShader>        csLwAtomic_;    // (unused — bin replaces)
-    ComPtr<ID3D11ComputeShader>        csLwBin_;       // phase 2 bin pass
-    ComPtr<ID3D11ComputeShader>        csLwTileRaster_;// phase 2 raster pass
+    ComPtr<ID3D11ComputeShader>        csLwAtomic_;    // PointCS (global atomic min)
+    ComPtr<ID3D11ComputeShader>        csLwBin_;       // PointCS_LDS bin pass
+    ComPtr<ID3D11ComputeShader>        csLwTileRaster_;// PointCS_LDS tile-raster pass
+    ComPtr<ID3D11ComputeShader>        csLwBlock_;     // PointCS_Block (2x2x2 blocks + LOD fade)
     ComPtr<ID3D11VertexShader>         vsLwResolve_;
     ComPtr<ID3D11PixelShader>          psLwResolve_;
     // Tile binning buffers (recreated on resize).
