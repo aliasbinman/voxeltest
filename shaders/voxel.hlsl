@@ -42,6 +42,12 @@ cbuffer cbPerFrame : register(b0)
     float    gRoughness;
     float    gColorizeClusters;
     float    gGridSize;
+    // ---- CPU-precomputed derived values to keep shaders free of redundant math ----
+    float2   gInvScreenSize;   // 1/W, 1/H
+    float    gAspect;          // W/H
+    float    gInvAspect;       // H/W
+    float    gAspectTanFov;    // gAspect * gTanHalfFovY
+    float3   _padPC;
 };
 
 // Shared lighting (ApplyFog, SampleShadow, SampleAmbientCubeTriplanar,
@@ -99,12 +105,11 @@ RWTexture2D<float>  gSplatFinalDepthUav : register(u2);
 // World-space ray dir for pixel center (camera basis; avoids invVP).
 float3 PixelWorldDir(int2 pix, int W, int H)
 {
-    float2 ndc;
-    ndc.x = ((float)pix.x + 0.5) / (float)W * 2.0 - 1.0;
-    ndc.y = 1.0 - ((float)pix.y + 0.5) / (float)H * 2.0;
-    float aspect = (float)W / (float)H;
-    float3 viewDir = float3(ndc.x * aspect * gTanHalfFovY,
-                            ndc.y           * gTanHalfFovY,
+    float2 uv = (float2(pix) + 0.5) * gInvScreenSize;
+    float ndcX = uv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uv.y * 2.0;
+    float3 viewDir = float3(ndcX * gAspectTanFov,
+                            ndcY * gTanHalfFovY,
                             1.0);
     return normalize(gCamRight   * viewDir.x +
                      gCamUp      * viewDir.y +
@@ -115,11 +120,11 @@ float3 PixelWorldDir(int2 pix, int W, int H)
 float3 ReconstructNeighborWorld(int2 sp, float zN, int W, int H)
 {
     float viewZ = gNearZ / zN;
-    float aspect = (float)W / (float)H;
-    float ndcX = ((float)sp.x + 0.5) / (float)W * 2.0 - 1.0 - gJitter.x;
-    float ndcY = 1.0 - ((float)sp.y + 0.5) / (float)H * 2.0 - gJitter.y;
-    float viewX = ndcX * aspect * gTanHalfFovY * viewZ;
-    float viewY = ndcY *          gTanHalfFovY * viewZ;
+    float2 uv = (float2(sp) + 0.5) * gInvScreenSize;
+    float ndcX = uv.x * 2.0 - 1.0 - gJitter.x;
+    float ndcY = 1.0 - uv.y * 2.0 - gJitter.y;
+    float viewX = ndcX * gAspectTanFov * viewZ;
+    float viewY = ndcY * gTanHalfFovY  * viewZ;
     return gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
 }
 
@@ -235,10 +240,12 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
         float4 clipHit = mul(float4(hit, 1.0), gViewProj);
         gSplatFinalDepthUav[pix] = saturate(clipHit.z / max(clipHit.w, 1e-6));
     } else {
-        // No AABB hit. Keep depth from nearest neighbour (if any) so the post
-        // pass has continuous Z; signal bg via alpha=0.
+        // No AABB hit. Match colour: leave depth at 0 (sky) so depth + colour
+        // dilation regions stay in sync. (Previously this wrote a neighbour's
+        // depth as a "continuous Z" fallback, but that depth-extends past the
+        // colour-filled region.)
         gSplatFinalUav[pix]      = float4(0, 0, 0, 0);
-        gSplatFinalDepthUav[pix] = fbHave ? fbZ : 0.0;
+        gSplatFinalDepthUav[pix] = 0.0;
     }
 }
 

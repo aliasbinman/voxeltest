@@ -320,6 +320,11 @@ cbuffer CBLwCS : register(b3)
 };
 
 RWTexture2D<uint>         gLwVisUav      : register(u0);
+// PointCS_Block → splat path UAVs (used by csmain_lw_block_splat_worklist).
+// Bound at u1..u3 so they don't alias the u0 used by other pass1/pass2 shaders.
+RWTexture2D<float4> gLwSplatColorUav : register(u1); // RGBA8 albedo + alpha = EncodeSplatAlpha
+RWTexture2D<uint>   gLwSplatMaskUav  : register(u2); // visMask(6) + 6 face AO(24) + parity(1)
+RWTexture2D<float>  gLwSplatDepthUav : register(u3); // reverse-Z (0..1)
 // Split SoA blocks:
 //   gLwBlockPos at t3: 4B/block — pack0 = bx|by|bz|occ (low..high bytes)
 //   gLwBlockCol at t4: 8B/block — pack1 = palIdx[0..3], pack2 = palIdx[4..7]
@@ -332,6 +337,22 @@ Texture2D<uint> gLwDepthSrv : register(t5);
 // Worklist for single-dispatch pass1. Sorted ascending by .w (firstThread).
 //   x = slot, y = blockBaseGlobal, z = count, w = firstThread (cumulative).
 StructuredBuffer<uint4> gLwWorkItems : register(t6);
+
+// PointCS A/B per-voxel expanded points. Packed: x|y<<8|z<<16|palIdx<<24.
+StructuredBuffer<uint> gLwBlockPoints : register(t7);
+
+// ---- Linear-depth encoding for the atomic-min visibility buffer ----
+// Linear view-Z mapped to uint: 0 at near plane, kLinDepthMax at 100km.
+// Uniform precision (~23.3 µm per uint) → constant tolerance in pass2 works
+// at any depth. Smaller uint = closer → atomic-min picks nearest directly.
+// Sky / unwritten = 0xFFFFFFFFu sentinel (set by clear).
+static const float kLinDepthFar  = 100000.0;
+static const float kLinDepthMaxF = 4294967294.0; // 0xFFFFFFFE
+static const float kLinDepthScale = kLinDepthMaxF / kLinDepthFar;
+uint EncodeLinDepth(float viewZ)
+{
+    return (uint)clamp(viewZ * kLinDepthScale, 0.0, kLinDepthMaxF);
+}
 
 // Resolve PS bindings (two-pass): t3 = depth (R32_UINT), t4 = color (R16_UINT).
 Texture2D<uint> gLwTpDepthSrv : register(t3);
@@ -427,9 +448,8 @@ void csmain_lw_block_depth_worklist(uint3 dt : SV_DispatchThreadID)
         if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
             pix.y < 0 || pix.y >= (int)gVwSize.y) continue;
 
-        uint scaledZ    = (uint)(saturate(ndc.z) * 4294967294.0);
-        uint invDepth32 = 0xFFFFFFFEu - scaledZ;
-        InterlockedMin(gLwVisUav[pix], invDepth32);
+        uint linD = EncodeLinDepth(clip.w);
+        InterlockedMin(gLwVisUav[pix], linD);
     }
 }
 
@@ -490,10 +510,10 @@ void csmain_lw_block_color_worklist(uint3 dt : SV_DispatchThreadID)
         if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
             pix.y < 0 || pix.y >= (int)gVwSize.y) continue;
 
-        uint myScaled   = (uint)(saturate(ndc.z) * 4294967294.0);
-        uint myInvDepth = 0xFFFFFFFEu - myScaled;
-        uint winDepth   = gLwDepthSrv.Load(int3(pix, 0));
-        if (myInvDepth != winDepth) continue;
+        uint myLin    = EncodeLinDepth(clip.w);
+        uint winDepth = gLwDepthSrv.Load(int3(pix, 0));
+        const uint kLinDepthSlop = 64u; // ~1.5 mm tolerance for FP non-det
+        if (myLin > winDepth + kLinDepthSlop) continue;
 
         uint rgb565;
         if (gMode == 4u) {
@@ -529,3 +549,160 @@ void csmain_lw_block_color_worklist(uint3 dt : SV_DispatchThreadID)
     }
 }
 
+// ============================================================
+// PointCS_Block pass2 → splat-format output (for csSplat_ dilation/lighting).
+// Same gid→item lookup. Writes RGBA8 colour, R32 mask with synthetic visMask
+// (0x3F = all faces visible) + per-face AO=15 + cluster parity, and reverse-Z
+// linear depth — formats that the existing splatCS dilate shader consumes.
+// ============================================================
+[numthreads(64, 1, 1)]
+void csmain_lw_block_splat_worklist(uint3 dt : SV_DispatchThreadID)
+{
+    uint gid = dt.x;
+    if (gid >= gLwPointCount) return;
+
+    uint lo = 0u, hi = gLwNumWorkItems;
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (gLwWorkItems[mid].w <= gid) lo = mid;
+        else                            hi = mid;
+    }
+    uint4 item = gLwWorkItems[lo];
+    uint slot        = item.x;
+    uint blockBase   = item.y;
+    uint count       = item.z;
+    uint firstThread = item.w;
+    if (gid - firstThread >= count) return;
+
+    LwChunkInfo ci = gLwChunkInfos[slot];
+    uint  pack0 = gLwBlockPos[blockBase + (gid - firstThread)];
+    uint2 cols  = gLwBlockCol[blockBase + (gid - firstThread)];
+
+    uint bx  = (pack0 >>  0) & 0xFFu;
+    uint by  = (pack0 >>  8) & 0xFFu;
+    uint bz  = (pack0 >> 16) & 0xFFu;
+    uint occ = (pack0 >> 24) & 0xFFu;
+
+    // Synthetic mask: all 6 faces visible, all face AOs = 15 (fully lit).
+    // Splat dilate shader picks dominant face per neighbour. Without per-face
+    // data, treating every face as visible + max AO gives plausible shading.
+    const uint kSyntheticMaskBase =
+        0x3Fu                            // visMask bits 0..5
+        | (0xFu <<  6) | (0xFu << 10)    // face0,1 AO nibbles
+        | (0xFu << 14) | (0xFu << 18)    // face2,3
+        | (0xFu << 22) | (0xFu << 26);   // face4,5
+
+    [unroll] for (uint i = 0; i < 8; ++i) {
+        if (((occ >> i) & 1u) == 0u) continue;
+        uint palIdx = (i < 4u) ? ((cols.x >> (i * 8u)) & 0xFFu)
+                                : ((cols.y >> ((i - 4u) * 8u)) & 0xFFu);
+        uint lx = (i >> 0) & 1u;
+        uint ly = (i >> 1) & 1u;
+        uint lz = (i >> 2) & 1u;
+        uint vx = bx * 2u + lx;
+        uint vy = by * 2u + ly;
+        uint vz = bz * 2u + lz;
+        float3 local = float3((float)vx, (float)vy, (float)vz) + 0.5;
+        float3 world = ci.worldOrigin + local * ci.lodScale;
+
+        float4 clip = mul(float4(world, 1.0), gViewProj);
+        if (clip.w <= 0.0) continue;
+        float3 ndc = clip.xyz / clip.w;
+        if (ndc.x < -1.0 || ndc.x > 1.0 ||
+            ndc.y < -1.0 || ndc.y > 1.0 ||
+            ndc.z <  0.0 || ndc.z > 1.0) continue;
+        int2 pix;
+        pix.x = (int)((ndc.x * 0.5 + 0.5) * (float)gVwSize.x);
+        pix.y = (int)((-ndc.y * 0.5 + 0.5) * (float)gVwSize.y);
+        if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
+            pix.y < 0 || pix.y >= (int)gVwSize.y) continue;
+
+        // Linear-depth winner gate. Slop tuned for FP non-determinism between
+        // pass1 + pass2 shaders (~few uint units), well under the minimum
+        // gap between any two real voxels at the same pixel.
+        uint myLin    = EncodeLinDepth(clip.w);
+        uint winDepth = gLwDepthSrv.Load(int3(pix, 0));
+        const uint kLinDepthSlop = 64u; // ~1.5 mm
+        if (myLin > winDepth + kLinDepthSlop) continue;
+
+        // Albedo from palette.
+        uint colPck = gLwPalette[ci.paletteBase + palIdx];
+        float r = (float)( colPck         & 0xFFu) / 255.0;
+        float g = (float)((colPck >>  8u) & 0xFFu) / 255.0;
+        float b = (float)((colPck >> 16u) & 0xFFu) / 255.0;
+
+        // Cluster parity (32 voxels per cluster = vx>>5 etc).
+        uint cx = vx >> 5u;
+        uint cy = vy >> 5u;
+        uint cz = vz >> 5u;
+        uint parity = (cx + cy + cz) & 1u;
+
+        // Splat alpha encoding (mirror of EncodeSplatAlpha in lodworld.hlsl VS).
+        // bit 7 marker, bits 6:4 lodIdx (3 bits), bits 3:0 AO (4 bits, 15=full).
+        uint a8 = 0x80u | ((gLwLodIdx & 7u) << 4) | 0xFu;
+        float alpha = (float)a8 / 255.0;
+
+        // Mask channel: synthetic visMask+AO + parity in bit 30.
+        uint mask = kSyntheticMaskBase | (parity << 30u);
+
+        gLwSplatColorUav[pix] = float4(r, g, b, alpha);
+        gLwSplatMaskUav[pix]  = mask;
+        gLwSplatDepthUav[pix] = saturate(ndc.z); // reverse-Z (near=1, far=0)
+    }
+}
+
+// ============================================================
+// Hardware draw-points A/B: VS+PS rasterized point primitives.
+// VS fetches packed voxel from gLwBlockPoints (SV_VertexID + gLwDrawBase),
+// projects to clip space. PS writes flat colour with depth-tested 1-pixel point.
+// ============================================================
+struct VSOutBlockPt {
+    float4 svpos  : SV_Position;
+    nointerpolation uint3 vxyz : COLOR0;
+    nointerpolation uint  palIdx : COLOR1;
+};
+
+VSOutBlockPt vsmain_lw_blockpoint(uint vid : SV_VertexID)
+{
+    uint slot = gLwSlot;
+    LwChunkInfo ci = gLwChunkInfos[slot];
+    uint pack = gLwBlockPoints[gLwDrawBase + vid];
+
+    uint vx = pack & 0xFFu;
+    uint vy = (pack >>  8) & 0xFFu;
+    uint vz = (pack >> 16) & 0xFFu;
+    uint palIdx = (pack >> 24) & 0xFFu;
+
+    float3 local = float3((float)vx, (float)vy, (float)vz) + 0.5;
+    float3 world = ci.worldOrigin + local * ci.lodScale;
+
+    VSOutBlockPt o;
+    o.svpos = mul(float4(world, 1.0), gViewProj);
+    o.vxyz  = uint3(vx, vy, vz);
+    o.palIdx = palIdx;
+    return o;
+}
+
+float4 psmain_lw_blockpoint(VSOutBlockPt i) : SV_Target
+{
+    if (gMode == 4u) {
+        static const float3 kLodTints[5] = {
+            float3(1.00, 0.40, 0.40), float3(1.00, 0.80, 0.30),
+            float3(0.40, 1.00, 0.40), float3(0.40, 0.70, 1.00),
+            float3(0.90, 0.40, 1.00),
+        };
+        float3 tint = kLodTints[min(gLodIdx, 4u)];
+        uint cx = i.vxyz.x >> 5u;
+        uint cy = i.vxyz.y >> 5u;
+        uint cz = i.vxyz.z >> 5u;
+        uint parity = (cx + cy + cz) & 1u;
+        float check = (parity == 0u) ? 0.55 : 1.0;
+        return float4(saturate(tint * check), 1.0);
+    }
+    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
+    uint colPck = gLwPalette[ci.paletteBase + i.palIdx];
+    float3 col = float3((float)( colPck         & 0xFFu),
+                        (float)((colPck >>  8u) & 0xFFu),
+                        (float)((colPck >> 16u) & 0xFFu)) / 255.0;
+    return float4(col, 1.0);
+}

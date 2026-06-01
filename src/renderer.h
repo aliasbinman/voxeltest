@@ -81,11 +81,13 @@ struct DrawSceneParams
     bool shadowBlur = false;
     bool lwShowBounds = false;
     bool lwPolyAxis = false;
+    bool csUsePointList = false; // A/B: dispatch per-voxel point CS instead of per-block
     bool skipBackbufferClear = false; // post pass writes every pixel
     float godrayStrength = 0.55f;
     float godrayAngleDeg = 10.0f; // angular extent of texture; real sun = 0.5° (tiny), 10° = nice halo
     float godrayEmaAlpha = 0.15f; // 1 = no smoothing, lower = more temporal damping
     float godrayTint[3] = {1.00f, 0.85f, 0.45f};
+    bool  godrayAniso = false;    // false = 24-tap line blur, true = SampleGrad anisotropic
 };
 
 class Renderer
@@ -104,6 +106,9 @@ public:
     // Use these when loading LODs incrementally; render starts once any LOD is up.
     void PrepLwWorld(const lw::World& w);
     bool UploadLwLodOnly(const lw::World& w, int L);
+    // Call once after a batch of UploadLwLodOnly calls (a stream cycle's worth
+    // of LOD updates). Rebuilds the combined-LOD GPU buffers if invalidated.
+    bool FinalizeLwUploads();
     void ClearLwWorld();
     bool HasLwWorld() const
     {
@@ -250,9 +255,13 @@ private:
     ComPtr<ID3D11Texture2D> splatColorTex_;
     ComPtr<ID3D11RenderTargetView> splatColorRtv_;
     ComPtr<ID3D11ShaderResourceView> splatColorSrv_;
+    ComPtr<ID3D11UnorderedAccessView> splatColorUav_; // PointCS_Block → splat path
     ComPtr<ID3D11Texture2D> splatDepthTex_;
     ComPtr<ID3D11DepthStencilView> splatDsv_;
     ComPtr<ID3D11ShaderResourceView> splatDepthSrv_;
+    ComPtr<ID3D11UnorderedAccessView> splatDepthUavF_; // R32F UAV of splatBlockDepthTex_
+    ComPtr<ID3D11Texture2D> splatBlockDepthTex_;       // R32F, UAV+SRV for block-CS path
+    ComPtr<ID3D11ShaderResourceView> splatBlockDepthSrv_;
     ComPtr<ID3D11DepthStencilState> dsAlwaysWrite_;
     ComPtr<ID3D11Texture2D> splatFinalTex_;
     ComPtr<ID3D11UnorderedAccessView> splatFinalUav_;
@@ -271,6 +280,7 @@ private:
     ComPtr<ID3D11Texture2D> splatMaskTex_;
     ComPtr<ID3D11RenderTargetView> splatMaskRtv_;
     ComPtr<ID3D11ShaderResourceView> splatMaskSrv_;
+    ComPtr<ID3D11UnorderedAccessView> splatMaskUav_; // PointCS_Block → splat path
     ComPtr<ID3D11PixelShader> psSplatComposite_;
 
     ComPtr<ID3D11RasterizerState> rsSolid_;
@@ -324,6 +334,8 @@ private:
     ComPtr<ID3D11ShaderResourceView> godraySrv_[3];
     ComPtr<ID3D11PixelShader> psGodrayMark_;
     ComPtr<ID3D11PixelShader> psGodrayBlur_;
+    ComPtr<ID3D11PixelShader> psGodrayBlurAniso_; // SampleGrad anisotropic variant
+    ComPtr<ID3D11SamplerState> anisoSamp_;        // wrap, max-aniso 16
     ComPtr<ID3D11Buffer> cbGodray_;
     uint32_t godrayCurrIdx_ = 1; // most recent blur write target
     uint32_t taaHistIdx_ = 0;
@@ -345,12 +357,39 @@ private:
         ComPtr<ID3D11ShaderResourceView> blockPosSrv;
         ComPtr<ID3D11Buffer> blockColSb; // BlockCol pool (8B/block: palIdx[8])
         ComPtr<ID3D11ShaderResourceView> blockColSrv;
+        ComPtr<ID3D11Buffer> blockPointSb; // PointCS A/B: per-voxel uint32_t list
+        ComPtr<ID3D11ShaderResourceView> blockPointSrv;
         uint32_t slotCount = 0;
         uint32_t pointCount = 0;
         uint32_t blockCount = 0;
+        uint32_t blockPointCount = 0;
         uint64_t bytes = 0;
     };
     LwGpu lwGpu_[lw::kLodCount];
+
+    // Combined LwGpu: all per-LOD pools concatenated into single SRVs so the
+    // worklist pass1/pass2 can run as ONE Dispatch across all LODs (eliminating
+    // per-LOD UAV barriers). Rebuilt after every UploadLwLodOnly.
+    struct LwGpuCombined
+    {
+        ComPtr<ID3D11Buffer> chunkInfoSb;
+        ComPtr<ID3D11ShaderResourceView> chunkInfoSrv;
+        ComPtr<ID3D11Buffer> paletteSb;
+        ComPtr<ID3D11ShaderResourceView> paletteSrv;
+        ComPtr<ID3D11Buffer> blockPosSb;
+        ComPtr<ID3D11ShaderResourceView> blockPosSrv;
+        ComPtr<ID3D11Buffer> blockColSb;
+        ComPtr<ID3D11ShaderResourceView> blockColSrv;
+        ComPtr<ID3D11Buffer> blockPointSb;
+        ComPtr<ID3D11ShaderResourceView> blockPointSrv;
+        uint32_t lodSlotBase[lw::kLodCount]   = {};
+        uint32_t lodBlockBase[lw::kLodCount]  = {};
+        uint32_t lodPointBase[lw::kLodCount]  = {};
+        uint32_t lodPaletteBase[lw::kLodCount]= {};
+        bool     valid = false;
+    };
+    LwGpuCombined lwGpuC_;
+    bool RebuildCombinedLwGpu();
     bool lwHasWorld_ = false;
     lw::World lwWorld_;
 
@@ -379,7 +418,10 @@ private:
     ComPtr<ID3D11ShaderResourceView> visColorSrv_;
     ComPtr<ID3D11Buffer> cbLwCS_;
     ComPtr<ID3D11ComputeShader> csLwBlockDepthWorklist_; // pass1
-    ComPtr<ID3D11ComputeShader> csLwBlockColorWorklist_; // pass2
+    ComPtr<ID3D11ComputeShader> csLwBlockColorWorklist_; // pass2 → R16 RGB565
+    ComPtr<ID3D11ComputeShader> csLwBlockSplatWorklist_; // pass2 → splat-format targets
+    ComPtr<ID3D11VertexShader>  vsLwBlockPoint_; // A/B: HW point primitive rasterizer
+    ComPtr<ID3D11PixelShader>   psLwBlockPoint_;
     // Per-LOD worklist buffer (uint4 per item: slot, blockBaseGlobal, count, firstThread).
     ComPtr<ID3D11Buffer> worklistSb_;
     ComPtr<ID3D11ShaderResourceView> worklistSrv_;

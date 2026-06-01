@@ -440,6 +440,12 @@ struct RuntimeChunk
     // that cluster. Used by per-cluster cull + LOD on the block dispatch path.
     uint32_t clusterBlockFirst[kClustersPerChunk];
     uint32_t clusterBlockCount[kClustersPerChunk];
+    // PointCS (A/B): per-voxel expanded point list. 4B per voxel packed as
+    // x|y<<8|z<<16|palIdx<<24 (chunk-local voxel coords, 0..255).
+    uint32_t blockPointBase;
+    uint32_t blockPointCount;
+    uint32_t clusterPointFirst[kClustersPerChunk];
+    uint32_t clusterPointCount[kClustersPerChunk];
 
     // Per-chunk palette (uploaded once to per-LOD palette atlas).
     uint32_t paletteCount;
@@ -471,6 +477,9 @@ struct LODWorld
     // Same index into both. Split for bandwidth: pass 1 only needs BlockPos.
     std::vector<BlockPos> blockPosPool;
     std::vector<BlockCol> blockColPool;
+    // PointCS (A/B): per-voxel expanded points, 4B each. Block voxels exploded
+    // out at load time into a flat list for the simpler 1-thread-per-voxel CS.
+    std::vector<uint32_t> blockPointPool;
 };
 
 struct World

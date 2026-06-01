@@ -162,6 +162,7 @@ struct AppState
     float godrayStrength = 0.55f;
     float godrayAngleDeg = 10.0f;
     float godrayEmaAlpha = 0.15f;
+    bool  godrayAniso = false; // false = 24-tap line blur, true = SampleGrad anisotropic
     float lastGodrayCamPos[3] = {0, 0, 0};
     float godrayTint[3] = {1.00f, 0.85f, 0.45f};
     bool rmbDown = false;
@@ -175,6 +176,7 @@ struct AppState
     int activeAdapterIdx = -1;                 // adapter actually in use this run
     bool lwShowBounds = false;                 // debug: draw per-chunk AABBs
     bool lwPolyAxis = false;                   // render cube faces instead of splats
+    bool csUsePointList = false;               // A/B: per-voxel point CS vs per-block CS
     // Saved camera views. view1 = auto-fit from world AABB (legacy default,
     // captured on first load). view2 = curated viewpoint hardcoded below.
     float view1Pos[3] = {0.0f, 0.0f, 0.0f};
@@ -610,6 +612,7 @@ void FrameControlsWindow()
             ImGui::ColorEdit3("Clear color", g_app.bgColor);
             ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
             ImGui::Checkbox("LW: PolyAxis (cube faces, per-face AO)", &g_app.lwPolyAxis);
+            ImGui::Checkbox("LW: PointCS A/B — per-voxel CS (vs per-block)", &g_app.csUsePointList);
             {
                 float rs = g_app.streamRadiusScale.load();
                 if (ImGui::SliderFloat("Stream radius", &rs, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic))
@@ -690,6 +693,7 @@ void FrameControlsWindow()
             ImGui::SliderFloat("Strength", &g_app.godrayStrength, 0.0f, 2.0f, "%.2f");
             ImGui::SliderFloat("Angle (deg)", &g_app.godrayAngleDeg, 0.05f, 30.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("Temporal blend", &g_app.godrayEmaAlpha, 0.02f, 1.0f, "%.2f (1 = none)");
+            ImGui::Checkbox("Anisotropic blur (SampleGrad)", &g_app.godrayAniso);
             ImGui::ColorEdit3("Tint", g_app.godrayTint);
             ImGui::Separator();
             ImGui::TextUnformatted("Mark (pre-blur):");
@@ -905,6 +909,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                 }
                 firstCycle = false;
             }
+            // Wait for main to consume any previous-cycle uploads still pending
+            // (flag==0). Resetting flags too early loses the last LODs of the
+            // previous cycle and they never get uploaded.
+            for (int L = 0; L < lw::kLodCount; ++L)
+            {
+                while (g_app.lodReadyFlag[L].load() == 0 && !g_app.loaderQuit.load())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             // Reset per-LOD ready flags so main waits for the new load.
             for (int L = 0; L < lw::kLodCount; ++L)
                 g_app.lodReadyFlag[L].store(-1);
@@ -1039,6 +1051,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                 g_app.everLoaded = true;
                 g_app.sceneReady = true;
                 g_app.loadStatus = "Streaming...";
+                // First load placed the camera at View2; nudge the streamer so
+                // the *next* cycle uses this camera position (rather than the
+                // scene-center fallback used by firstCycle).
+                g_app.lastTriggerCam[0] = -1e9f;
+                g_app.lastTriggerCam[1] = -1e9f;
+                g_app.lastTriggerCam[2] = -1e9f;
             }
             {
                 std::lock_guard<std::mutex> lk(g_app.lodMu[L]);
@@ -1046,6 +1064,23 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             }
             g_app.lodReadyFlag[L].store(1);
             break; // one LOD per frame
+        }
+
+        // Combined-LOD GPU rebuild deferred until no more pending LOD uploads
+        // remain. Avoids stuttering during streaming (each LOD upload would
+        // otherwise rebuild ~100+ MB of concatenated SRVs).
+        {
+            bool anyPending = false;
+            for (int L = 0; L < lw::kLodCount; ++L)
+            {
+                if (g_app.lodReadyFlag[L].load() == 0)
+                {
+                    anyPending = true;
+                    break;
+                }
+            }
+            if (!anyPending && g_app.sceneReady)
+                g_app.renderer.FinalizeLwUploads();
         }
 
         // Loader thread completion: free CPU world struct + finalize status.
@@ -1168,6 +1203,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.heightFogStart = g_app.heightFogStart;
             ps.godrayStrength = g_app.godrayStrength;
             ps.godrayAngleDeg = g_app.godrayAngleDeg;
+            ps.godrayAniso = g_app.godrayAniso;
             {
                 // Boost alpha (less smoothing) on translation. Rotation is
                 // fine — sun stays at same world dir, just on different screen
@@ -1213,6 +1249,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.shadowBlur = g_app.shadowBlur;
             ps.lwShowBounds = g_app.lwShowBounds;
             ps.lwPolyAxis = g_app.lwPolyAxis;
+            ps.csUsePointList = g_app.csUsePointList;
             ps.exposure = exp2f(g_app.exposureEV);
             ps.roughness = g_app.roughness;
             if (g_app.renderer.HasLwWorld())

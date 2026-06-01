@@ -42,6 +42,11 @@ cbuffer cbPerFrame : register(b0)
     float    gRoughness;
     float    gColorizeClusters;
     float    gGridSize;
+    float2   gInvScreenSize;   // 1/W, 1/H
+    float    gAspect;          // W/H
+    float    gInvAspect;       // H/W
+    float    gAspectTanFov;    // gAspect * gTanHalfFovY
+    float3   _padPC;
 };
 
 // ---------------- Fullscreen triangle for blit-style passes ----------------
@@ -93,12 +98,12 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     int2 pix = (int2)i.pos.xy;
     int W = (int)gScreenSize.x;
     int H = (int)gScreenSize.y;
-    float2 currUv = (float2(pix) + 0.5) / float2((float)W, (float)H);
+    float2 currUv = (float2(pix) + 0.5) * gInvScreenSize;
     currUv += float2(gJitter.x * 0.5, -gJitter.y * 0.5);
     float4 curSample = gTaaScene.SampleLevel(gTaaSamp, currUv, 0);
     float3 curC = curSample.rgb;
     float outAlpha = curSample.a;
-    int2 jPix = clamp(int2(currUv * float2((float)W, (float)H)),
+    int2 jPix = clamp(int2(currUv * gScreenSize),
                       int2(0, 0), int2(W - 1, H - 1));
     float  d  = gTaaDepth.Load(int3(jPix, 0));
     if (d <= 0.0) {
@@ -106,11 +111,10 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     }
 
     float viewZ = gNearZ / d;
-    float aspect = (float)W / (float)H;
     float ndcX = currUv.x * 2.0 - 1.0;
     float ndcY = 1.0 - currUv.y * 2.0;
-    float viewX = ndcX * aspect * gTanHalfFovY * viewZ;
-    float viewY = ndcY *          gTanHalfFovY * viewZ;
+    float viewX = ndcX * gAspectTanFov * viewZ;
+    float viewY = ndcY * gTanHalfFovY  * viewZ;
     float3 world = gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
 
     float4 prevClip = mul(float4(world, 1.0), gPrevViewProj);
@@ -147,7 +151,7 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     prevC += gTaaHist.SampleLevel(gTaaSamp, float2(tp12.x, tp3.y ), 0).rgb * k4;
     prevC /= kSum;
 
-    float2 px = 1.0 / float2((float)W, (float)H);
+    float2 px = gInvScreenSize;
     float3 nMin = curC;
     float3 nMax = curC;
     float3 nMean = curC;
@@ -186,24 +190,29 @@ cbuffer cbGodray : register(b3)
     float  gSunOnScreen;         // 0 = sun behind cam or NDC outside; 1 = on screen
     float  gGodrayEmaAlpha;      // 0..1: how much of the new frame to mix in (1 = no smoothing)
     float2 gGodrayHalfScreenUV;  // half-extent in screen-UV space (square in pixels)
-    float2 _padG1;
+    float  gSunFacing;           // dot(viewFwd, sunDir): >0 in front, <0 behind
+    float  _padG1;
+    float2 gSunScreenUV;         // CPU-precomputed: gSunScreenNdc * (0.5, -0.5) + 0.5
+    float2 _padG2;
     float3 gGodrayTint;
     float  gGodrayStrength;      // 0 = off
 };
 Texture2D<float> gGodrayTex     : register(t9);   // mark (in blur) / blur+EMA (in post)
 Texture2D<float> gGodrayHistTex : register(t10);  // previous-frame blur+EMA (blur input only)
 
-// (gAnisoSamp at s2 only used by the SampleGrad variant; not needed here.)
+SamplerState gAnisoSamp : register(s2); // anisotropic, max 16x; used by the SampleGrad variant
 
 float4 psmain_godray_mark(VTaaOut i) : SV_Target
 {
-    if (gSunOnScreen < 0.5) return 0.0;
+    // Sun off-screen → texel is "open sky" (no occluder) so godrays bleed in
+    // from the off-screen sun direction.
+    if (gSunOnScreen < 0.5) return 1.0;
     int2 tex = (int2)i.pos.xy;
     float2 local = (float2(tex) + 0.5) / 64.0 * 2.0 - 1.0;
     if (dot(local, local) > 1.0) return 0.0;
-    float2 sunScreenUV = gSunScreenNdc * float2(0.5, -0.5) + 0.5;
-    float2 uv = sunScreenUV + local * gGodrayHalfScreenUV;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+    float2 uv = gSunScreenUV + local * gGodrayHalfScreenUV;
+    // Off-screen → treat as unoccluded sky so godrays continue past the edge.
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
     int2 px = int2(uv * gScreenSize);
     px = clamp(px, int2(0,0), int2((int)gScreenSize.x - 1, (int)gScreenSize.y - 1));
     float d = gPostDepth.Load(int3(px, 0));
@@ -226,12 +235,33 @@ float4 psmain_godray_blur(VTaaOut i) : SV_Target
     return lerp(prev, curr, gGodrayEmaAlpha);
 }
 
+// Anisotropic variant: one SampleGrad with long footprint along the radial
+// direction (toward texture center / sun) and a narrow footprint perpendicular.
+float4 psmain_godray_blur_aniso(VTaaOut i) : SV_Target
+{
+    int2 tex = (int2)i.pos.xy;
+    float2 uv = (float2(tex) + 0.5) / 64.0;
+    float2 toCenter = float2(0.5, 0.5) - uv;
+    float  d        = length(toCenter) + 1e-6;
+    float2 radial   = toCenter / d;
+    float2 perp     = float2(-radial.y, radial.x);
+
+    const float streakHalf = 0.35;          // in UV (64-texel space)
+    float2 sampleUV = uv + radial * (streakHalf * 0.5);
+    float2 ddxUV    = radial * streakHalf;  // long axis
+    float2 ddyUV    = perp   * (1.0 / 64.0);// 1-texel across
+
+    float curr = gGodrayTex.SampleGrad(gAnisoSamp, sampleUV, ddxUV, ddyUV);
+    float prev = gGodrayHistTex.SampleLevel(gTaaSamp, uv, 0);
+    return lerp(prev, curr, gGodrayEmaAlpha);
+}
+
 float3 PostPixelWorldDir(int2 pix, int W, int H)
 {
-    float ndcX = ((float)pix.x + 0.5) / (float)W * 2.0 - 1.0;
-    float ndcY = 1.0 - ((float)pix.y + 0.5) / (float)H * 2.0;
-    float aspect = (float)W / (float)H;
-    float3 v = float3(ndcX * aspect * gTanHalfFovY, ndcY * gTanHalfFovY, 1.0);
+    float2 uv = (float2(pix) + 0.5) * gInvScreenSize;
+    float ndcX = uv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uv.y * 2.0;
+    float3 v = float3(ndcX * gAspectTanFov, ndcY * gTanHalfFovY, 1.0);
     return normalize(gCamRight * v.x + gCamUp * v.y + gCamForward * v.z);
 }
 
@@ -266,19 +296,21 @@ float4 psmain_post(VTaaOut i) : SV_Target
                       gPostIn.Load(int3(pU, 0)).rgb + gPostIn.Load(int3(pD, 0)).rgb) * 0.25;
         c = c + 0.5 * (c - avg);   // unsharp mask
     }
-    if (gSunOnScreen > 0.5 && gGodrayStrength > 0.0) {
-        float2 sunScreenUV = gSunScreenNdc * float2(0.5, -0.5) + 0.5;
-        float2 screenUV    = (float2(pix) + 0.5) / float2(W, H);
-        float2 off         = (screenUV - sunScreenUV) / gGodrayHalfScreenUV;
+    // Smooth fade of godrays as the view turns away from the sun. Full strength
+    // when sun is in front (dot >= ~0.2), zero behind. Prevents rays leaking
+    // when looking 180° opposite the sun.
+    float facingFade = saturate(gSunFacing * 5.0);
+    if (gGodrayStrength > 0.0 && facingFade > 0.0) {
+        float2 screenUV    = (float2(pix) + 0.5) * gInvScreenSize;
+        float2 off         = (screenUV - gSunScreenUV) / gGodrayHalfScreenUV;
         float  rOff        = length(off);
         if (rOff > 1.0) off *= (1.0 / rOff);
         float2 godrayUV    = 0.5 + off * 0.5;
         float  gr          = saturate(gGodrayTex.SampleLevel(gTaaSamp, godrayUV, 0));
-        float  aspect      = gScreenSize.x / gScreenSize.y;
-        float2 dScreen     = (screenUV - sunScreenUV) * float2(aspect, 1.0);
+        float2 dScreen     = (screenUV - gSunScreenUV) * float2(gAspect, 1.0);
         float  dist        = length(dScreen);
         float  fade        = saturate(1.0 - dist * 1.5);
-        c += gGodrayTint * gr * gGodrayStrength * fade;
+        c += gGodrayTint * gr * gGodrayStrength * fade * facingFade;
     }
     return float4(c, 1.0);
 }
