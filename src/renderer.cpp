@@ -890,8 +890,9 @@ bool Renderer::CreateRenderTargets()
         }
     }
 
-    // Godray (64x64 R8 — fixed size). [0] = mark, [1,2] = blur+EMA ping-pong.
-    for (int i = 0; i < 3; ++i)
+    // Godray (64x64 R8 — fixed size). [0] = mark, [1,2] = blur+EMA ping-pong,
+    // [3] = separable pass-1 intermediate.
+    for (int i = 0; i < 4; ++i)
     {
         godrayTex_[i].Reset();
         godrayRtv_[i].Reset();
@@ -1158,8 +1159,12 @@ bool Renderer::CreateShaders()
         return false;
     if (!compileFx("psmain_godray_blur", "ps_5_0", psbGrBlur))
         return false;
-    ComPtr<ID3DBlob> psbGrBlurAniso;
+    ComPtr<ID3DBlob> psbGrBlurAniso, psbGrBlurSparse, psbGrBlurFill;
     if (!compileFx("psmain_godray_blur_aniso", "ps_5_0", psbGrBlurAniso))
+        return false;
+    if (!compileFx("psmain_godray_blur_sparse", "ps_5_0", psbGrBlurSparse))
+        return false;
+    if (!compileFx("psmain_godray_blur_fill", "ps_5_0", psbGrBlurFill))
         return false;
 
     hr = device_->CreateComputeShader(csbSp->GetBufferPointer(), csbSp->GetBufferSize(), nullptr, csSplat_.GetAddressOf());
@@ -1193,6 +1198,12 @@ bool Renderer::CreateShaders()
     if (FAILED(hr))
         return false;
     hr = device_->CreatePixelShader(psbGrBlurAniso->GetBufferPointer(), psbGrBlurAniso->GetBufferSize(), nullptr, psGodrayBlurAniso_.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    hr = device_->CreatePixelShader(psbGrBlurSparse->GetBufferPointer(), psbGrBlurSparse->GetBufferSize(), nullptr, psGodrayBlurSparse_.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    hr = device_->CreatePixelShader(psbGrBlurFill->GetBufferPointer(), psbGrBlurFill->GetBufferSize(), nullptr, psGodrayBlurFill_.GetAddressOf());
     if (FAILED(hr))
         return false;
     {
@@ -1351,7 +1362,7 @@ bool Renderer::CreateShaders()
         bd.ByteWidth = 32;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwBounds_.GetAddressOf())))
             return false;
-        // CBGodray: 64 bytes (sunNdc+flags / halfScreenUV+facing+pad / sunUV+pad / tint+strength)
+        // CBGodray: 64 bytes — sunUV(8)+stride(4)+pad(4) reuses the same 16-byte slot.
         bd.ByteWidth = 64;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbGodray_.GetAddressOf())))
             return false;
@@ -3111,7 +3122,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                 float facing;
                 float _padG1;
                 float sunUV[2];
-                float _padG2[2];
+                float stridePx;
+                float _padG2;
                 float tint[3];
                 float strength;
             } cbg;
@@ -3138,7 +3150,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             cbg._padG1 = 0.0f;
             cbg.sunUV[0] = sunNdcX * 0.5f + 0.5f;
             cbg.sunUV[1] = sunNdcY * -0.5f + 0.5f;
-            cbg._padG2[0] = cbg._padG2[1] = 0.0f;
+            cbg.stridePx = (float)std::max(1, args.godraySeparableStride);
+            cbg._padG2 = 0.0f;
             cbg.tint[0] = args.godrayTint[0];
             cbg.tint[1] = args.godrayTint[1];
             cbg.tint[2] = args.godrayTint[2];
@@ -3175,25 +3188,53 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             ID3D11ShaderResourceView* nullDsrv[] = {nullptr};
             ctx_->PSSetShaderResources(6, 1, nullDsrv);
 
-            // Blur+EMA: read mark + previous frame's blend, write to other slot.
-            uint32_t prevIdx = godrayCurrIdx_; // last frame's output
+            uint32_t prevIdx = godrayCurrIdx_;
             uint32_t writeIdx = (prevIdx == 1u) ? 2u : 1u;
-            ctx_->PSSetShader((args.godrayAniso && psGodrayBlurAniso_) ? psGodrayBlurAniso_.Get() : psGodrayBlur_.Get(), nullptr, 0);
-            if (args.godrayAniso && anisoSamp_)
+            const bool sepBlur = args.godraySeparable && psGodrayBlurSparse_ && psGodrayBlurFill_;
+            if (sepBlur)
             {
-                ID3D11SamplerState* anS[] = {anisoSamp_.Get()};
-                ctx_->PSSetSamplers(2, 1, anS);
+                // Pass 1: 5 sparse strided taps from mark (t9) → intermediate [3].
+                ctx_->PSSetShader(psGodrayBlurSparse_.Get(), nullptr, 0);
+                ID3D11RenderTargetView* pass1Rtv[] = {godrayRtv_[3].Get()};
+                ctx_->OMSetRenderTargets(1, pass1Rtv, nullptr);
+                ID3D11ShaderResourceView* grSrv[] = {godraySrv_[0].Get()};
+                ctx_->PSSetShaderResources(9, 1, grSrv);
+                ID3D11ShaderResourceView* nullHist[] = {nullptr};
+                ctx_->PSSetShaderResources(10, 1, nullHist);
+                ctx_->Draw(3, 0);
+                // Pass 2: fill from intermediate (t9 = [3]) + history (t10) → writeIdx.
+                ctx_->PSSetShader(psGodrayBlurFill_.Get(), nullptr, 0);
+                ID3D11RenderTargetView* pass2Rtv[] = {godrayRtv_[writeIdx].Get()};
+                ctx_->OMSetRenderTargets(1, pass2Rtv, nullptr);
+                ID3D11ShaderResourceView* grSrv2[] = {godraySrv_[3].Get()};
+                ID3D11ShaderResourceView* grHist[] = {godraySrv_[prevIdx].Get()};
+                ctx_->PSSetShaderResources(9, 1, grSrv2);
+                ctx_->PSSetShaderResources(10, 1, grHist);
+                ctx_->Draw(3, 0);
+                ID3D11ShaderResourceView* nullSrv[] = {nullptr};
+                ctx_->PSSetShaderResources(9, 1, nullSrv);
+                ctx_->PSSetShaderResources(10, 1, nullSrv);
             }
-            ID3D11RenderTargetView* blurRtv[] = {godrayRtv_[writeIdx].Get()};
-            ctx_->OMSetRenderTargets(1, blurRtv, nullptr);
-            ID3D11ShaderResourceView* grSrv[] = {godraySrv_[0].Get()};        // mark @ t9
-            ID3D11ShaderResourceView* grHist[] = {godraySrv_[prevIdx].Get()}; // history @ t10
-            ctx_->PSSetShaderResources(9, 1, grSrv);
-            ctx_->PSSetShaderResources(10, 1, grHist);
-            ctx_->Draw(3, 0);
-            ID3D11ShaderResourceView* nullGrSrv[] = {nullptr};
-            ctx_->PSSetShaderResources(9, 1, nullGrSrv);
-            ctx_->PSSetShaderResources(10, 1, nullGrSrv);
+            else
+            {
+                // Single-pass blur (line or aniso) — read mark + history → writeIdx.
+                ctx_->PSSetShader((args.godrayAniso && psGodrayBlurAniso_) ? psGodrayBlurAniso_.Get() : psGodrayBlur_.Get(), nullptr, 0);
+                if (args.godrayAniso && anisoSamp_)
+                {
+                    ID3D11SamplerState* anS[] = {anisoSamp_.Get()};
+                    ctx_->PSSetSamplers(2, 1, anS);
+                }
+                ID3D11RenderTargetView* blurRtv[] = {godrayRtv_[writeIdx].Get()};
+                ctx_->OMSetRenderTargets(1, blurRtv, nullptr);
+                ID3D11ShaderResourceView* grSrv[] = {godraySrv_[0].Get()};
+                ID3D11ShaderResourceView* grHist[] = {godraySrv_[prevIdx].Get()};
+                ctx_->PSSetShaderResources(9, 1, grSrv);
+                ctx_->PSSetShaderResources(10, 1, grHist);
+                ctx_->Draw(3, 0);
+                ID3D11ShaderResourceView* nullGrSrv[] = {nullptr};
+                ctx_->PSSetShaderResources(9, 1, nullGrSrv);
+                ctx_->PSSetShaderResources(10, 1, nullGrSrv);
+            }
             godrayCurrIdx_ = writeIdx;
 
             // Restore main viewport.

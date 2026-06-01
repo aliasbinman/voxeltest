@@ -162,7 +162,9 @@ struct AppState
     float godrayStrength = 0.55f;
     float godrayAngleDeg = 10.0f;
     float godrayEmaAlpha = 0.15f;
-    bool  godrayAniso = false; // false = 24-tap line blur, true = SampleGrad anisotropic
+    bool  godrayAniso = false;       // false = 24-tap line blur, true = SampleGrad anisotropic
+    bool  godraySeparable = false;   // 2-pass sparse + fill
+    int   godraySeparableStride = 6; // stride (pixels) between sparse taps
     float lastGodrayCamPos[3] = {0, 0, 0};
     float godrayTint[3] = {1.00f, 0.85f, 0.45f};
     bool rmbDown = false;
@@ -694,6 +696,8 @@ void FrameControlsWindow()
             ImGui::SliderFloat("Angle (deg)", &g_app.godrayAngleDeg, 0.05f, 30.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("Temporal blend", &g_app.godrayEmaAlpha, 0.02f, 1.0f, "%.2f (1 = none)");
             ImGui::Checkbox("Anisotropic blur (SampleGrad)", &g_app.godrayAniso);
+            ImGui::Checkbox("Separable blur (2-pass sparse)", &g_app.godraySeparable);
+            ImGui::SliderInt("Stride (px)", &g_app.godraySeparableStride, 1, 12);
             ImGui::ColorEdit3("Tint", g_app.godrayTint);
             ImGui::Separator();
             ImGui::TextUnformatted("Mark (pre-blur):");
@@ -1204,6 +1208,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.godrayStrength = g_app.godrayStrength;
             ps.godrayAngleDeg = g_app.godrayAngleDeg;
             ps.godrayAniso = g_app.godrayAniso;
+            ps.godraySeparable = g_app.godraySeparable;
+            ps.godraySeparableStride = g_app.godraySeparableStride;
             {
                 // Boost alpha (less smoothing) on translation. Rotation is
                 // fine — sun stays at same world dir, just on different screen

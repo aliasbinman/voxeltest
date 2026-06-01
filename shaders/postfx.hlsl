@@ -196,7 +196,8 @@ cbuffer cbGodray : register(b3)
     float  gSunFacing;           // dot(viewFwd, sunDir): >0 in front, <0 behind
     float  _padG1;
     float2 gSunScreenUV;         // CPU-precomputed: gSunScreenNdc * (0.5, -0.5) + 0.5
-    float2 _padG2;
+    float  gGodrayStridePx;      // separable: pixels between sparse taps
+    float  _padG2;
     float3 gGodrayTint;
     float  gGodrayStrength;      // 0 = off
 };
@@ -212,7 +213,7 @@ float4 psmain_godray_mark(VTaaOut i) : SV_Target
     if (gSunOnScreen < 0.5) return 1.0;
     int2 tex = (int2)i.pos.xy;
     float2 local = (float2(tex) + 0.5) / 64.0 * 2.0 - 1.0;
-    if (dot(local, local) > 1.0) return 0.0;
+    if (dot(local, local) > 0.97) return 0.0;
     float2 uv = gSunScreenUV + local * gGodrayHalfScreenUV;
     // Off-screen → treat as unoccluded sky so godrays continue past the edge.
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
@@ -245,16 +246,55 @@ float4 psmain_godray_blur_aniso(VTaaOut i) : SV_Target
     int2 tex = (int2)i.pos.xy;
     float2 uv = (float2(tex) + 0.5) / 64.0;
     float2 toCenter = float2(0.5, 0.5) - uv;
-    float  d        = length(toCenter) + 1e-6;
-    float2 radial   = toCenter / d;
-    float2 perp     = float2(-radial.y, radial.x);
+    float  d        = length(toCenter);
+    
+    float weight = d;
+    float2 radial = toCenter / max(d, 0.1);
+    float2 perp     = float2(-radial.y, radial.x) ;
 
-    const float streakHalf = 0.35;          // in UV (64-texel space)
+    const float streakHalf = 0.135;          // in UV (64-texel space)
     float2 sampleUV = uv + radial * (streakHalf * 0.5);
     float2 ddxUV    = radial * streakHalf;  // long axis
     float2 ddyUV    = perp   * (1.0 / 64.0);// 1-texel across
 
-    float curr = gGodrayTex.SampleGrad(gAnisoSamp, sampleUV, ddxUV, ddyUV);
+    float curr = gGodrayTex.SampleGrad(gAnisoSamp, sampleUV, ddxUV, ddyUV);// * weight;
+    float prev = gGodrayHistTex.SampleLevel(gTaaSamp, uv, 0);
+    return lerp(prev, curr, gGodrayEmaAlpha);
+}
+
+// ---- Separable godray blur ----
+// Pass 1 (sparse): 5 taps along radial, each gGodrayStridePx pixels apart.
+// Reads mark texture (t9). No history blend. Output → intermediate.
+float4 psmain_godray_blur_sparse(VTaaOut i) : SV_Target
+{
+    int2 tex = (int2)i.pos.xy;
+    float2 uv = (float2(tex) + 0.5) / 64.0;
+    float2 toCenter = float2(0.5, 0.5) - uv;
+    // Step in UV per pixel of texture (texture is 64x64).
+    float2 stepUV = toCenter / max(length(toCenter) * 64.0, 1.0) * gGodrayStridePx;
+    float sum = 0.0;
+    [unroll] for (int s = 0; s < 5; ++s) {
+        sum += gGodrayTex.SampleLevel(gTaaSamp, uv + stepUV * (float)s, 0);
+    }
+    return sum * (1.0 / 5.0);
+}
+
+// Pass 2 (fill): 5 taps at fractional offsets within the pass-1 stride to fill
+// in the gaps between sparse samples. Reads pass-1 intermediate (t9).
+// Blends with previous-frame EMA history (t10).
+float4 psmain_godray_blur_fill(VTaaOut i) : SV_Target
+{
+    int2 tex = (int2)i.pos.xy;
+    float2 uv = (float2(tex) + 0.5) / 64.0;
+    float2 toCenter = float2(0.5, 0.5) - uv;
+    float2 stepUV = toCenter / max(length(toCenter) * 64.0, 1.0) * gGodrayStridePx;
+    // Offsets in [-0.5..0.5] of one stride → interpolates between pass-1 samples.
+    float sum = 0.0;
+    const float offs[5] = { -0.4, -0.2, 0.0, 0.2, 0.4 };
+    [unroll] for (int s = 0; s < 5; ++s) {
+        sum += gGodrayTex.SampleLevel(gTaaSamp, uv + stepUV * offs[s], 0);
+    }
+    float curr = sum * (1.0 / 5.0);
     float prev = gGodrayHistTex.SampleLevel(gTaaSamp, uv, 0);
     return lerp(prev, curr, gGodrayEmaAlpha);
 }

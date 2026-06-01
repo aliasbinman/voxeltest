@@ -87,7 +87,9 @@ struct DrawSceneParams
     float godrayAngleDeg = 10.0f; // angular extent of texture; real sun = 0.5° (tiny), 10° = nice halo
     float godrayEmaAlpha = 0.15f; // 1 = no smoothing, lower = more temporal damping
     float godrayTint[3] = {1.00f, 0.85f, 0.45f};
-    bool  godrayAniso = false;    // false = 24-tap line blur, true = SampleGrad anisotropic
+    bool  godrayAniso = false;       // false = 24-tap line blur, true = SampleGrad anisotropic
+    bool  godraySeparable = false;   // 2-pass sparse (5 strided taps + fill)
+    int   godraySeparableStride = 6; // stride (pixels) between sparse taps
 };
 
 class Renderer
@@ -329,13 +331,16 @@ private:
     // [0]   = mark output (transient each frame)
     // [1,2] = ping-pong blur+EMA output (sampled by post; previous frame's
     //         blend used by next frame's blur via EMA history input)
-    ComPtr<ID3D11Texture2D> godrayTex_[3];
-    ComPtr<ID3D11RenderTargetView> godrayRtv_[3];
-    ComPtr<ID3D11ShaderResourceView> godraySrv_[3];
+    // [0] = mark, [1,2] = ping-pong blur+EMA, [3] = separable pass-1 intermediate.
+    ComPtr<ID3D11Texture2D> godrayTex_[4];
+    ComPtr<ID3D11RenderTargetView> godrayRtv_[4];
+    ComPtr<ID3D11ShaderResourceView> godraySrv_[4];
     ComPtr<ID3D11PixelShader> psGodrayMark_;
     ComPtr<ID3D11PixelShader> psGodrayBlur_;
-    ComPtr<ID3D11PixelShader> psGodrayBlurAniso_; // SampleGrad anisotropic variant
-    ComPtr<ID3D11SamplerState> anisoSamp_;        // wrap, max-aniso 16
+    ComPtr<ID3D11PixelShader> psGodrayBlurAniso_;   // SampleGrad anisotropic variant
+    ComPtr<ID3D11PixelShader> psGodrayBlurSparse_;  // separable pass 1: 5 strided taps
+    ComPtr<ID3D11PixelShader> psGodrayBlurFill_;    // separable pass 2: fills gaps
+    ComPtr<ID3D11SamplerState> anisoSamp_;          // wrap, max-aniso 16
     ComPtr<ID3D11Buffer> cbGodray_;
     uint32_t godrayCurrIdx_ = 1; // most recent blur write target
     uint32_t taaHistIdx_ = 0;
