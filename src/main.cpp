@@ -196,7 +196,7 @@ struct AppState
     std::atomic<bool> frustumValid{false};
     std::atomic<bool> loaderQuit{false};
     std::atomic<bool> loaderTrigger{false};
-    std::atomic<float> streamRadiusScale{1.0f}; // 1.0 = default; higher = wider shells, less pop-in
+    std::atomic<float> streamRadiusScale{3.0f}; // wider shells preload finer LODs farther out → less pop-in
     bool skipBackbufferClear = false;           // skip swapchain RTV clear (post pass covers all pixels)
     std::mutex loaderMu;
     std::condition_variable loaderCv;

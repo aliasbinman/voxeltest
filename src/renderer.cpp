@@ -1845,7 +1845,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             return;
 
         float distNearC = nearAabbDist(mnx, mny, mnz, mxx, mxy, mxz);
-        int des = desiredLodForDist(distNearC);
+        int desNearC = desiredLodForDist(distNearC);
+        (void)farAabbDist;
 
         // 8 child chunks per parent, picked by parent cluster's octant.
         int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
@@ -1855,8 +1856,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         // we render this coarser LOD instead of dropping the chunk entirely.
         bool childLoaded = (L > 0) && (childChunkId != lw::kNoChild) && (childChunkId < lwWorld_.lods[L - 1].chunks.size()) && (lwWorld_.lods[L - 1].chunks[childChunkId].poolCount > 0);
 
-        // Terminal: this LOD fine enough, or no child to descend into.
-        if (des >= L || !childLoaded || L == 0)
+        // Recurse only when the cluster's nearest point wants finer than L.
+        // Straddle alone (near @ L, far @ L+1) shouldn't recurse — we can't go
+        // coarser than L here anyway, so push at L for the whole cluster.
+        if (desNearC >= L || !childLoaded || L == 0)
         {
             std::vector<DrawItem>* dl = pickListForChunk(L,
                                                          0.5f * (mnx + mxx), 0.5f * (mny + mxy), 0.5f * (mnz + mxz));
@@ -1912,114 +1915,12 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         int desNear = desiredLodForDist(distNear); // finest LOD wanted anywhere in chunk
         int desFar = desiredLodForDist(distFar);   // coarsest LOD wanted anywhere in chunk
 
-        // ---- Fast path: uniform LOD across the chunk ----
         const bool isBlock = (dl == &drawListBlock[L]);
-        if (desNear == desFar)
-        {
-            int desired = desNear;
-            if (desired >= L || L == 0)
-            {
-                if (dl)
-                    dl->push_back({slot, 0u, rc.poolCount, 0u, rc.blockCount});
-                return;
-            }
-            // Need finer LOD. Per-octant: recurse where child exists AND is
-            // actually resident (poolCount > 0); otherwise draw parent's
-            // clusters. Streaming/shell-cull leaves un-loaded chunks with
-            // poolCount=0 in the full-sized chunks vector.
-            bool fallbackOct[8];
-            bool anyFallback = false;
-            const auto& childChunks = (L > 0) ? lwWorld_.lods[L - 1].chunks
-                                              : std::vector<lw::RuntimeChunk>{};
-            for (int c = 0; c < 8; ++c)
-            {
-                uint32_t cid = rc.childId[c];
-                bool childLoaded = (L > 0) && (cid != lw::kNoChild) && (cid < childChunks.size()) && (childChunks[cid].poolCount > 0);
-                if (childLoaded)
-                {
-                    visit(L - 1, cid);
-                    fallbackOct[c] = false;
-                }
-                else
-                {
-                    fallbackOct[c] = true;
-                    anyFallback = true;
-                }
-            }
-            if (anyFallback)
-            {
-                if (isBlock)
-                {
-                    // Block path: push per cluster (no coalescing — block ranges
-                    // aren't guaranteed contiguous across cluster slots in pool).
-                    for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c)
-                    {
-                        uint32_t bcnt = rc.clusterBlockCount[slot_c];
-                        if (bcnt == 0)
-                            continue;
-                        int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
-                        int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
-                        int cx_g = slot_c % lw::kClustersX;
-                        int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
-                        if (!fallbackOct[oct])
-                            continue;
-                        if (dl)
-                            dl->push_back({slot, 0u, 0u,
-                                           rc.clusterBlockFirst[slot_c], bcnt});
-                    }
-                }
-                else
-                {
-                    uint32_t spanFirst = 0, spanCount = 0;
-                    auto flush = [&]()
-                    {
-                        if (spanCount > 0)
-                        {
-                            if (dl)
-                                dl->push_back({slot, spanFirst, spanCount, 0u, 0u});
-                            spanCount = 0;
-                        }
-                    };
-                    for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c)
-                    {
-                        const lw::DiskCluster& cl = rc.clusters[slot_c];
-                        if (cl.numPoints == 0)
-                        {
-                            flush();
-                            continue;
-                        }
-                        int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
-                        int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
-                        int cx_g = slot_c % lw::kClustersX;
-                        int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
-                        if (!fallbackOct[oct])
-                        {
-                            flush();
-                            continue;
-                        }
-                        if (spanCount == 0)
-                        {
-                            spanFirst = cl.pointFirst;
-                            spanCount = cl.numPoints;
-                        }
-                        else if (cl.pointFirst == spanFirst + spanCount)
-                        {
-                            spanCount += cl.numPoints;
-                        }
-                        else
-                        {
-                            flush();
-                            spanFirst = cl.pointFirst;
-                            spanCount = cl.numPoints;
-                        }
-                    }
-                    flush();
-                }
-            }
-            return;
-        }
+        (void)isBlock; (void)desFar;
+        // Always use per-cluster path so each cluster picks its own LOD/cull.
+        // visitCluster handles cull, finer-LOD recursion, and terminal push.
 
-        // ---- Straddle path: true per-cluster recursive decision. ----
+        // ---- Per-cluster path: each cluster makes its own cull + LOD choice. ----
         // Each cluster checked independently. If its closest LOD is finer
         // than the current chunk's LOD AND a child chunk exists, recurse
         // into the 2x2x2 = 8 child clusters that cover this parent cluster.
@@ -2281,7 +2182,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                     struct
                     {
                         uint32_t w, h, totalThreads, numItems;
-                        float fadeStart, fadeEnd, _p1, _p2;
+                        float fadeStart, fadeEnd;
+                        uint32_t lodIdx, _pad;
                     } cbcs;
                     cbcs.w = width_;
                     cbcs.h = height_;
@@ -2289,7 +2191,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                     cbcs.numItems = (uint32_t)wl.size();
                     cbcs.fadeStart = 0.0f;
                     cbcs.fadeEnd = 0.0f;
-                    cbcs._p1 = cbcs._p2 = 0.0f;
+                    cbcs.lodIdx = (uint32_t)L;
+                    cbcs._pad = 0;
                     memcpy(mm.pData, &cbcs, sizeof(cbcs));
                     ctx_->Unmap(cbLwCS_.Get(), 0);
 
@@ -2413,7 +2316,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             struct
             {
                 uint32_t w, h, totalThreads, numItems;
-                float fadeStart, fadeEnd, _p1, _p2;
+                float fadeStart, fadeEnd;
+                uint32_t lodIdx, _pad;
             } cbcs;
             cbcs.w = width_;
             cbcs.h = height_;
@@ -2421,7 +2325,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             cbcs.numItems = (uint32_t)wlP2.size();
             cbcs.fadeStart = fadeStart;
             cbcs.fadeEnd = fadeEnd;
-            cbcs._p1 = cbcs._p2 = 0.0f;
+            cbcs.lodIdx = (uint32_t)Lp;
+            cbcs._pad = 0;
             memcpy(mm.pData, &cbcs, sizeof(cbcs));
             ctx_->Unmap(cbLwCS_.Get(), 0);
 

@@ -312,11 +312,11 @@ cbuffer CBLwCS : register(b3)
 {
     uint2 gVwSize;             // viewport pixels
     uint  gLwPointCount;       // worklist: total threads (sum of item counts)
-                               // legacy: block count in this dispatch
     uint  gLwNumWorkItems;     // worklist: number of items in gLwWorkItems
     float gLodFadeStart;       // world distance — fade to parent starts
     float gLodFadeEnd;         // world distance — fully parent (LOD about to be replaced)
-    float2 _padCs1;
+    uint  gLwLodIdx;           // LOD index of the current dispatch (used by LodViz)
+    uint  _padCs;
 };
 
 RWTexture2D<uint>         gLwVisUav      : register(u0);
@@ -495,11 +495,36 @@ void csmain_lw_block_color_worklist(uint3 dt : SV_DispatchThreadID)
         uint winDepth   = gLwDepthSrv.Load(int3(pix, 0));
         if (myInvDepth != winDepth) continue;
 
-        uint colPck = gLwPalette[ci.paletteBase + palIdx];
-        uint rR = (uint)(((colPck >>  0) & 0xFFu) >> 3);
-        uint rG = (uint)(((colPck >>  8) & 0xFFu) >> 2);
-        uint rB = (uint)(((colPck >> 16) & 0xFFu) >> 3);
-        uint rgb565 = (rR << 11) | (rG << 5) | rB;
+        uint rgb565;
+        if (gMode == 4u) {
+            // LodViz: per-LOD tint × per-cluster checker. AO unavailable in V3
+            // block data so the AO modulation from the splat path is dropped.
+            static const float3 kLodTints[5] = {
+                float3(1.00, 0.40, 0.40),
+                float3(1.00, 0.80, 0.30),
+                float3(0.40, 1.00, 0.40),
+                float3(0.40, 0.70, 1.00),
+                float3(0.90, 0.40, 1.00),
+            };
+            float3 tint = kLodTints[min(gLwLodIdx, 4u)];
+            // Cluster within chunk: each cluster spans 32 voxels = 16 blocks.
+            uint cx = bx >> 4u;
+            uint cy = by >> 4u;
+            uint cz = bz >> 4u;
+            uint parity = (cx + cy + cz) & 1u;
+            float check = (parity == 0u) ? 0.55 : 1.0;
+            float3 col = saturate(tint * check);
+            uint rR = (uint)(col.r * 31.0);
+            uint rG = (uint)(col.g * 63.0);
+            uint rB = (uint)(col.b * 31.0);
+            rgb565 = (rR << 11) | (rG << 5) | rB;
+        } else {
+            uint colPck = gLwPalette[ci.paletteBase + palIdx];
+            uint rR = (uint)(((colPck >>  0) & 0xFFu) >> 3);
+            uint rG = (uint)(((colPck >>  8) & 0xFFu) >> 2);
+            uint rB = (uint)(((colPck >> 16) & 0xFFu) >> 3);
+            rgb565 = (rR << 11) | (rG << 5) | rB;
+        }
         gLwVisUav[pix] = rgb565;
     }
 }
