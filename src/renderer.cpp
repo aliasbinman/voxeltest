@@ -1272,10 +1272,12 @@ bool Renderer::CreateShaders()
         ComPtr<ID3DBlob> bcsBlkSpWl;
         if (!compileLw("csmain_lw_block_splat_worklist", "cs_5_0", bcsBlkSpWl))
             return false;
-        ComPtr<ID3DBlob> bvsBlkPt, bpsBlkPt;
+        ComPtr<ID3DBlob> bvsBlkPt, bpsBlkPt, bpsBlkPtSp;
         if (!compileLw("vsmain_lw_blockpoint", "vs_5_0", bvsBlkPt))
             return false;
         if (!compileLw("psmain_lw_blockpoint", "ps_5_0", bpsBlkPt))
+            return false;
+        if (!compileLw("psmain_lw_blockpoint_splat", "ps_5_0", bpsBlkPtSp))
             return false;
         if (!compileLw("vsmain_lw_resolve", "vs_5_0", bvsR))
             return false;
@@ -1318,6 +1320,9 @@ bool Renderer::CreateShaders()
         if (FAILED(hr))
             return false;
         hr = device_->CreatePixelShader(bpsBlkPt->GetBufferPointer(), bpsBlkPt->GetBufferSize(), nullptr, psLwBlockPoint_.GetAddressOf());
+        if (FAILED(hr))
+            return false;
+        hr = device_->CreatePixelShader(bpsBlkPtSp->GetBufferPointer(), bpsBlkPtSp->GetBufferSize(), nullptr, psLwBlockPointSplat_.GetAddressOf());
         if (FAILED(hr))
             return false;
         hr = device_->CreateVertexShader(bvsR->GetBufferPointer(), bvsR->GetBufferSize(), nullptr, vsLwResolve_.GetAddressOf());
@@ -2665,6 +2670,66 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->OMSetRenderTargets(2, mrtRestoreP2, splatDsv_.Get());
     }
 
+    // pointSplatRoute hoisted here so the splat dilate + composite can see it
+    // and run BEFORE the HW point draw block below would normally fire.
+    const bool pointSplatRoute = args.csUsePointList && args.splatFilter
+                                 && vsLwBlockPoint_ && psLwBlockPointSplat_
+                                 && splatColorRtv_ && splatMaskRtv_ && splatDsv_;
+
+    // ---- HW point A/B splat-route: draw points to splat MRT + DSV ----
+    bool anyPointSplat = false;
+    if (pointSplatRoute)
+    {
+        for (int Ls = 0; Ls < lw::kLodCount; ++Ls)
+            if (!drawListBlock[Ls].empty()) { anyPointSplat = true; break; }
+    }
+    if (anyPointSplat)
+    {
+        MICROPROFILE_SCOPEGPUI("LW/BlockPoints/DrawSplat", 0xff80ffe0);
+        float clearC[4] = {0, 0, 0, 0};
+        uint32_t clearMu[4] = {0, 0, 0, 0};
+        ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clearC);
+        ctx_->ClearRenderTargetView(splatMaskRtv_.Get(), (const float*)clearMu);
+        ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        ID3D11RenderTargetView* mrt[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
+        ctx_->OMSetRenderTargets(2, mrt, splatDsv_.Get());
+        ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+        ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+        ctx_->RSSetState(rsNoCull_.Get());
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+        ctx_->IASetInputLayout(nullptr);
+        ID3D11Buffer* nullVbS[] = {nullptr};
+        UINT zSs = 0, zOs = 0;
+        ctx_->IASetVertexBuffers(0, 1, nullVbS, &zSs, &zOs);
+        ctx_->VSSetShader(vsLwBlockPoint_.Get(), nullptr, 0);
+        ctx_->PSSetShader(psLwBlockPointSplat_.Get(), nullptr, 0);
+        ID3D11Buffer* ptCbsS[] = {cbLwFrame_.Get(), cbLwLod_.Get()};
+        ctx_->VSSetConstantBuffers(0, 2, ptCbsS);
+        ctx_->PSSetConstantBuffers(0, 2, ptCbsS);
+        for (int L = lw::kLodCount - 1; L >= 0; --L)
+        {
+            if (drawListBlock[L].empty()) continue;
+            const LwGpu& g = lwGpu_[L];
+            if (!g.blockPointSrv) continue;
+            const lw::LODWorld& lwL = lwWorld_.lods[L];
+            ID3D11ShaderResourceView* vsSrvsS[] = {nullptr, g.chunkInfoSrv.Get(), g.paletteSrv.Get()};
+            ctx_->VSSetShaderResources(0, 3, vsSrvsS);
+            ctx_->PSSetShaderResources(0, 3, vsSrvsS);
+            ID3D11ShaderResourceView* ptSrvS[] = {g.blockPointSrv.Get()};
+            ctx_->VSSetShaderResources(7, 1, ptSrvS);
+            for (const DrawItem& it : drawListBlock[L])
+            {
+                if (it.blockPointCount == 0) continue;
+                const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
+                setLodCbForLod(L, rc.slotIdx, rc.blockPointBase + it.blockPointFirst);
+                ctx_->Draw(it.blockPointCount, 0);
+                ++drawCount;
+            }
+            ID3D11ShaderResourceView* nullPtS[] = {nullptr};
+            ctx_->VSSetShaderResources(7, 1, nullPtS);
+        }
+    }
+
     // ---- Splat dilate CS (csSplat_) — fills holes, lighting, shadow lookup ----
     bool anySplat = false;
     for (int Ls = 0; Ls < lw::kLodCount; ++Ls)
@@ -2676,6 +2741,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     // PointCS_Block splat-route also writes to splat targets → run splat dilate.
     bool anyBlockSplat = blockSplatRoute && !twoPassLods.empty();
     if (anyBlockSplat) anySplat = true;
+    if (anyPointSplat) anySplat = true;
     if (anySplat && args.splatFilter && csSplat_)
     {
         MICROPROFILE_SCOPEGPUI("LW/SplatCS", 0xffffa030);
@@ -2688,8 +2754,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->CSSetShader(csSplat_.Get(), nullptr, 0);
         ID3D11Buffer* csCbs[] = {cbPerFrame_.Get()};
         ctx_->CSSetConstantBuffers(0, 1, csCbs);
-        // Block-route uses the R32F UAV-friendly depth texture; raster path uses
-        // the DSV texture's R32F SRV view. splatColor + splatMask are shared.
+        // Depth SRV source:
+        //   block-CS splat-route  → splatBlockDepthSrv_ (R32F UAV-bound tex)
+        //   point HW splat-route  → splatDepthSrv_ (DSV-bound tex via SRV view)
+        //   legacy splat raster   → splatDepthSrv_
         ID3D11ShaderResourceView* depthSrvForCS =
             anyBlockSplat ? splatBlockDepthSrv_.Get() : splatDepthSrv_.Get();
         ID3D11ShaderResourceView* csSrvs[] = {
@@ -2793,13 +2861,16 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     }
 
     // ---- PointCS A/B: hardware-rasterized POINTLIST via VS+PS ----
-    if (args.csUsePointList && vsLwBlockPoint_ && psLwBlockPoint_)
+    // splat-route case handled earlier (writes to splat MRT before dilate).
+    // This block only runs the direct-to-scene-RT case.
+    if (args.csUsePointList && !pointSplatRoute && vsLwBlockPoint_ && psLwBlockPoint_)
     {
         MICROPROFILE_SCOPEGPUI("LW/BlockPoints/Draw", 0xff80ffe0);
         ID3D11RenderTargetView* sceneRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
         ID3D11RenderTargetView* mrt[] = {sceneRtv};
         ctx_->OMSetRenderTargets(1, mrt, dsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
+        ctx_->PSSetShader(psLwBlockPoint_.Get(), nullptr, 0);
         ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
         ctx_->RSSetState(rsNoCull_.Get());
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -2808,7 +2879,6 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         UINT zS = 0, zO = 0;
         ctx_->IASetVertexBuffers(0, 1, nullVb, &zS, &zO);
         ctx_->VSSetShader(vsLwBlockPoint_.Get(), nullptr, 0);
-        ctx_->PSSetShader(psLwBlockPoint_.Get(), nullptr, 0);
         ID3D11Buffer* ptCbs[] = {cbLwFrame_.Get(), cbLwLod_.Get()};
         ctx_->VSSetConstantBuffers(0, 2, ptCbs);
         ctx_->PSSetConstantBuffers(0, 2, ptCbs);

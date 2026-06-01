@@ -706,3 +706,34 @@ float4 psmain_lw_blockpoint(VSOutBlockPt i) : SV_Target
                         (float)((colPck >> 16u) & 0xFFu)) / 255.0;
     return float4(col, 1.0);
 }
+
+// ---- HW point draw → splat-format MRT (RGBA8 colour + R32 mask) so the
+// existing csSplat dilate path can consume the output. SV_Depth comes from the
+// vertex pos automatically (hardware writes to bound DSV).
+struct PSOutSplat {
+    float4 col  : SV_Target0;
+    uint   mask : SV_Target1;
+};
+PSOutSplat psmain_lw_blockpoint_splat(VSOutBlockPt i)
+{
+    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
+    uint colPck = gLwPalette[ci.paletteBase + i.palIdx];
+    float3 rgb = float3((float)( colPck         & 0xFFu),
+                        (float)((colPck >>  8u) & 0xFFu),
+                        (float)((colPck >> 16u) & 0xFFu)) / 255.0;
+    // Splat alpha encoding (mirrors EncodeSplatAlpha): bit 7 marker, bits 6:4
+    // lodIdx (3 bits), bits 3:0 AO 4-bit (15 = max).
+    uint a8 = 0x80u | ((gLodIdx & 7u) << 4) | 0xFu;
+    float alpha = (float)a8 / 255.0;
+    // Synthetic mask: visMask=0x3F + all per-face AOs = 15 + parity in bit 30.
+    uint mask = 0x3FFFFFFFu;
+    uint cx = i.vxyz.x >> 5u;
+    uint cy = i.vxyz.y >> 5u;
+    uint cz = i.vxyz.z >> 5u;
+    uint parity = (cx + cy + cz) & 1u;
+    mask |= (parity << 30u);
+    PSOutSplat o;
+    o.col  = float4(rgb, alpha);
+    o.mask = mask;
+    return o;
+}

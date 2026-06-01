@@ -98,21 +98,23 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     int2 pix = (int2)i.pos.xy;
     int W = (int)gScreenSize.x;
     int H = (int)gScreenSize.y;
-    float2 currUv = (float2(pix) + 0.5) * gInvScreenSize;
-    currUv += float2(gJitter.x * 0.5, -gJitter.y * 0.5);
+    // Pixel-centre UV (no jitter). Use this for depth Load + world reconstruction
+    // so reprojection into history is jitter-free → static scenes tap the same
+    // history texel every frame. Jitter only applies to the current-frame
+    // scene sample.
+    float2 currUvCenter = (float2(pix) + 0.5) * gInvScreenSize;
+    float2 currUv = currUvCenter + float2(gJitter.x * 0.5, -gJitter.y * 0.5);
     float4 curSample = gTaaScene.SampleLevel(gTaaSamp, currUv, 0);
     float3 curC = curSample.rgb;
     float outAlpha = curSample.a;
-    int2 jPix = clamp(int2(currUv * gScreenSize),
-                      int2(0, 0), int2(W - 1, H - 1));
-    float  d  = gTaaDepth.Load(int3(jPix, 0));
+    float  d  = gTaaDepth.Load(int3(pix, 0));
     if (d <= 0.0) {
         return float4(curC, outAlpha);
     }
 
     float viewZ = gNearZ / d;
-    float ndcX = currUv.x * 2.0 - 1.0;
-    float ndcY = 1.0 - currUv.y * 2.0;
+    float ndcX = currUvCenter.x * 2.0 - 1.0;
+    float ndcY = 1.0 - currUvCenter.y * 2.0;
     float viewX = ndcX * gAspectTanFov * viewZ;
     float viewY = ndcY * gTanHalfFovY  * viewZ;
     float3 world = gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
@@ -123,7 +125,7 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     if (any(abs(prevNdc.xy) > 1.0)) return float4(curC, outAlpha);
     float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
 
-    float2 texSize = float2((float)W, (float)H);
+    float2 texSize = gScreenSize;
     float2 sp = prevUv * texSize;
     float2 tp1 = floor(sp - 0.5) + 0.5;
     float2 f = sp - tp1;
@@ -133,9 +135,10 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     float2 w3 = f * f * (-0.5 + 0.5 * f);
     float2 w12 = w1 + w2;
     float2 off12 = w2 / max(w12, 1e-5);
-    float2 tp0  = (tp1 - 1.0) / texSize;
-    float2 tp3  = (tp1 + 2.0) / texSize;
-    float2 tp12 = (tp1 + off12) / texSize;
+    // /texSize → *gInvScreenSize: 3 divides become 3 muls.
+    float2 tp0  = (tp1 - 1.0)   * gInvScreenSize;
+    float2 tp3  = (tp1 + 2.0)   * gInvScreenSize;
+    float2 tp12 = (tp1 + off12) * gInvScreenSize;
 
     float k0 = w12.x * w0.y;
     float k1 = w0.x  * w12.y;
@@ -288,13 +291,26 @@ float4 psmain_post(VTaaOut i) : SV_Target
         c = SkyColor(rd);
     } else {
         c = inC.rgb;
-        int2 pL = int2(max(pix.x - 1, 0),     pix.y);
-        int2 pR = int2(min(pix.x + 1, W - 1), pix.y);
-        int2 pU = int2(pix.x, max(pix.y - 1, 0));
-        int2 pD = int2(pix.x, min(pix.y + 1, H - 1));
-        float3 avg = (gPostIn.Load(int3(pL, 0)).rgb + gPostIn.Load(int3(pR, 0)).rgb +
-                      gPostIn.Load(int3(pU, 0)).rgb + gPostIn.Load(int3(pD, 0)).rgb) * 0.25;
-        c = c + 0.5 * (c - avg);   // unsharp mask
+        // Unsharp mask: avg of 4 cardinal neighbours. Gears Of War 4 trick
+        // (Xfest 2017, slide 55-56): 2 of the 4 neighbours are in the same 2x2
+        // quad as this pixel, so derive them from ddx_fine/ddy_fine (free —
+        // hardware computes derivatives across the quad with no extra texture
+        // reads). Only the OTHER two neighbours need real loads.
+        // QuadVector: (-1,-1)..(+1,+1) — direction away from the quad.
+        float2 qv = float2(float(pix.x & 1) * 2.0 - 1.0,
+                           float(pix.y & 1) * 2.0 - 1.0);
+        // In-quad neighbours via derivatives. ddx_fine(A) = A_right - A_left
+        // within the 2x2 lane group, so subtracting (ddx * qv.x) reflects to
+        // the OTHER in-quad lane along that axis.
+        float3 cH = c - ddx_fine(c) * qv.x;   // in-quad horizontal neighbour
+        float3 cV = c - ddy_fine(c) * qv.y;   // in-quad vertical neighbour
+        // Out-of-quad neighbours via real samples — one H, one V.
+        int2 oH = int2(clamp(pix.x + (int)qv.x, 0, W - 1), pix.y);
+        int2 oV = int2(pix.x, clamp(pix.y + (int)qv.y, 0, H - 1));
+        float3 cOH = gPostIn.Load(int3(oH, 0)).rgb;
+        float3 cOV = gPostIn.Load(int3(oV, 0)).rgb;
+        float3 avg = (cH + cV + cOH + cOV) * 0.25;
+        c = c + 0.5 * (c - avg);
     }
     // Smooth fade of godrays as the view turns away from the sun. Full strength
     // when sun is in front (dot >= ~0.2), zero behind. Prevents rays leaking

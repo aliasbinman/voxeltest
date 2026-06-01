@@ -420,8 +420,9 @@ private:
     ComPtr<ID3D11ComputeShader> csLwBlockDepthWorklist_; // pass1
     ComPtr<ID3D11ComputeShader> csLwBlockColorWorklist_; // pass2 → R16 RGB565
     ComPtr<ID3D11ComputeShader> csLwBlockSplatWorklist_; // pass2 → splat-format targets
-    ComPtr<ID3D11VertexShader>  vsLwBlockPoint_; // A/B: HW point primitive rasterizer
+    ComPtr<ID3D11VertexShader>  vsLwBlockPoint_;      // A/B: HW point primitive rasterizer
     ComPtr<ID3D11PixelShader>   psLwBlockPoint_;
+    ComPtr<ID3D11PixelShader>   psLwBlockPointSplat_; // writes splat MRT for csSplat
     // Per-LOD worklist buffer (uint4 per item: slot, blockBaseGlobal, count, firstThread).
     ComPtr<ID3D11Buffer> worklistSb_;
     ComPtr<ID3D11ShaderResourceView> worklistSrv_;

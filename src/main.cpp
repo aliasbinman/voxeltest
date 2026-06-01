@@ -146,7 +146,7 @@ struct AppState
     float roughness = 0.6f;
     bool vsync = false;
     int gridSize = 1;
-    bool taa = false;
+    bool taa = true;
     PointLighting pointLight = PointLighting::Complex;
     PointLod pointLod = PointLod::Auto;
     float pointLodScale = 1.0f;
