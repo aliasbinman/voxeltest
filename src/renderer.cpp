@@ -258,30 +258,48 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
         device_->CreateShaderResourceView(g.paletteSb.Get(), &sv, g.paletteSrv.GetAddressOf());
     }
 
-    // ---- DiskBlock pool (PointCS_Block) ----
-    uint64_t blockBytes = (uint64_t)src.blockPool.size() * sizeof(lw::DiskBlock);
-    if (blockBytes > 0)
+    // ---- Block pools (PointCS_Block) — split SoA: pos (4B) + col (8B) ----
+    uint64_t posBytes = (uint64_t)src.blockPosPool.size() * sizeof(lw::BlockPos);
+    uint64_t colBytes = (uint64_t)src.blockColPool.size() * sizeof(lw::BlockCol);
+    if (posBytes > 0)
     {
         D3D11_BUFFER_DESC bd = {};
         bd.Usage = D3D11_USAGE_IMMUTABLE;
         bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        bd.ByteWidth = (UINT)blockBytes;
+        bd.ByteWidth = (UINT)posBytes;
         bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        bd.StructureByteStride = sizeof(lw::DiskBlock);
-        D3D11_SUBRESOURCE_DATA sd = {src.blockPool.data(), 0, 0};
-        if (FAILED(device_->CreateBuffer(&bd, &sd, g.blockSb.GetAddressOf())))
+        bd.StructureByteStride = sizeof(lw::BlockPos);
+        D3D11_SUBRESOURCE_DATA sd = {src.blockPosPool.data(), 0, 0};
+        if (FAILED(device_->CreateBuffer(&bd, &sd, g.blockPosSb.GetAddressOf())))
             return false;
         D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
         sv.Format = DXGI_FORMAT_UNKNOWN;
         sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-        sv.Buffer.NumElements = (UINT)src.blockPool.size();
-        device_->CreateShaderResourceView(g.blockSb.Get(), &sv, g.blockSrv.GetAddressOf());
+        sv.Buffer.NumElements = (UINT)src.blockPosPool.size();
+        device_->CreateShaderResourceView(g.blockPosSb.Get(), &sv, g.blockPosSrv.GetAddressOf());
+    }
+    if (colBytes > 0)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        bd.ByteWidth = (UINT)colBytes;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        bd.StructureByteStride = sizeof(lw::BlockCol);
+        D3D11_SUBRESOURCE_DATA sd = {src.blockColPool.data(), 0, 0};
+        if (FAILED(device_->CreateBuffer(&bd, &sd, g.blockColSb.GetAddressOf())))
+            return false;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.Format = DXGI_FORMAT_UNKNOWN;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sv.Buffer.NumElements = (UINT)src.blockColPool.size();
+        device_->CreateShaderResourceView(g.blockColSb.Get(), &sv, g.blockColSrv.GetAddressOf());
     }
 
     g.slotCount = slotCount;
     g.pointCount = (uint32_t)src.pointPool.size();
-    g.blockCount = (uint32_t)src.blockPool.size();
-    g.bytes = pointBytes + infos.size() * sizeof(lw::GpuChunkInfo) + atlas.size() * sizeof(uint32_t) + blockBytes;
+    g.blockCount = (uint32_t)src.blockPosPool.size();
+    g.bytes = pointBytes + infos.size() * sizeof(lw::GpuChunkInfo) + atlas.size() * sizeof(uint32_t) + posBytes + colBytes;
     std::printf("[lw] LOD %d uploaded: %u slots, %u points, %u blocks, %.2f MB GPU\n",
                 L, g.slotCount, g.pointCount, g.blockCount, g.bytes / (1024.0 * 1024.0));
     return true;
@@ -301,8 +319,10 @@ bool Renderer::UploadLwWorld(const lw::World& w)
             return false;
         lwWorld_.lods[L].pointPool.clear();
         lwWorld_.lods[L].pointPool.shrink_to_fit();
-        lwWorld_.lods[L].blockPool.clear();
-        lwWorld_.lods[L].blockPool.shrink_to_fit();
+        lwWorld_.lods[L].blockPosPool.clear();
+        lwWorld_.lods[L].blockPosPool.shrink_to_fit();
+        lwWorld_.lods[L].blockColPool.clear();
+        lwWorld_.lods[L].blockColPool.shrink_to_fit();
     }
     return RebuildLwIdentityIb();
 }
@@ -662,10 +682,7 @@ bool Renderer::CreateRenderTargets()
         device_->CreateShaderResourceView(godrayTex_[i].Get(), nullptr, godraySrv_[i].GetAddressOf());
     }
 
-    // Compute rasterizer vis buffer (R32_UINT, fullscreen, UAV + SRV).
-    visBufTex_.Reset();
-    visBufUav_.Reset();
-    visBufSrv_.Reset();
+    // Two-pass split vis textures: depth R32_UINT + colour R16_UINT.
     {
         D3D11_TEXTURE2D_DESC vd = {};
         vd.Width = width_;
@@ -676,9 +693,16 @@ bool Renderer::CreateRenderTargets()
         vd.SampleDesc.Count = 1;
         vd.Usage = D3D11_USAGE_DEFAULT;
         vd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-        device_->CreateTexture2D(&vd, nullptr, visBufTex_.GetAddressOf());
-        device_->CreateUnorderedAccessView(visBufTex_.Get(), nullptr, visBufUav_.GetAddressOf());
-        device_->CreateShaderResourceView(visBufTex_.Get(), nullptr, visBufSrv_.GetAddressOf());
+        visDepthTex_.Reset(); visDepthUav_.Reset(); visDepthSrv_.Reset();
+        visColorTex_.Reset(); visColorUav_.Reset(); visColorSrv_.Reset();
+        device_->CreateTexture2D(&vd, nullptr, visDepthTex_.GetAddressOf());
+        device_->CreateUnorderedAccessView(visDepthTex_.Get(), nullptr, visDepthUav_.GetAddressOf());
+        device_->CreateShaderResourceView(visDepthTex_.Get(), nullptr, visDepthSrv_.GetAddressOf());
+        D3D11_TEXTURE2D_DESC vcd = vd;
+        vcd.Format = DXGI_FORMAT_R16_UINT;
+        device_->CreateTexture2D(&vcd, nullptr, visColorTex_.GetAddressOf());
+        device_->CreateUnorderedAccessView(visColorTex_.Get(), nullptr, visColorUav_.GetAddressOf());
+        device_->CreateShaderResourceView(visColorTex_.Get(), nullptr, visColorSrv_.GetAddressOf());
     }
 
     // Splat color RT + final UAV target.
@@ -976,12 +1000,14 @@ bool Renderer::CreateShaders()
             return false;
         if (!compileLw("psmain_lw_polyaxis_lit", "ps_5_0", bpsPaLit))
             return false;
-        ComPtr<ID3DBlob> bcsBlk, bvsR, bpsR;
-        if (!compileLw("csmain_lw_block_atomic", "cs_5_0", bcsBlk))
+        ComPtr<ID3DBlob> bvsR, bcsBlkWl, bcsBlkCWl, bpsR2;
+        if (!compileLw("csmain_lw_block_depth_worklist", "cs_5_0", bcsBlkWl))
+            return false;
+        if (!compileLw("csmain_lw_block_color_worklist", "cs_5_0", bcsBlkCWl))
             return false;
         if (!compileLw("vsmain_lw_resolve", "vs_5_0", bvsR))
             return false;
-        if (!compileLw("psmain_lw_resolve", "ps_5_0", bpsR))
+        if (!compileLw("psmain_lw_resolve_twopass", "ps_5_0", bpsR2))
             return false;
         hr = device_->CreateVertexShader(bvs->GetBufferPointer(), bvs->GetBufferSize(), nullptr, vsLwPoints_.GetAddressOf());
         if (FAILED(hr))
@@ -1007,13 +1033,16 @@ bool Renderer::CreateShaders()
         hr = device_->CreatePixelShader(bpsPaLit->GetBufferPointer(), bpsPaLit->GetBufferSize(), nullptr, psLwPolyAxisLit_.GetAddressOf());
         if (FAILED(hr))
             return false;
-        hr = device_->CreateComputeShader(bcsBlk->GetBufferPointer(), bcsBlk->GetBufferSize(), nullptr, csLwBlock_.GetAddressOf());
+        hr = device_->CreateComputeShader(bcsBlkWl->GetBufferPointer(), bcsBlkWl->GetBufferSize(), nullptr, csLwBlockDepthWorklist_.GetAddressOf());
+        if (FAILED(hr))
+            return false;
+        hr = device_->CreateComputeShader(bcsBlkCWl->GetBufferPointer(), bcsBlkCWl->GetBufferSize(), nullptr, csLwBlockColorWorklist_.GetAddressOf());
         if (FAILED(hr))
             return false;
         hr = device_->CreateVertexShader(bvsR->GetBufferPointer(), bvsR->GetBufferSize(), nullptr, vsLwResolve_.GetAddressOf());
         if (FAILED(hr))
             return false;
-        hr = device_->CreatePixelShader(bpsR->GetBufferPointer(), bpsR->GetBufferSize(), nullptr, psLwResolve_.GetAddressOf());
+        hr = device_->CreatePixelShader(bpsR2->GetBufferPointer(), bpsR2->GetBufferSize(), nullptr, psLwResolveTwoPass_.GetAddressOf());
         if (FAILED(hr))
             return false;
 
@@ -1758,8 +1787,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     struct DrawItem
     {
         uint32_t slot;
-        uint32_t drawBase;
-        uint32_t drawCount;
+        uint32_t drawBase;  // splat/poly: cluster.pointFirst (vertex offset)
+        uint32_t drawCount; // splat/poly: cluster.numPoints  (vertex count)
+        uint32_t blockFirst = 0; // PointCS_Block: offset relative to rc.blockBase
+        uint32_t blockCount = 0; // PointCS_Block: blocks to dispatch this item
     };
     std::vector<DrawItem> drawListSplat[lw::kLodCount];
     std::vector<DrawItem> drawListPoly[lw::kLodCount];
@@ -1830,7 +1861,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             std::vector<DrawItem>* dl = pickListForChunk(L,
                                                          0.5f * (mnx + mxx), 0.5f * (mny + mxy), 0.5f * (mnz + mxz));
             if (dl)
-                dl->push_back({chunkSlot, cl.pointFirst, cl.numPoints});
+                dl->push_back({chunkSlot, cl.pointFirst, cl.numPoints,
+                               rc.clusterBlockFirst[clSlot],
+                               rc.clusterBlockCount[clSlot]});
             return;
         }
 
@@ -1880,13 +1913,14 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         int desFar = desiredLodForDist(distFar);   // coarsest LOD wanted anywhere in chunk
 
         // ---- Fast path: uniform LOD across the chunk ----
+        const bool isBlock = (dl == &drawListBlock[L]);
         if (desNear == desFar)
         {
             int desired = desNear;
             if (desired >= L || L == 0)
             {
                 if (dl)
-                    dl->push_back({slot, 0u, rc.poolCount});
+                    dl->push_back({slot, 0u, rc.poolCount, 0u, rc.blockCount});
                 return;
             }
             // Need finer LOD. Per-octant: recurse where child exists AND is
@@ -1914,50 +1948,73 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             }
             if (anyFallback)
             {
-                uint32_t spanFirst = 0, spanCount = 0;
-                auto flush = [&]()
+                if (isBlock)
                 {
-                    if (spanCount > 0)
+                    // Block path: push per cluster (no coalescing — block ranges
+                    // aren't guaranteed contiguous across cluster slots in pool).
+                    for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c)
                     {
+                        uint32_t bcnt = rc.clusterBlockCount[slot_c];
+                        if (bcnt == 0)
+                            continue;
+                        int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
+                        int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
+                        int cx_g = slot_c % lw::kClustersX;
+                        int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
+                        if (!fallbackOct[oct])
+                            continue;
                         if (dl)
-                            dl->push_back({slot, spanFirst, spanCount});
-                        spanCount = 0;
-                    }
-                };
-                for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c)
-                {
-                    const lw::DiskCluster& cl = rc.clusters[slot_c];
-                    if (cl.numPoints == 0)
-                    {
-                        flush();
-                        continue;
-                    }
-                    int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
-                    int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
-                    int cx_g = slot_c % lw::kClustersX;
-                    int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
-                    if (!fallbackOct[oct])
-                    {
-                        flush();
-                        continue;
-                    }
-                    if (spanCount == 0)
-                    {
-                        spanFirst = cl.pointFirst;
-                        spanCount = cl.numPoints;
-                    }
-                    else if (cl.pointFirst == spanFirst + spanCount)
-                    {
-                        spanCount += cl.numPoints;
-                    }
-                    else
-                    {
-                        flush();
-                        spanFirst = cl.pointFirst;
-                        spanCount = cl.numPoints;
+                            dl->push_back({slot, 0u, 0u,
+                                           rc.clusterBlockFirst[slot_c], bcnt});
                     }
                 }
-                flush();
+                else
+                {
+                    uint32_t spanFirst = 0, spanCount = 0;
+                    auto flush = [&]()
+                    {
+                        if (spanCount > 0)
+                        {
+                            if (dl)
+                                dl->push_back({slot, spanFirst, spanCount, 0u, 0u});
+                            spanCount = 0;
+                        }
+                    };
+                    for (int slot_c = 0; slot_c < lw::kClustersPerChunk; ++slot_c)
+                    {
+                        const lw::DiskCluster& cl = rc.clusters[slot_c];
+                        if (cl.numPoints == 0)
+                        {
+                            flush();
+                            continue;
+                        }
+                        int cz_g = slot_c / (lw::kClustersX * lw::kClustersY);
+                        int cy_g = (slot_c / lw::kClustersX) % lw::kClustersY;
+                        int cx_g = slot_c % lw::kClustersX;
+                        int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
+                        if (!fallbackOct[oct])
+                        {
+                            flush();
+                            continue;
+                        }
+                        if (spanCount == 0)
+                        {
+                            spanFirst = cl.pointFirst;
+                            spanCount = cl.numPoints;
+                        }
+                        else if (cl.pointFirst == spanFirst + spanCount)
+                        {
+                            spanCount += cl.numPoints;
+                        }
+                        else
+                        {
+                            flush();
+                            spanFirst = cl.pointFirst;
+                            spanCount = cl.numPoints;
+                        }
+                    }
+                    flush();
+                }
             }
             return;
         }
@@ -2000,13 +2057,14 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         }
     }
     bool anyCS = anyBlock;
-    if (anyCS && visBufUav_)
+    if (anyCS && visDepthUav_ && visColorUav_)
     {
         MICROPROFILE_SCOPEGPUI("LW/PointCS/Clear", 0xff404060);
         ID3D11RenderTargetView* nullRtvsA[] = {nullptr, nullptr};
         ctx_->OMSetRenderTargets(2, nullRtvsA, nullptr);
         uint32_t clearVis[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-        ctx_->ClearUnorderedAccessViewUint(visBufUav_.Get(), clearVis);
+        ctx_->ClearUnorderedAccessViewUint(visDepthUav_.Get(), clearVis);
+        ctx_->ClearUnorderedAccessViewUint(visColorUav_.Get(), clearVis);
         // Restore splat RTs for the splat draws inside the loop.
         ID3D11RenderTargetView* mrtA[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
         ctx_->OMSetRenderTargets(2, mrtA, splatDsv_.Get());
@@ -2019,6 +2077,12 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     uint32_t prevSlot = 0xFFFFFFFFu;
     static const uint32_t kLodColors[5] = {
         0xffff6060, 0xffffa030, 0xff60c060, 0xff6098c0, 0xffc060ff};
+    // Two-pass LODs that completed pass1 and need pass2 after the per-LOD loop.
+    std::vector<int> twoPassLods;
+    // PointCS_Block stats — accumulated across LODs.
+    uint64_t blockTotalAll = 0;
+    uint32_t blockDispatchesAll = 0;
+    uint64_t blockTotalPerLod[5] = {};
     for (int L = topL; L >= 0; --L)
     {
         if (drawListSplat[L].empty() && drawListPoly[L].empty() && drawListBlock[L].empty())
@@ -2027,7 +2091,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         if (g.slotCount == 0)
             continue;
         // pointSrv may be null in block-only mode; only required by splat/poly paths.
-        if (!g.pointSrv && !g.blockSrv)
+        if (!g.pointSrv && !g.blockPosSrv)
             continue;
         const lw::LODWorld& lwL = lwWorld_.lods[L];
         MICROPROFILE_SCOPEGPUI("LW/Points/LOD", kLodColors[L < 5 ? L : 4]);
@@ -2107,79 +2171,278 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             ctx_->Unmap(cbLwCS_.Get(), 0);
         };
 
-        // PointCS_Block — per-chunk dispatch over 2x2x2 blocks with LOD fade.
-        if (!drawListBlock[L].empty() && csLwBlock_)
+        // PointCS_Block — two-pass single-dispatch worklist pass1.
+        if (!drawListBlock[L].empty() && csLwBlockDepthWorklist_)
         {
-            MICROPROFILE_SCOPEGPUI("LW/PointCS_Block", 0xffe080ff);
             // Per-LOD fade: switch-out distance = focalPx * (1<<L) / thresh.
             float switchOut = focalPx * (float)(1u << L) / thresh;
             float fadeStart = 0.75f * switchOut;
             float fadeEnd = switchOut;
 
-            // Bind UAV + SRVs once for this LOD's block dispatches.
+            // Bind shared state (SRVs + CBs) once.
             ID3D11RenderTargetView* nullRtvsB[] = {nullptr, nullptr};
             ctx_->OMSetRenderTargets(2, nullRtvsB, nullptr);
             ID3D11ShaderResourceView* nullVsB[3] = {nullptr, nullptr, nullptr};
             ctx_->VSSetShaderResources(0, 3, nullVsB);
 
-            ctx_->CSSetShader(csLwBlock_.Get(), nullptr, 0);
-            // t0 points, t1 chunkInfos, t2 palette (already in vsSrvs), + t3 blocks.
             ID3D11ShaderResourceView* csSrvBlk[] = {
-                g.pointSrv.Get(), g.chunkInfoSrv.Get(), g.paletteSrv.Get(), g.blockSrv.Get()};
-            ctx_->CSSetShaderResources(0, 4, csSrvBlk);
-            ID3D11UnorderedAccessView* uavsB[] = {visBufUav_.Get()};
-            UINT initB[] = {0};
-            ctx_->CSSetUnorderedAccessViews(0, 1, uavsB, initB);
+                g.pointSrv.Get(), g.chunkInfoSrv.Get(), g.paletteSrv.Get(),
+                g.blockPosSrv.Get(), g.blockColSrv.Get()};
+            ctx_->CSSetShaderResources(0, 5, csSrvBlk);
             ID3D11Buffer* csCbsB[] = {cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get()};
             ctx_->CSSetConstantBuffers(0, 4, csCbsB);
+            UINT initB[] = {0};
 
-            // Dedup per slot: one dispatch per chunk with its full blockCount.
+            // Sort by (slot, blockFirst) then coalesce adjacent items with
+            // contiguous block ranges in the same chunk. Loader appends cluster
+            // blocks in stream order, so consecutive cluster slots usually map
+            // to consecutive pool ranges → coalesce collapses most per-cluster
+            // items back to per-chunk-region dispatches.
             std::sort(drawListBlock[L].begin(), drawListBlock[L].end(),
                       [](const DrawItem& a, const DrawItem& b)
-                      { return a.slot < b.slot; });
-            uint32_t prevSlotB = 0xFFFFFFFFu;
+                      {
+                          if (a.slot != b.slot) return a.slot < b.slot;
+                          return a.blockFirst < b.blockFirst;
+                      });
+            {
+                auto& dl_ = drawListBlock[L];
+                size_t w = 0;
+                for (size_t r = 0; r < dl_.size(); ++r)
+                {
+                    if (w > 0 && dl_[w - 1].slot == dl_[r].slot &&
+                        dl_[w - 1].blockFirst + dl_[w - 1].blockCount == dl_[r].blockFirst)
+                    {
+                        dl_[w - 1].blockCount += dl_[r].blockCount;
+                    }
+                    else
+                    {
+                        dl_[w++] = dl_[r];
+                    }
+                }
+                dl_.resize(w);
+            }
+
             uint32_t blockDispatches = 0;
             uint64_t blockTotal = 0;
             uint32_t blockSkipEmpty = 0;
-            for (const DrawItem& it : drawListBlock[L])
+
+            // Single-dispatch worklist pass1. Caller picks dedupe variant via toggle.
             {
-                if (it.slot == prevSlotB)
-                    continue;
-                prevSlotB = it.slot;
-                const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
-                if (rc.blockCount == 0)
+                MICROPROFILE_SCOPEGPUI("LW/PointCS_Block/Pass1DepthWorklist", 0xffe0a0ff);
+                struct WI { uint32_t slot, baseGlobal, count, first; };
+                static thread_local std::vector<WI> wl;
+                wl.clear();
+                wl.reserve(drawListBlock[L].size());
+                uint32_t cumul = 0;
+                for (const DrawItem& it : drawListBlock[L])
                 {
-                    ++blockSkipEmpty;
-                    continue;
+                    if (it.blockCount == 0)
+                    {
+                        ++blockSkipEmpty;
+                        continue;
+                    }
+                    const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
+                    wl.push_back({rc.slotIdx, rc.blockBase + it.blockFirst, it.blockCount, cumul});
+                    cumul += it.blockCount;
+                    blockTotal += it.blockCount;
                 }
-                setLodCbForLod(L, rc.slotIdx, rc.blockBase);
-                writeCbLwCS(rc.blockCount, fadeStart, fadeEnd);
-                uint32_t groups = (rc.blockCount + 63) / 64;
-                ctx_->Dispatch(groups, 1, 1);
-                ++drawCount;
-                ++blockDispatches;
-                blockTotal += rc.blockCount;
+                if (!wl.empty())
+                {
+                    uint32_t needCap = (uint32_t)wl.size();
+                    if (!worklistSb_ || worklistCapacity_ < needCap)
+                    {
+                        worklistSb_.Reset();
+                        worklistSrv_.Reset();
+                        uint32_t cap = 256;
+                        while (cap < needCap) cap *= 2;
+                        D3D11_BUFFER_DESC bd = {};
+                        bd.ByteWidth = cap * 16;
+                        bd.Usage = D3D11_USAGE_DYNAMIC;
+                        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+                        bd.StructureByteStride = 16;
+                        device_->CreateBuffer(&bd, nullptr, worklistSb_.GetAddressOf());
+                        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+                        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+                        sd.Format = DXGI_FORMAT_UNKNOWN;
+                        sd.Buffer.FirstElement = 0;
+                        sd.Buffer.NumElements = cap;
+                        device_->CreateShaderResourceView(worklistSb_.Get(), &sd, worklistSrv_.GetAddressOf());
+                        worklistCapacity_ = cap;
+                    }
+                    D3D11_MAPPED_SUBRESOURCE mw;
+                    ctx_->Map(worklistSb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mw);
+                    memcpy(mw.pData, wl.data(), wl.size() * 16);
+                    ctx_->Unmap(worklistSb_.Get(), 0);
+
+                    D3D11_MAPPED_SUBRESOURCE mm;
+                    ctx_->Map(cbLwCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+                    struct
+                    {
+                        uint32_t w, h, totalThreads, numItems;
+                        float fadeStart, fadeEnd, _p1, _p2;
+                    } cbcs;
+                    cbcs.w = width_;
+                    cbcs.h = height_;
+                    cbcs.totalThreads = cumul;
+                    cbcs.numItems = (uint32_t)wl.size();
+                    cbcs.fadeStart = 0.0f;
+                    cbcs.fadeEnd = 0.0f;
+                    cbcs._p1 = cbcs._p2 = 0.0f;
+                    memcpy(mm.pData, &cbcs, sizeof(cbcs));
+                    ctx_->Unmap(cbLwCS_.Get(), 0);
+
+                    ID3D11ShaderResourceView* wlSrv[] = {worklistSrv_.Get()};
+                    ctx_->CSSetShaderResources(6, 1, wlSrv);
+                    ctx_->CSSetShader(csLwBlockDepthWorklist_.Get(), nullptr, 0);
+                    ID3D11UnorderedAccessView* uavP1[] = {visDepthUav_.Get()};
+                    ctx_->CSSetUnorderedAccessViews(0, 1, uavP1, initB);
+                    uint32_t groups = (cumul + 63) / 64;
+                    ctx_->Dispatch(groups, 1, 1);
+                    ++drawCount;
+                    ++blockDispatches;
+                    ID3D11UnorderedAccessView* nullUav[] = {nullptr};
+                    ctx_->CSSetUnorderedAccessViews(0, 1, nullUav, initB);
+                    ID3D11ShaderResourceView* nullWl[] = {nullptr};
+                    ctx_->CSSetShaderResources(6, 1, nullWl);
+                }
+                twoPassLods.push_back(L);
             }
-            // Only print when something is off: missing SRV, or items but no dispatches.
-            bool bad = (!g.blockSrv && !drawListBlock[L].empty()) || (!drawListBlock[L].empty() && blockDispatches == 0 && blockSkipEmpty == 0);
+
+            bool bad = (!g.blockPosSrv && !drawListBlock[L].empty()) || (!drawListBlock[L].empty() && blockDispatches == 0 && blockSkipEmpty == 0);
             if (bad)
             {
                 std::printf("[blockCS] L%d PROBLEM: dispatches=%u, total blocks=%llu, skip-empty=%u, srvOk=%d, items=%zu\n",
                             L, blockDispatches, (unsigned long long)blockTotal, blockSkipEmpty,
-                            g.blockSrv ? 1 : 0, drawListBlock[L].size());
+                            g.blockPosSrv ? 1 : 0, drawListBlock[L].size());
                 std::fflush(stdout);
             }
 
-            ID3D11UnorderedAccessView* nullUavB[] = {nullptr};
-            ctx_->CSSetUnorderedAccessViews(0, 1, nullUavB, initB);
-            ID3D11ShaderResourceView* nullCsSrvB[4] = {nullptr, nullptr, nullptr, nullptr};
-            ctx_->CSSetShaderResources(0, 4, nullCsSrvB);
+            ID3D11ShaderResourceView* nullCsSrvB[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+            ctx_->CSSetShaderResources(0, 5, nullCsSrvB);
             ID3D11RenderTargetView* mrtRestoreB[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
             ctx_->OMSetRenderTargets(2, mrtRestoreB, splatDsv_.Get());
             ctx_->VSSetShaderResources(0, 3, vsSrvs);
+
+            blockTotalAll += blockTotal;
+            blockDispatchesAll += blockDispatches;
+            if (L >= 0 && L < 5) blockTotalPerLod[L] += blockTotal;
         }
     }
     (void)pointCountTotal; // stats consolidated below after polyaxis pass
+
+    // ---- PointCS_Block Pass2 worklist: all LODs after all pass1s done ----
+    if (!twoPassLods.empty() && csLwBlockColorWorklist_ && visColorUav_ && visDepthSrv_)
+    {
+        MICROPROFILE_SCOPEGPUI("LW/PointCS_Block/Pass2Color", 0xffe080ff);
+        ID3D11RenderTargetView* nullRtvsP2[] = {nullptr, nullptr};
+        ctx_->OMSetRenderTargets(2, nullRtvsP2, nullptr);
+        ID3D11ShaderResourceView* nullVsP2[3] = {nullptr, nullptr, nullptr};
+        ctx_->VSSetShaderResources(0, 3, nullVsP2);
+
+        ctx_->CSSetShader(csLwBlockColorWorklist_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* dSrv[] = {visDepthSrv_.Get()};
+        ctx_->CSSetShaderResources(5, 1, dSrv);
+        ID3D11UnorderedAccessView* uavP2[] = {visColorUav_.Get()};
+        UINT initP2[] = {0};
+        ctx_->CSSetUnorderedAccessViews(0, 1, uavP2, initP2);
+        ID3D11Buffer* csCbsP2[] = {cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get()};
+        ctx_->CSSetConstantBuffers(0, 4, csCbsP2);
+
+        for (int Lp : twoPassLods)
+        {
+            const LwGpu& gp = lwGpu_[Lp];
+            const lw::LODWorld& lwLp = lwWorld_.lods[Lp];
+            // Re-bind per-LOD CS SRVs (t0..t4). t5 (depth) + t6 (worklist) below.
+            ID3D11ShaderResourceView* csSrvP2[] = {
+                gp.pointSrv.Get(), gp.chunkInfoSrv.Get(), gp.paletteSrv.Get(),
+                gp.blockPosSrv.Get(), gp.blockColSrv.Get()};
+            ctx_->CSSetShaderResources(0, 5, csSrvP2);
+
+            float switchOut = focalPx * (float)(1u << Lp) / thresh;
+            float fadeStart = 0.75f * switchOut;
+            float fadeEnd = switchOut;
+
+            // Build worklist (mirrors pass1 logic).
+            struct WI { uint32_t slot, baseGlobal, count, first; };
+            static thread_local std::vector<WI> wlP2;
+            wlP2.clear();
+            wlP2.reserve(drawListBlock[Lp].size());
+            uint32_t cumul = 0;
+            for (const DrawItem& it : drawListBlock[Lp])
+            {
+                if (it.blockCount == 0)
+                    continue;
+                const lw::RuntimeChunk& rc = lwLp.chunks[it.slot];
+                wlP2.push_back({rc.slotIdx, rc.blockBase + it.blockFirst, it.blockCount, cumul});
+                cumul += it.blockCount;
+            }
+            if (wlP2.empty())
+                continue;
+            uint32_t needCap = (uint32_t)wlP2.size();
+            if (!worklistSb_ || worklistCapacity_ < needCap)
+            {
+                worklistSb_.Reset();
+                worklistSrv_.Reset();
+                uint32_t cap = 256;
+                while (cap < needCap) cap *= 2;
+                D3D11_BUFFER_DESC bd = {};
+                bd.ByteWidth = cap * 16;
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+                bd.StructureByteStride = 16;
+                device_->CreateBuffer(&bd, nullptr, worklistSb_.GetAddressOf());
+                D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+                sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+                sd.Format = DXGI_FORMAT_UNKNOWN;
+                sd.Buffer.FirstElement = 0;
+                sd.Buffer.NumElements = cap;
+                device_->CreateShaderResourceView(worklistSb_.Get(), &sd, worklistSrv_.GetAddressOf());
+                worklistCapacity_ = cap;
+            }
+            D3D11_MAPPED_SUBRESOURCE mw;
+            ctx_->Map(worklistSb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mw);
+            memcpy(mw.pData, wlP2.data(), wlP2.size() * 16);
+            ctx_->Unmap(worklistSb_.Get(), 0);
+
+            D3D11_MAPPED_SUBRESOURCE mm;
+            ctx_->Map(cbLwCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+            struct
+            {
+                uint32_t w, h, totalThreads, numItems;
+                float fadeStart, fadeEnd, _p1, _p2;
+            } cbcs;
+            cbcs.w = width_;
+            cbcs.h = height_;
+            cbcs.totalThreads = cumul;
+            cbcs.numItems = (uint32_t)wlP2.size();
+            cbcs.fadeStart = fadeStart;
+            cbcs.fadeEnd = fadeEnd;
+            cbcs._p1 = cbcs._p2 = 0.0f;
+            memcpy(mm.pData, &cbcs, sizeof(cbcs));
+            ctx_->Unmap(cbLwCS_.Get(), 0);
+
+            ID3D11ShaderResourceView* wlSrv[] = {worklistSrv_.Get()};
+            ctx_->CSSetShaderResources(6, 1, wlSrv);
+            uint32_t groups = (cumul + 63) / 64;
+            ctx_->Dispatch(groups, 1, 1);
+            ++drawCount;
+            ID3D11ShaderResourceView* nullWl[] = {nullptr};
+            ctx_->CSSetShaderResources(6, 1, nullWl);
+        }
+
+        ID3D11UnorderedAccessView* nullUavP2[] = {nullptr};
+        ctx_->CSSetUnorderedAccessViews(0, 1, nullUavP2, initP2);
+        ID3D11ShaderResourceView* nullCsSrvP2[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+        ctx_->CSSetShaderResources(0, 5, nullCsSrvP2);
+        ID3D11ShaderResourceView* nullDSrv[] = {nullptr};
+        ctx_->CSSetShaderResources(5, 1, nullDSrv);
+        ID3D11RenderTargetView* mrtRestoreP2[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
+        ctx_->OMSetRenderTargets(2, mrtRestoreP2, splatDsv_.Get());
+    }
 
     // ---- Splat dilate CS (csSplat_) — fills holes, lighting, shadow lookup ----
     bool anySplat = false;
@@ -2276,8 +2539,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
     }
 
-    // ---- Compute rasterizer resolve: visBuf → scene RT (after composite) ----
-    if (anyCS && psLwResolve_ && vsLwResolve_)
+    // ---- Compute rasterizer resolve (two-pass): depth+colour → scene RT ----
+    if (anyCS && psLwResolveTwoPass_ && vsLwResolve_ && visDepthSrv_ && visColorSrv_)
     {
         MICROPROFILE_SCOPEGPUI("LW/PointCS/Resolve", 0xff8040c0);
         ID3D11RenderTargetView* sceneRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
@@ -2290,12 +2553,12 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         UINT zz = 0;
         ctx_->IASetVertexBuffers(0, 1, nvb, &zz, &zz);
         ctx_->VSSetShader(vsLwResolve_.Get(), nullptr, 0);
-        ctx_->PSSetShader(psLwResolve_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* rSrv[] = {visBufSrv_.Get()};
-        ctx_->PSSetShaderResources(3, 1, rSrv);
+        ctx_->PSSetShader(psLwResolveTwoPass_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* rSrv[] = {visDepthSrv_.Get(), visColorSrv_.Get()};
+        ctx_->PSSetShaderResources(3, 2, rSrv);
         ctx_->Draw(3, 0);
-        ID3D11ShaderResourceView* nullR[] = {nullptr};
-        ctx_->PSSetShaderResources(3, 1, nullR);
+        ID3D11ShaderResourceView* nullR[] = {nullptr, nullptr};
+        ctx_->PSSetShaderResources(3, 2, nullR);
         ctx_->RSSetState(rsSolid_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
     }
@@ -2410,6 +2673,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     lastSplatDrawCalls_ = splatDraws;
     lastPolyDrawCalls_ = polyDraws;
     lastFastDrawCalls_ = fastDraws;
+    lastBlockTotal_ = blockTotalAll;
+    lastBlockDispatches_ = blockDispatchesAll;
+    for (int L = 0; L < 5; ++L) lastBlockTotalPerLod_[L] = blockTotalPerLod[L];
 
     // ---- TAA composite + post (optional) ----
     ID3D11ShaderResourceView* postInput = nullptr;

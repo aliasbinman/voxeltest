@@ -37,7 +37,8 @@ constexpr const char* kSettingsPath = "voxeltest.settings";
 struct Settings
 {
     std::string lastVox;
-    int adapterIdx = -1; // -1 = system default
+    int adapterIdx = -1;  // -1 = system default
+    int monitorIdx = -1;  // -1 = system default placement; else EnumDisplayMonitors index
 };
 
 Settings LoadSettings()
@@ -53,6 +54,8 @@ Settings LoadSettings()
             s.lastVox = line.substr(8);
         else if (line.rfind("adapter=", 0) == 0)
             s.adapterIdx = std::atoi(line.c_str() + 8);
+        else if (line.rfind("monitor=", 0) == 0)
+            s.monitorIdx = std::atoi(line.c_str() + 8);
     }
     return s;
 }
@@ -63,6 +66,7 @@ void SaveSettings(const Settings& s)
         return;
     f << "lastVox=" << s.lastVox << "\n";
     f << "adapter=" << s.adapterIdx << "\n";
+    f << "monitor=" << s.monitorIdx << "\n";
 }
 
 // Compat wrappers — call sites pass a path-only or want the path only.
@@ -171,6 +175,12 @@ struct AppState
     int activeAdapterIdx = -1;                 // adapter actually in use this run
     bool lwShowBounds = false;                 // debug: draw per-chunk AABBs
     bool lwPolyAxis = false;                   // render cube faces instead of splats
+    // Saved camera views. view1 = auto-fit from world AABB (legacy default,
+    // captured on first load). view2 = curated viewpoint hardcoded below.
+    float view1Pos[3] = {0.0f, 0.0f, 0.0f};
+    float view1Yaw = 0.0f;
+    float view1Pitch = 0.0f;
+    bool  view1Valid = false;
     std::string currentVoxPath;
     std::vector<std::string> datasetPaths; // discovered assets/*.vox at startup
     int datasetIdx = 0;                    // index into datasetPaths
@@ -383,6 +393,25 @@ void FrameStatsWindow()
                     (unsigned long long)tris);
         ImGui::Text("  Splat points:    %llu  (1 point primitive each)",
                     (unsigned long long)voxSpl);
+
+        uint64_t blk = g_app.renderer.LastBlockTotal();
+        uint32_t blkDisp = g_app.renderer.LastBlockDispatches();
+        if (blk || blkDisp)
+        {
+            // Each block = 1 thread = up to 8 voxel atomics ("octet").
+            // No GPU readback for actual pixels-written, so report block count
+            // and upper-bound atomic count (= blocks * 8).
+            ImGui::Text("  Block CS:        %llu blocks  (≤ %llu atomics)  %u dispatches",
+                        (unsigned long long)blk,
+                        (unsigned long long)(blk * 8ull),
+                        blkDisp);
+            ImGui::Text("    per-LOD blocks: L0=%llu L1=%llu L2=%llu L3=%llu L4=%llu",
+                        (unsigned long long)g_app.renderer.LastBlockTotalAt(0),
+                        (unsigned long long)g_app.renderer.LastBlockTotalAt(1),
+                        (unsigned long long)g_app.renderer.LastBlockTotalAt(2),
+                        (unsigned long long)g_app.renderer.LastBlockTotalAt(3),
+                        (unsigned long long)g_app.renderer.LastBlockTotalAt(4));
+        }
     }
 
     if (g_app.renderer.HasLwWorld())
@@ -436,6 +465,20 @@ void FrameControlsWindow()
         ImGui::End();
         return;
     }
+
+    if (ImGui::Button("Copy camera (pos+rot)"))
+    {
+        float cp[3];
+        hlslpp::store(cp, g_app.camera.position);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "pos=(%.4f, %.4f, %.4f) yaw=%.6f pitch=%.6f fov=%.2f",
+                      cp[0], cp[1], cp[2],
+                      g_app.camera.yaw, g_app.camera.pitch, g_app.camera.fovDeg);
+        ImGui::SetClipboardText(buf);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(yaw/pitch in radians)");
 
     {
         // Dataset combo built from discovered assets/*.vox at startup.
@@ -660,6 +703,30 @@ void FrameControlsWindow()
             ImGui::EndGroup();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Camera"))
+        {
+            if (ImGui::Button("View 1 (auto-fit)"))
+            {
+                if (g_app.view1Valid)
+                {
+                    g_app.camera.position = hlslpp::float3(
+                        g_app.view1Pos[0], g_app.view1Pos[1], g_app.view1Pos[2]);
+                    g_app.camera.yaw = g_app.view1Yaw;
+                    g_app.camera.pitch = g_app.view1Pitch;
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(g_app.view1Valid ? "captured at first load"
+                                                  : "(load a scene first)");
+            if (ImGui::Button("View 2 (curated)"))
+            {
+                g_app.camera.position = hlslpp::float3(274.4363f, 274.3316f, 353.6918f);
+                g_app.camera.yaw = 0.802501f;
+                g_app.camera.pitch = -0.505000f;
+                g_app.camera.fovDeg = 70.0f;
+            }
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
 
@@ -697,6 +764,38 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                                 style, CW_USEDEFAULT, CW_USEDEFAULT,
                                 rc.right - rc.left, rc.bottom - rc.top,
                                 nullptr, nullptr, hInst, nullptr);
+
+    // Place on monitor index from settings (0-based EnumDisplayMonitors order;
+    // stable per boot but not guaranteed to match Display Settings numbering).
+    // monitorIdx < 0 → leave default placement.
+    {
+        int targetIdx = LoadSettings().monitorIdx;
+        if (targetIdx >= 0)
+        {
+            struct EnumCtx { std::vector<RECT> rects; };
+            EnumCtx ec;
+            EnumDisplayMonitors(nullptr, nullptr,
+                [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
+                    MONITORINFO mi = {sizeof(mi)};
+                    if (GetMonitorInfoW(mon, &mi))
+                        reinterpret_cast<EnumCtx*>(lp)->rects.push_back(mi.rcWork);
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&ec));
+            if ((int)ec.rects.size() > targetIdx)
+            {
+                const RECT& mr = ec.rects[targetIdx];
+                int winW = rc.right - rc.left;
+                int winH = rc.bottom - rc.top;
+                int monW = mr.right - mr.left;
+                int monH = mr.bottom - mr.top;
+                int x = mr.left + (monW - winW) / 2;
+                int y = mr.top + (monH - winH) / 2;
+                SetWindowPos(hwnd, nullptr, x, y, winW, winH, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+    }
+
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
@@ -923,9 +1022,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                 float dz = (float)(w.worldAabbMax[2] - w.worldAabbMin[2]);
                 float ext = (dx > dz ? dx : dz);
                 float topY = (float)w.worldAabbMax[1] + ext * 0.3f;
-                g_app.camera.position = hlslpp::float3(cx, topY, cz - ext * 0.5f);
-                g_app.camera.yaw = 0.0f;
-                g_app.camera.pitch = -0.5f;
+                // Capture legacy auto-fit values for the View1 button.
+                g_app.view1Pos[0] = cx;
+                g_app.view1Pos[1] = topY;
+                g_app.view1Pos[2] = cz - ext * 0.5f;
+                g_app.view1Yaw = 0.0f;
+                g_app.view1Pitch = -0.5f;
+                g_app.view1Valid = true;
+                // Initial placement = View2 (curated).
+                g_app.camera.position = hlslpp::float3(274.4363f, 274.3316f, 353.6918f);
+                g_app.camera.yaw = 0.802501f;
+                g_app.camera.pitch = -0.505000f;
+                g_app.camera.fovDeg = 70.0f;
                 g_app.camera.moveSpeed = ext * 0.05f;
                 g_app.camera.farZ = ext * 4.0f + 1000.0f;
                 g_app.everLoaded = true;

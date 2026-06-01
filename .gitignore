@@ -35,6 +35,9 @@ assets/*
 # ImGui runtime state
 imgui.ini
 
+# Local user/app state
+voxeltest.settings
+
 # OS junk
 Thumbs.db
 .DS_Store

@@ -81,30 +81,35 @@ struct DiskPoint
 static_assert(sizeof(DiskPoint) == 8, "");
 
 // =====================================================================
-// Disk-resident BLOCK (16 bytes). 2x2x2 voxels packed together.
-//   blockX/Y/Z   = chunk-local block coord (0..127 for 256-voxel chunk)
-//   occupancy    = 8-bit mask, bit i = voxel i present
-//                  voxel-i local offset = (i & 1, (i>>1)&1, (i>>2)&1)
-//   palIdx[i]    = chunk palette index for voxel i (valid where occupancy bit set)
-//   parentRgb565 = direct RGB565 of the coarser-LOD voxel covering this block's
-//                  centre. Used to LOD pop-hide via fade in the compute rasterizer.
-//                  Stored as colour (not palIdx) so the shader doesn't need
-//                  cross-LOD palette indirection.
-// Used by PointCS_Block path. Coexists with DiskPoint format.
+// Runtime BLOCK split into two parallel SoA arrays for the
+// PointCS_Block path. Same index used into both pools.
+//
+//   BlockPos (4 B) — pos + occupancy. Pass 1 (depth-only) reads this.
+//     blockX/Y/Z   = chunk-local block coord (0..127 for 256-voxel chunk)
+//     occupancy    = 8-bit mask, bit i = voxel i present
+//                    voxel-i local offset = (i & 1, (i>>1)&1, (i>>2)&1)
+//
+//   BlockCol (8 B) — palette per voxel. Pass 2 / single-pass reads this.
+//     palIdx[i]    = chunk palette index for voxel i (valid where occ bit set)
+//
+// parentRgb565 dropped (was used for LOD pop-hide; will be recomputed in
+// shader when needed).
 // =====================================================================
 #pragma pack(push, 1)
-struct DiskBlock
+struct BlockPos
 {
     uint8_t blockX;
     uint8_t blockY;
     uint8_t blockZ;
     uint8_t occupancy;
+};
+struct BlockCol
+{
     uint8_t palIdx[8];
-    uint16_t parentRgb565;
-    uint8_t _pad[2];
 };
 #pragma pack(pop)
-static_assert(sizeof(DiskBlock) == 16, "");
+static_assert(sizeof(BlockPos) == 4, "");
+static_assert(sizeof(BlockCol) == 8, "");
 
 // kFlag for chunk blob: compact per-chunk OCTET stream at end of blob.
 // Format (V3, file version 2):
@@ -426,9 +431,15 @@ struct RuntimeChunk
     uint32_t slotIdx;   // index into LODWorld's ChunkInfo SRV; top byte
                         //  of startVertex during Draw.
 
-    // PointCS_Block: per-chunk DiskBlock range in this LOD's blockPool.
+    // PointCS_Block: per-chunk block range. Same index into blockPosPool
+    // and blockColPool of this LOD.
     uint32_t blockBase;
     uint32_t blockCount;
+    // Per-cluster block sub-ranges (offsets relative to blockBase). Filled by
+    // loader during V3 stream walk. clusterBlockCount[ci]==0 = no blocks for
+    // that cluster. Used by per-cluster cull + LOD on the block dispatch path.
+    uint32_t clusterBlockFirst[kClustersPerChunk];
+    uint32_t clusterBlockCount[kClustersPerChunk];
 
     // Per-chunk palette (uploaded once to per-LOD palette atlas).
     uint32_t paletteCount;
@@ -456,8 +467,10 @@ struct LODWorld
     // poolBase serves both CPU+GPU. Loader fills; renderer can drop after
     // upload if it wants to.
     std::vector<DiskPoint> pointPool;
-    // Parallel block pool for PointCS_Block. Empty if .lw lacks block stream.
-    std::vector<DiskBlock> blockPool;
+    // Parallel block pools for PointCS_Block. Empty if .lw lacks block stream.
+    // Same index into both. Split for bandwidth: pass 1 only needs BlockPos.
+    std::vector<BlockPos> blockPosPool;
+    std::vector<BlockCol> blockColPool;
 };
 
 struct World

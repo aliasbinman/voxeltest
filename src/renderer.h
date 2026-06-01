@@ -208,6 +208,16 @@ public:
     {
         return lastFastDrawCalls_;
     }
+    // PointCS_Block stats: total blocks dispatched across all LODs this frame.
+    // Each block = up to 8 voxels (octet) → atomic upper bound = blocks * 8.
+    // Pass1 + Pass2 share the same input set; this counts blocks once.
+    uint64_t LastBlockTotal() const { return lastBlockTotal_; }
+    uint32_t LastBlockDispatches() const { return lastBlockDispatches_; }
+    uint64_t LastBlockTotalAt(int lod) const
+    {
+        if (lod < 0 || lod >= 5) return 0;
+        return lastBlockTotalPerLod_[lod];
+    }
 
 private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
@@ -331,8 +341,10 @@ private:
         ComPtr<ID3D11ShaderResourceView> chunkInfoSrv;
         ComPtr<ID3D11Buffer> paletteSb;
         ComPtr<ID3D11ShaderResourceView> paletteSrv;
-        ComPtr<ID3D11Buffer> blockSb; // DiskBlock pool (PointCS_Block)
-        ComPtr<ID3D11ShaderResourceView> blockSrv;
+        ComPtr<ID3D11Buffer> blockPosSb; // BlockPos pool (PointCS_Block, 4B/block: pos+occ)
+        ComPtr<ID3D11ShaderResourceView> blockPosSrv;
+        ComPtr<ID3D11Buffer> blockColSb; // BlockCol pool (8B/block: palIdx[8])
+        ComPtr<ID3D11ShaderResourceView> blockColSrv;
         uint32_t slotCount = 0;
         uint32_t pointCount = 0;
         uint32_t blockCount = 0;
@@ -357,14 +369,23 @@ private:
     ComPtr<ID3D11Buffer> lwIdentityIb_;
     uint32_t lwIdentityIbCount_ = 0;
 
-    // ---- Compute rasterizer (PointAtomicCS) ----
-    ComPtr<ID3D11Texture2D> visBufTex_; // R32_UINT, fullscreen
-    ComPtr<ID3D11UnorderedAccessView> visBufUav_;
-    ComPtr<ID3D11ShaderResourceView> visBufSrv_;
-    ComPtr<ID3D11Buffer> cbLwCS_;           // tile params + dispatch count
-    ComPtr<ID3D11ComputeShader> csLwBlock_; // PointCS_Block (2x2x2 blocks + LOD fade)
+    // ---- Compute rasterizer (PointCS_Block two-pass worklist) ----
+    // Pass1 writes R32 depth (atomic). Pass2 reads depth, writes R16 colour.
+    ComPtr<ID3D11Texture2D> visDepthTex_;
+    ComPtr<ID3D11UnorderedAccessView> visDepthUav_;
+    ComPtr<ID3D11ShaderResourceView> visDepthSrv_;
+    ComPtr<ID3D11Texture2D> visColorTex_;
+    ComPtr<ID3D11UnorderedAccessView> visColorUav_;
+    ComPtr<ID3D11ShaderResourceView> visColorSrv_;
+    ComPtr<ID3D11Buffer> cbLwCS_;
+    ComPtr<ID3D11ComputeShader> csLwBlockDepthWorklist_; // pass1
+    ComPtr<ID3D11ComputeShader> csLwBlockColorWorklist_; // pass2
+    // Per-LOD worklist buffer (uint4 per item: slot, blockBaseGlobal, count, firstThread).
+    ComPtr<ID3D11Buffer> worklistSb_;
+    ComPtr<ID3D11ShaderResourceView> worklistSrv_;
+    uint32_t worklistCapacity_ = 0;
     ComPtr<ID3D11VertexShader> vsLwResolve_;
-    ComPtr<ID3D11PixelShader> psLwResolve_;
+    ComPtr<ID3D11PixelShader> psLwResolveTwoPass_;
 
     ComPtr<ID3D11Buffer> cbPerFrame_;
 
@@ -379,6 +400,9 @@ private:
     uint32_t lastSplatDrawCalls_ = 0;
     uint32_t lastPolyDrawCalls_ = 0;
     uint32_t lastFastDrawCalls_ = 0;
+    uint64_t lastBlockTotal_ = 0;
+    uint32_t lastBlockDispatches_ = 0;
+    uint64_t lastBlockTotalPerLod_[5] = {};
     uint64_t shaderMtime_ = 0;
     bool shaderReloading_ = false;
 

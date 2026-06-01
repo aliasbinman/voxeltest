@@ -311,26 +311,31 @@ float4 psmain_lw_bounds(VSBoundsOut i) : SV_Target
 cbuffer CBLwCS : register(b3)
 {
     uint2 gVwSize;             // viewport pixels
-    uint  gLwPointCount;       // block count in this dispatch
-    uint  _padCs0;
+    uint  gLwPointCount;       // worklist: total threads (sum of item counts)
+                               // legacy: block count in this dispatch
+    uint  gLwNumWorkItems;     // worklist: number of items in gLwWorkItems
     float gLodFadeStart;       // world distance — fade to parent starts
     float gLodFadeEnd;         // world distance — fully parent (LOD about to be replaced)
     float2 _padCs1;
 };
 
-struct LwBlock {
-    uint pack0;       // [0]=blockX [1]=blockY [2]=blockZ [3]=occupancy
-    uint pack1;       // 4 palIdx (bytes 0..3)
-    uint pack2;       // 4 palIdx (bytes 4..7)
-    uint pack3;       // [0..1]=parentRgb565  [2..3]=pad
-};
-
 RWTexture2D<uint>         gLwVisUav      : register(u0);
-StructuredBuffer<LwBlock> gLwBlocks      : register(t3);
+// Split SoA blocks:
+//   gLwBlockPos at t3: 4B/block — pack0 = bx|by|bz|occ (low..high bytes)
+//   gLwBlockCol at t4: 8B/block — pack1 = palIdx[0..3], pack2 = palIdx[4..7]
+StructuredBuffer<uint>  gLwBlockPos : register(t3);
+StructuredBuffer<uint2> gLwBlockCol : register(t4);
 
-// Resolve PS: full-screen pass, reads visBuf via SRV, outputs to scene RT.
-// alpha = 0 for sky pixels so the post pass draws sky / godrays for them.
-Texture2D<uint> gLwVisSrv : register(t3);
+// Two-pass: pass1 writes 32-bit depth via UAV; pass2 reads it as SRV at t5.
+Texture2D<uint> gLwDepthSrv : register(t5);
+
+// Worklist for single-dispatch pass1. Sorted ascending by .w (firstThread).
+//   x = slot, y = blockBaseGlobal, z = count, w = firstThread (cumulative).
+StructuredBuffer<uint4> gLwWorkItems : register(t6);
+
+// Resolve PS bindings (two-pass): t3 = depth (R32_UINT), t4 = color (R16_UINT).
+Texture2D<uint> gLwTpDepthSrv : register(t3);
+Texture2D<uint> gLwTpColorSrv : register(t4);
 
 struct VLwResolveOut { float4 pos : SV_Position; };
 VLwResolveOut vsmain_lw_resolve(uint vid : SV_VertexID)
@@ -342,12 +347,13 @@ VLwResolveOut vsmain_lw_resolve(uint vid : SV_VertexID)
     return o;
 }
 
-float4 psmain_lw_resolve(VLwResolveOut i) : SV_Target
+// Two-pass resolve: depth UAV (t3) gates discard, colour UAV (t4) supplies RGB565.
+float4 psmain_lw_resolve_twopass(VLwResolveOut i) : SV_Target
 {
     int2 pix = int2(i.pos.xy);
-    uint pack = gLwVisSrv.Load(int3(pix, 0));
-    if (pack == 0xFFFFFFFFu) discard;          // preserve existing pixel (sky / splat)
-    uint rgb565 = pack & 0xFFFFu;
+    uint depth = gLwTpDepthSrv.Load(int3(pix, 0));
+    if (depth == 0xFFFFFFFFu) discard;
+    uint rgb565 = gLwTpColorSrv.Load(int3(pix, 0)) & 0xFFFFu;
     uint r = (rgb565 >> 11) & 0x1Fu;
     uint g = (rgb565 >>  5) & 0x3Fu;
     uint b =  rgb565        & 0x1Fu;
@@ -356,39 +362,53 @@ float4 psmain_lw_resolve(VLwResolveOut i) : SV_Target
 
 
 // ============================================================
-// PointCS_Block: 1 thread per 2x2x2 block. Up to 8 atomics.
-// Each block carries parentRgb565 (coarser-LOD voxel colour at
-// block centre) for distance-based pop-hide fade.
+// Single-dispatch worklist pass1. Caller submits ONE Dispatch covering all
+// LOD items at once. gid -> item via binary search over firstThread. Avoids
+// per-item UAV barriers and CB Map/Unmap stalls.
 // ============================================================
 [numthreads(64, 1, 1)]
-void csmain_lw_block_atomic(uint3 dt : SV_DispatchThreadID)
+void csmain_lw_block_depth_worklist(uint3 dt : SV_DispatchThreadID)
 {
-    uint bid = dt.x;
-    if (bid >= gLwPointCount) return;
+    uint gid = dt.x;
+    if (gid >= gLwPointCount) return;
 
-    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
-    LwBlock b = gLwBlocks[gLwDrawBase + bid];
+  //  gLwVisUav[int2(gid & 1023, (gid >> 10) & 1023)] = 0;
+  //  return;
+    
+    
+    // Binary search: find largest i where gLwWorkItems[i].w <= gid.
+    uint lo = 0u;
+    uint hi = gLwNumWorkItems; // exclusive
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (gLwWorkItems[mid].w <= gid) lo = mid;
+        else                            hi = mid;
+    }
+    uint4 item = gLwWorkItems[lo];
+    uint slot         = item.x;
+    uint blockBase    = item.y;
+    uint count        = item.z;
+    uint firstThread  = item.w;
+    if (gid - firstThread >= count) return; // padding tail
 
-    uint bx  = (b.pack0 >>  0) & 0xFFu;
-    uint by  = (b.pack0 >>  8) & 0xFFu;
-    uint bz  = (b.pack0 >> 16) & 0xFFu;
-    uint occ = (b.pack0 >> 24) & 0xFFu;
-    uint parentRgb565 = b.pack3 & 0xFFFFu;
+    LwChunkInfo ci = gLwChunkInfos[slot];
+    uint pack0 = gLwBlockPos[blockBase + (gid - firstThread)];
 
-    // LOD fade weight: 0 at block centre near, 1 at far → fully parent colour.
-    float3 blockCentre = ci.worldOrigin + (float3((float)bx, (float)by, (float)bz) * 2.0 + 1.0) * ci.lodScale;
-    float dist = length(blockCentre - gCamPos);
-    float fade = saturate((dist - gLodFadeStart) / max(gLodFadeEnd - gLodFadeStart, 1e-3));
+    uint bx  = (pack0 >>  0) & 0xFFu;
+    uint by  = (pack0 >>  8) & 0xFFu;
+    uint bz  = (pack0 >> 16) & 0xFFu;
+    uint occ = (pack0 >> 24) & 0xFFu;
 
-    uint pR = (parentRgb565 >> 11) & 0x1Fu;
-    uint pG = (parentRgb565 >>  5) & 0x3Fu;
-    uint pB =  parentRgb565        & 0x1Fu;
-    float3 parentCol = float3((float)pR / 31.0, (float)pG / 63.0, (float)pB / 31.0);
-
-    [unroll] for (uint i = 0; i < 8; ++i) {
-        if (((occ >> i) & 1u) == 0u) continue;
-        uint palIdx = (i < 4u) ? ((b.pack1 >> (i * 8u)) & 0xFFu)
-                                : ((b.pack2 >> ((i - 4u) * 8u)) & 0xFFu);
+    [unroll]
+    for (uint i = 0; i < 8; ++i)
+    {
+        if (((occ >> i) & 1u) == 0u)
+            continue;
+        
+    //[unroll] for (uint j = 0; j < 8; ++j) {
+    //    uint i = firstbitlow(occ);
+        occ = occ & ~(1u << i); // clear lowest set bit for next iteration
+        
         uint lx = (i >> 0) & 1u;
         uint ly = (i >> 1) & 1u;
         uint lz = (i >> 2) & 1u;
@@ -407,21 +427,80 @@ void csmain_lw_block_atomic(uint3 dt : SV_DispatchThreadID)
         if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
             pix.y < 0 || pix.y >= (int)gVwSize.y) continue;
 
-        uint colPck = gLwPalette[ci.paletteBase + palIdx];
-        float fr = (float)((colPck >>  0) & 0xFFu) / 255.0;
-        float fg = (float)((colPck >>  8) & 0xFFu) / 255.0;
-        float fb = (float)((colPck >> 16) & 0xFFu) / 255.0;
-        float3 fineCol = float3(fr, fg, fb);
-
-        float3 blended = lerp(fineCol, parentCol, fade);
-        uint rR = (uint)(saturate(blended.r) * 31.0);
-        uint rG = (uint)(saturate(blended.g) * 63.0);
-        uint rB = (uint)(saturate(blended.b) * 31.0);
-        uint rgb565 = (rR << 11) | (rG << 5) | rB;
-
-        uint depthU16 = (uint)(saturate(ndc.z) * 65535.0);
-        uint invDepth = 0xFFFFu - depthU16;
-        uint packed   = (invDepth << 16) | rgb565;
-        InterlockedMin(gLwVisUav[pix], packed);
+        uint scaledZ    = (uint)(saturate(ndc.z) * 4294967294.0);
+        uint invDepth32 = 0xFFFFFFFEu - scaledZ;
+        InterlockedMin(gLwVisUav[pix], invDepth32);
     }
 }
+
+// Single-dispatch worklist pass2 colour. Same gid→item lookup as depth_worklist.
+[numthreads(64, 1, 1)]
+void csmain_lw_block_color_worklist(uint3 dt : SV_DispatchThreadID)
+{
+    uint gid = dt.x;
+    if (gid >= gLwPointCount) return;
+
+ //   gLwVisUav[int2(gid & 1023, (gid >> 10) & 1023)] = 0x00ff0000;
+ //   return;
+    
+    uint lo = 0u, hi = gLwNumWorkItems;
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (gLwWorkItems[mid].w <= gid) lo = mid;
+        else                            hi = mid;
+    }
+    uint4 item = gLwWorkItems[lo];
+    uint slot        = item.x;
+    uint blockBase   = item.y;
+    uint count       = item.z;
+    uint firstThread = item.w;
+    if (gid - firstThread >= count) return;
+
+    LwChunkInfo ci = gLwChunkInfos[slot];
+    uint  pack0 = gLwBlockPos[blockBase + (gid - firstThread)];
+    uint2 cols  = gLwBlockCol[blockBase + (gid - firstThread)];
+
+    uint bx  = (pack0 >>  0) & 0xFFu;
+    uint by  = (pack0 >>  8) & 0xFFu;
+    uint bz  = (pack0 >> 16) & 0xFFu;
+    uint occ = (pack0 >> 24) & 0xFFu;
+
+    [unroll] for (uint i = 0; i < 8; ++i) {
+        if (((occ >> i) & 1u) == 0u) continue;
+        
+        
+        
+        uint palIdx = (i < 4u) ? ((cols.x >> (i * 8u)) & 0xFFu)
+                                : ((cols.y >> ((i - 4u) * 8u)) & 0xFFu);
+        uint lx = (i >> 0) & 1u;
+        uint ly = (i >> 1) & 1u;
+        uint lz = (i >> 2) & 1u;
+        float3 local = float3((float)(bx * 2u + lx), (float)(by * 2u + ly), (float)(bz * 2u + lz)) + 0.5;
+        float3 world = ci.worldOrigin + local * ci.lodScale;
+
+        float4 clip = mul(float4(world, 1.0), gViewProj);
+        if (clip.w <= 0.0) continue;
+        float3 ndc = clip.xyz / clip.w;
+        if (ndc.x < -1.0 || ndc.x > 1.0 ||
+            ndc.y < -1.0 || ndc.y > 1.0 ||
+            ndc.z <  0.0 || ndc.z > 1.0) continue;
+        int2 pix;
+        pix.x = (int)((ndc.x * 0.5 + 0.5) * (float)gVwSize.x);
+        pix.y = (int)((-ndc.y * 0.5 + 0.5) * (float)gVwSize.y);
+        if (pix.x < 0 || pix.x >= (int)gVwSize.x ||
+            pix.y < 0 || pix.y >= (int)gVwSize.y) continue;
+
+        uint myScaled   = (uint)(saturate(ndc.z) * 4294967294.0);
+        uint myInvDepth = 0xFFFFFFFEu - myScaled;
+        uint winDepth   = gLwDepthSrv.Load(int3(pix, 0));
+        if (myInvDepth != winDepth) continue;
+
+        uint colPck = gLwPalette[ci.paletteBase + palIdx];
+        uint rR = (uint)(((colPck >>  0) & 0xFFu) >> 3);
+        uint rG = (uint)(((colPck >>  8) & 0xFFu) >> 2);
+        uint rB = (uint)(((colPck >> 16) & 0xFFu) >> 3);
+        uint rgb565 = (rR << 11) | (rG << 5) | rB;
+        gLwVisUav[pix] = rgb565;
+    }
+}
+

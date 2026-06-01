@@ -111,7 +111,8 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         lw.lodScale = 1u << L;
         lw.chunks.clear();
         lw.pointPool.clear();
-        lw.blockPool.clear();
+        lw.blockPosPool.clear();
+        lw.blockColPool.clear();
         const uint32_t cc = lh[L].chunkCount;
         if (cc == 0)
             continue;
@@ -278,24 +279,17 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
             rc.poolCount = 1; // dummy non-zero so visit()/childChunks check passes
             rc.slotIdx = i;
             memset(rc.clusters, 0, sizeof(rc.clusters));
-            // HACK: visit() recursion uses cluster.numPoints>0 to descend.
-            // Now that pass3 is gone there are no real per-cluster counts.
-            // Mark all clusters non-empty with dummy data so visit() walks
-            // every chunk and routes to drawListBlock via pickListForChunk.
-            // Block dispatch dedups by slot and dispatches chunk's full
-            // blockCount once — bogus per-cluster counts never reach a draw.
-            for (int s = 0; s < kClustersPerChunk; ++s)
-            {
-                rc.clusters[s].numPoints = 1;
-                rc.clusters[s].pointFirst = 0;
-                rc.clusters[s].bounds = PackClusterBounds(0, 0, 0,
-                                                          kClusterVoxX - 1, kClusterVoxY - 1, kClusterVoxZ - 1);
-            }
+            // Per-cluster numPoints + bounds filled below as the V3 stream walk
+            // visits each cluster. Clusters absent from the stream stay 0 so
+            // visitCluster() early-returns instead of doing 128 frustum tests
+            // per chunk.
             tHeaderMs += std::chrono::duration<double, std::milli>(clk::now() - tHdr0).count();
 
             // ---- V3 compact octet stream (PointCS_Block) — only payload now ----
-            rc.blockBase = (uint32_t)lw.blockPool.size();
+            rc.blockBase = (uint32_t)lw.blockPosPool.size();
             rc.blockCount = 0;
+            memset(rc.clusterBlockFirst, 0, sizeof(rc.clusterBlockFirst));
+            memset(rc.clusterBlockCount, 0, sizeof(rc.clusterBlockCount));
             auto tBlk0 = clk::now();
             if (ce.flags & kFlagBlocks)
             {
@@ -308,6 +302,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                         uint8_t cid = *p++;
                         bool lastCluster = (cid & 0x80u) != 0;
                         uint32_t ci = (uint32_t)(cid & 0x7Fu);
+                        uint32_t clusterBlockFirst = (uint32_t)lw.blockPosPool.size() - rc.blockBase;
                         uint32_t cx = ci % kClustersX;
                         uint32_t cy = (ci / kClustersX) % kClustersY;
                         uint32_t cz = ci / (kClustersX * kClustersY);
@@ -322,6 +317,9 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                         uint32_t octetCount = 0;
                         uint8_t modeByte = 0;
                         int prevColor = -1;
+                        // Tight per-cluster voxel-AABB (cluster-local 0..31 per axis).
+                        uint32_t cMinX = 31, cMinY = 31, cMinZ = 31;
+                        uint32_t cMaxX = 0, cMaxY = 0, cMaxZ = 0;
                         while (!clusterEnd)
                         {
                             if ((octetCount & 3u) == 0u)
@@ -394,19 +392,47 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                             uint32_t blockX = (clusterOriginVoxX >> 1) + ox;
                             uint32_t blockY = (clusterOriginVoxY >> 1) + oy;
                             uint32_t blockZ = (clusterOriginVoxZ >> 1) + oz;
-                            DiskBlock b{};
-                            b.blockX = (uint8_t)blockX;
-                            b.blockY = (uint8_t)blockY;
-                            b.blockZ = (uint8_t)blockZ;
-                            b.occupancy = mask;
+                            BlockPos bp{};
+                            bp.blockX = (uint8_t)blockX;
+                            bp.blockY = (uint8_t)blockY;
+                            bp.blockZ = (uint8_t)blockZ;
+                            bp.occupancy = mask;
+                            lw.blockPosPool.push_back(bp);
+                            // Tight AABB in cluster-local LOD-voxel coords.
+                            // Block covers voxels [block*2, block*2+1]; subtract cluster origin in voxels.
+                            uint32_t lvxMin = (blockX * 2u) - clusterOriginVoxX;
+                            uint32_t lvxMax = lvxMin + 1u;
+                            uint32_t lvyMin = (blockY * 2u) - clusterOriginVoxY;
+                            uint32_t lvyMax = lvyMin + 1u;
+                            uint32_t lvzMin = (blockZ * 2u) - clusterOriginVoxZ;
+                            uint32_t lvzMax = lvzMin + 1u;
+                            if (lvxMin < cMinX) cMinX = lvxMin;
+                            if (lvyMin < cMinY) cMinY = lvyMin;
+                            if (lvzMin < cMinZ) cMinZ = lvzMin;
+                            if (lvxMax > cMaxX) cMaxX = lvxMax;
+                            if (lvyMax > cMaxY) cMaxY = lvyMax;
+                            if (lvzMax > cMaxZ) cMaxZ = lvzMax;
+                            BlockCol bc{};
                             for (int vi = 0; vi < 8; ++vi)
-                                b.palIdx[vi] = palFull[vi];
-                            // parentRgb565 computed in shader now.
-                            lw.blockPool.push_back(b);
+                                bc.palIdx[vi] = palFull[vi];
+                            lw.blockColPool.push_back(bc);
                             ++rc.blockCount;
                             ++octetCount;
                             if (clusterEnd && implicitRemaining == 0)
                                 break;
+                        }
+                        // Record per-cluster block range (relative to chunk's blockBase).
+                        if (ci < (uint32_t)kClustersPerChunk)
+                        {
+                            rc.clusterBlockFirst[ci] = clusterBlockFirst;
+                            rc.clusterBlockCount[ci] = octetCount;
+                            if (octetCount > 0)
+                            {
+                                rc.clusters[ci].numPoints = 1; // visitCluster gate
+                                rc.clusters[ci].pointFirst = 0;
+                                rc.clusters[ci].bounds = PackClusterBounds(
+                                    cMinX, cMinY, cMinZ, cMaxX, cMaxY, cMaxZ);
+                            }
                         }
                         if (lastCluster)
                             clusterDone = true;
