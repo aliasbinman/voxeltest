@@ -366,6 +366,7 @@ bool Renderer::UploadLwLodOnly(const lw::World& w, int L)
         return false;
     lwWorld_.lods[L].pointPool.clear();
     lwWorld_.lods[L].pointPool.shrink_to_fit();
+    if (L == 0) aoDirty_ = true; // top-down depth derived from LOD0
     return RebuildLwIdentityIb();
 }
 
@@ -565,6 +566,53 @@ bool Renderer::RebuildCombinedLwGpu()
     return true;
 }
 
+bool Renderer::EnsureAoTextures(uint32_t size)
+{
+    if (size == aoTexSize_ && aoTopDownTex_ && aoOcclTex_)
+        return true;
+    aoTopDownTex_.Reset();
+    aoTopDownUav_.Reset();
+    aoTopDownSrv_.Reset();
+    aoOcclTex_.Reset();
+    aoOcclUav_.Reset();
+    aoOcclSrv_.Reset();
+
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = size; d.Height = size;
+    d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R32_UINT;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(device_->CreateTexture2D(&d, nullptr, aoTopDownTex_.GetAddressOf()))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uv = {};
+    uv.Format = DXGI_FORMAT_R32_UINT;
+    uv.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    if (FAILED(device_->CreateUnorderedAccessView(aoTopDownTex_.Get(), &uv, aoTopDownUav_.GetAddressOf()))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format = DXGI_FORMAT_R32_UINT;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    if (FAILED(device_->CreateShaderResourceView(aoTopDownTex_.Get(), &sv, aoTopDownSrv_.GetAddressOf()))) return false;
+
+    D3D11_TEXTURE2D_DESC d2 = d;
+    d2.Format = DXGI_FORMAT_R8_UNORM;
+    if (FAILED(device_->CreateTexture2D(&d2, nullptr, aoOcclTex_.GetAddressOf()))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uv2 = {};
+    uv2.Format = DXGI_FORMAT_R8_UNORM;
+    uv2.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    if (FAILED(device_->CreateUnorderedAccessView(aoOcclTex_.Get(), &uv2, aoOcclUav_.GetAddressOf()))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv2 = {};
+    sv2.Format = DXGI_FORMAT_R8_UNORM;
+    sv2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv2.Texture2D.MipLevels = 1;
+    if (FAILED(device_->CreateShaderResourceView(aoOcclTex_.Get(), &sv2, aoOcclSrv_.GetAddressOf()))) return false;
+
+    aoTexSize_ = size;
+    aoDirty_ = true;
+    return true;
+}
+
 void Renderer::PrepLwWorld(const lw::World& w)
 {
     ClearLwWorld();
@@ -575,6 +623,16 @@ void Renderer::PrepLwWorld(const lw::World& w)
         lwWorld_.worldAabbMax[i] = w.worldAabbMax[i];
     }
     lwHasWorld_ = true;
+
+    // Size AO map to world voxel extent → 1 texel = 1 LOD0 voxel.
+    int32_t xExt = w.worldAabbMax[0] - w.worldAabbMin[0];
+    int32_t zExt = w.worldAabbMax[2] - w.worldAabbMin[2];
+    uint32_t maxExt = (uint32_t)std::max(1, std::max(xExt, zExt));
+    uint32_t pow2 = 1;
+    while (pow2 < maxExt) pow2 <<= 1;
+    pow2 = std::min(pow2, kAoTexSizeMax);
+    pow2 = std::max(pow2, 1024u);
+    EnsureAoTextures(pow2);
 }
 
 bool Renderer::RebuildLwIdentityIb()
@@ -1283,6 +1341,11 @@ bool Renderer::CreateShaders()
         ComPtr<ID3DBlob> bcsBlkSpWl;
         if (!compileLw("csmain_lw_block_splat_worklist", "cs_5_0", bcsBlkSpWl))
             return false;
+        ComPtr<ID3DBlob> bcsAoBuild, bcsAoHbao;
+        if (!compileLw("csmain_ao_build_topdown", "cs_5_0", bcsAoBuild))
+            return false;
+        if (!compileLw("csmain_ao_hbao_filter", "cs_5_0", bcsAoHbao))
+            return false;
         ComPtr<ID3DBlob> bvsBlkPt, bpsBlkPt, bpsBlkPtSp;
         if (!compileLw("vsmain_lw_blockpoint", "vs_5_0", bvsBlkPt))
             return false;
@@ -1325,6 +1388,12 @@ bool Renderer::CreateShaders()
         if (FAILED(hr))
             return false;
         hr = device_->CreateComputeShader(bcsBlkSpWl->GetBufferPointer(), bcsBlkSpWl->GetBufferSize(), nullptr, csLwBlockSplatWorklist_.GetAddressOf());
+        if (FAILED(hr))
+            return false;
+        hr = device_->CreateComputeShader(bcsAoBuild->GetBufferPointer(), bcsAoBuild->GetBufferSize(), nullptr, csAoTopDownBuild_.GetAddressOf());
+        if (FAILED(hr))
+            return false;
+        hr = device_->CreateComputeShader(bcsAoHbao->GetBufferPointer(), bcsAoHbao->GetBufferSize(), nullptr, csAoHbaoFilter_.GetAddressOf());
         if (FAILED(hr))
             return false;
         hr = device_->CreateVertexShader(bvsBlkPt->GetBufferPointer(), bvsBlkPt->GetBufferSize(), nullptr, vsLwBlockPoint_.GetAddressOf());
@@ -1370,6 +1439,11 @@ bool Renderer::CreateShaders()
         bd.ByteWidth = 32;
         if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwCS_.GetAddressOf())))
             return false;
+        // CBLwAo: 48 bytes
+        bd.ByteWidth = 48;
+        if (FAILED(device_->CreateBuffer(&bd, nullptr, cbLwAo_.GetAddressOf())))
+            return false;
+        // AO textures created lazily in EnsureAoTextures (sized to world).
     }
 
     return true;
@@ -2285,6 +2359,206 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11RenderTargetView* mrtA[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
         ctx_->OMSetRenderTargets(2, mrtA, splatDsv_.Get());
     }
+
+    // ---- CBLwAo upload (only when enabled) + one-shot build ----
+    if (args.cheapAO && cbLwAo_ && aoTopDownTex_)
+    {
+        // Tight AABB from LOD0 chunk culls — header AABB is padded.
+        float xMin = +1e30f, zMin = +1e30f, yMin = +1e30f;
+        float xMax = -1e30f, zMax = -1e30f, yMax = -1e30f;
+        if (!lwWorld_.lods[0].chunks.empty())
+        {
+            const lw::LODWorld& lw0 = lwWorld_.lods[0];
+            size_t cc = lw0.chunks.size();
+            for (size_t i = 0; i < cc; ++i)
+            {
+                if (lw0.chunks[i].blockCount == 0) continue;
+                xMin = std::min(xMin, lw0.cull.minX[i]);
+                yMin = std::min(yMin, lw0.cull.minY[i]);
+                zMin = std::min(zMin, lw0.cull.minZ[i]);
+                xMax = std::max(xMax, lw0.cull.maxX[i]);
+                yMax = std::max(yMax, lw0.cull.maxY[i]);
+                zMax = std::max(zMax, lw0.cull.maxZ[i]);
+            }
+        }
+        if (xMin >= xMax)
+        {
+            xMin = (float)lwWorld_.worldAabbMin[0];
+            zMin = (float)lwWorld_.worldAabbMin[2];
+            yMin = (float)lwWorld_.worldAabbMin[1];
+            xMax = (float)lwWorld_.worldAabbMax[0];
+            zMax = (float)lwWorld_.worldAabbMax[2];
+            yMax = (float)lwWorld_.worldAabbMax[1];
+        }
+        float xExt = std::max(1.0f, xMax - xMin);
+        float zExt = std::max(1.0f, zMax - zMin);
+        float yExt = std::max(1.0f, yMax - yMin);
+        // ~24 bits for Y range → ~4mm precision over 64k m extent.
+        float yScale = 16777215.0f / yExt;
+
+        D3D11_MAPPED_SUBRESOURCE mm;
+        ctx_->Map(cbLwAo_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+        struct
+        {
+            float originX, originZ;
+            float invSizeX, invSizeZ;
+            float texSizeF;
+            float yMinF;
+            float yScale;
+            float strength;
+            float fadeUnits;
+            float pushTexels;
+            float worldPerTexel;
+            float _padAo;
+        } cb;
+        cb.originX = xMin;
+        cb.originZ = zMin;
+        cb.invSizeX = 1.0f / xExt;
+        cb.invSizeZ = 1.0f / zExt;
+        cb.texSizeF = (float)aoTexSize_;
+        cb.yMinF = yMin;
+        cb.yScale = yScale;
+        cb.strength = args.cheapAO ? args.aoStrength : 0.0f;
+        cb.fadeUnits = args.aoFadeUnits;
+        cb.pushTexels = args.aoPushTexels;
+        cb.worldPerTexel = 0.5f * (xExt + zExt) / (float)std::max(1u, aoTexSize_);
+        cb._padAo = 0.0f;
+        memcpy(mm.pData, &cb, sizeof(cb));
+        ctx_->Unmap(cbLwAo_.Get(), 0);
+    }
+
+    if (args.cheapAO && aoDirty_ && csAoTopDownBuild_ && aoTopDownUav_)
+    {
+        MICROPROFILE_SCOPEGPUI("LW/AO/BuildTopDown", 0xff80a0e0);
+        uint32_t clearZero[4] = {0, 0, 0, 0};
+        ctx_->ClearUnorderedAccessViewUint(aoTopDownUav_.Get(), clearZero);
+
+        // Walk LOD0 only — finest data → tightest top-down depth map.
+        const int Lao = 0;
+        const lw::LODWorld& lwLao = lwWorld_.lods[Lao];
+        if (Lao < (int)lw::kLodCount)
+        {
+            const LwGpu& gpAo = lwGpu_[Lao];
+            if (gpAo.chunkInfoSrv && gpAo.blockPosSrv)
+            {
+                ID3D11ShaderResourceView* nullVs[3] = {nullptr, nullptr, nullptr};
+                ctx_->VSSetShaderResources(0, 3, nullVs);
+                ID3D11RenderTargetView* nullRtv2[] = {nullptr, nullptr};
+                ctx_->OMSetRenderTargets(2, nullRtv2, nullptr);
+
+                struct WI
+                {
+                    uint32_t slot, baseGlobal, count, first;
+                };
+                static thread_local std::vector<WI> wlAo;
+                wlAo.clear();
+                uint32_t cumul = 0;
+                for (const lw::RuntimeChunk& rc : lwLao.chunks)
+                {
+                    if (rc.blockCount == 0) continue;
+                    wlAo.push_back({rc.slotIdx, rc.blockBase, rc.blockCount, cumul});
+                    cumul += rc.blockCount;
+                }
+                if (!wlAo.empty())
+                {
+                    uint32_t needCap = (uint32_t)wlAo.size();
+                    if (!worklistSb_ || worklistCapacity_ < needCap)
+                    {
+                        worklistSb_.Reset();
+                        worklistSrv_.Reset();
+                        uint32_t cap = 256;
+                        while (cap < needCap) cap *= 2;
+                        D3D11_BUFFER_DESC bd = {};
+                        bd.ByteWidth = cap * 16;
+                        bd.Usage = D3D11_USAGE_DYNAMIC;
+                        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+                        bd.StructureByteStride = 16;
+                        device_->CreateBuffer(&bd, nullptr, worklistSb_.GetAddressOf());
+                        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+                        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+                        sd.Format = DXGI_FORMAT_UNKNOWN;
+                        sd.Buffer.FirstElement = 0;
+                        sd.Buffer.NumElements = cap;
+                        device_->CreateShaderResourceView(worklistSb_.Get(), &sd, worklistSrv_.GetAddressOf());
+                        worklistCapacity_ = cap;
+                    }
+                    D3D11_MAPPED_SUBRESOURCE mwAo;
+                    ctx_->Map(worklistSb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mwAo);
+                    memcpy(mwAo.pData, wlAo.data(), wlAo.size() * 16);
+                    ctx_->Unmap(worklistSb_.Get(), 0);
+
+                    // cbLwCS: pointCount + numItems + lodIdx
+                    D3D11_MAPPED_SUBRESOURCE mm;
+                    ctx_->Map(cbLwCS_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mm);
+                    struct
+                    {
+                        uint32_t w, h, totalThreads, numItems;
+                        float fadeStart, fadeEnd;
+                        uint32_t lodIdx, _pad;
+                    } cbcs;
+                    cbcs.w = width_;
+                    cbcs.h = height_;
+                    cbcs.totalThreads = cumul;
+                    cbcs.numItems = (uint32_t)wlAo.size();
+                    cbcs.fadeStart = 0.0f;
+                    cbcs.fadeEnd = 0.0f;
+                    cbcs.lodIdx = (uint32_t)Lao;
+                    cbcs._pad = 0;
+                    memcpy(mm.pData, &cbcs, sizeof(cbcs));
+                    ctx_->Unmap(cbLwCS_.Get(), 0);
+
+                    ID3D11Buffer* csCbsAo[] = {cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get(), cbLwAo_.Get()};
+                    ctx_->CSSetConstantBuffers(0, 5, csCbsAo);
+                    ID3D11ShaderResourceView* csSrvAo[] = {
+                        nullptr, gpAo.chunkInfoSrv.Get(), nullptr,
+                        gpAo.blockPosSrv.Get(), nullptr};
+                    ctx_->CSSetShaderResources(0, 5, csSrvAo);
+                    ID3D11ShaderResourceView* wlSrv[] = {worklistSrv_.Get()};
+                    ctx_->CSSetShaderResources(6, 1, wlSrv);
+
+                    UINT initU[] = {0, 0};
+                    ID3D11UnorderedAccessView* uavs[] = {nullptr, aoTopDownUav_.Get()};
+                    ctx_->CSSetUnorderedAccessViews(0, 2, uavs, initU);
+                    ctx_->CSSetShader(csAoTopDownBuild_.Get(), nullptr, 0);
+                    uint32_t groups = (cumul + 63) / 64;
+                    ctx_->Dispatch(groups, 1, 1);
+
+                    ID3D11UnorderedAccessView* nullUavs[] = {nullptr, nullptr};
+                    ctx_->CSSetUnorderedAccessViews(0, 2, nullUavs, initU);
+
+                    // HBAO sweep: reads depth (t8), writes occlusion (u2).
+                    if (csAoHbaoFilter_ && aoOcclUav_ && aoTopDownSrv_)
+                    {
+                        MICROPROFILE_SCOPEGPUI("LW/AO/HBAOSweep", 0xff80e0a0);
+                        ID3D11ShaderResourceView* depthSrv[] = {aoTopDownSrv_.Get()};
+                        ctx_->CSSetShaderResources(8, 1, depthSrv);
+                        UINT initH[] = {0, 0, 0};
+                        ID3D11UnorderedAccessView* hbUavs[] = {nullptr, nullptr, aoOcclUav_.Get()};
+                        ctx_->CSSetUnorderedAccessViews(0, 3, hbUavs, initH);
+                        ctx_->CSSetShader(csAoHbaoFilter_.Get(), nullptr, 0);
+                        uint32_t gx = (aoTexSize_ + 7) / 8;
+                        ctx_->Dispatch(gx, gx, 1);
+                        ID3D11UnorderedAccessView* nullH[] = {nullptr, nullptr, nullptr};
+                        ctx_->CSSetUnorderedAccessViews(0, 3, nullH, initH);
+                        ID3D11ShaderResourceView* nullD[] = {nullptr};
+                        ctx_->CSSetShaderResources(8, 1, nullD);
+                    }
+
+                    ID3D11ShaderResourceView* nullSrvs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+                    ctx_->CSSetShaderResources(0, 5, nullSrvs);
+                    ID3D11ShaderResourceView* nullWl[] = {nullptr};
+                    ctx_->CSSetShaderResources(6, 1, nullWl);
+                    aoDirty_ = false;
+                }
+
+                // Restore splat RTs.
+                ID3D11RenderTargetView* mrtRestore[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
+                ctx_->OMSetRenderTargets(2, mrtRestore, splatDsv_.Get());
+            }
+        }
+    }
     uint64_t polyVoxels = 0;
     uint64_t triCount = 0;
     uint32_t splatDraws = 0;
@@ -2588,8 +2862,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             ID3D11UnorderedAccessView* uavP2[] = {visColorUav_.Get()};
             ctx_->CSSetUnorderedAccessViews(0, 1, uavP2, initP2);
         }
-        ID3D11Buffer* csCbsP2[] = {cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get()};
-        ctx_->CSSetConstantBuffers(0, 4, csCbsP2);
+        ID3D11Buffer* csCbsP2[] = {cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, cbLwCS_.Get(), cbLwAo_.Get()};
+        ctx_->CSSetConstantBuffers(0, 5, csCbsP2);
+        ID3D11ShaderResourceView* aoSrv[] = {aoTopDownSrv_.Get(), aoOcclSrv_.Get()};
+        ctx_->CSSetShaderResources(8, 2, aoSrv);
 
         for (int Lp : twoPassLods)
         {
@@ -2677,6 +2953,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->CSSetShaderResources(0, 5, nullCsSrvP2);
         ID3D11ShaderResourceView* nullDSrv[] = {nullptr};
         ctx_->CSSetShaderResources(5, 1, nullDSrv);
+        ID3D11ShaderResourceView* nullAo[] = {nullptr, nullptr};
+        ctx_->CSSetShaderResources(8, 2, nullAo);
         ID3D11RenderTargetView* mrtRestoreP2[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
         ctx_->OMSetRenderTargets(2, mrtRestoreP2, splatDsv_.Get());
     }
@@ -2714,9 +2992,11 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->IASetVertexBuffers(0, 1, nullVbS, &zSs, &zOs);
         ctx_->VSSetShader(vsLwBlockPoint_.Get(), nullptr, 0);
         ctx_->PSSetShader(psLwBlockPointSplat_.Get(), nullptr, 0);
-        ID3D11Buffer* ptCbsS[] = {cbLwFrame_.Get(), cbLwLod_.Get()};
-        ctx_->VSSetConstantBuffers(0, 2, ptCbsS);
-        ctx_->PSSetConstantBuffers(0, 2, ptCbsS);
+        ID3D11Buffer* ptCbsS[] = {cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, nullptr, cbLwAo_.Get()};
+        ctx_->VSSetConstantBuffers(0, 5, ptCbsS);
+        ctx_->PSSetConstantBuffers(0, 5, ptCbsS);
+        ID3D11ShaderResourceView* aoPsSrv[] = {aoTopDownSrv_.Get(), aoOcclSrv_.Get()};
+        ctx_->PSSetShaderResources(8, 2, aoPsSrv);
         for (int L = lw::kLodCount - 1; L >= 0; --L)
         {
             if (drawListBlock[L].empty()) continue;
@@ -2763,8 +3043,11 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->VSSetShaderResources(0, 3, nullVs);
 
         ctx_->CSSetShader(csSplat_.Get(), nullptr, 0);
-        ID3D11Buffer* csCbs[] = {cbPerFrame_.Get()};
-        ctx_->CSSetConstantBuffers(0, 1, csCbs);
+        ID3D11Buffer* csCbs[] = {cbPerFrame_.Get(), nullptr, nullptr, nullptr, cbLwAo_.Get()};
+        ctx_->CSSetConstantBuffers(0, 5, csCbs);
+        // AO map (t8 depth, t9 occlusion) for normal-pushed lookup in dilate.
+        ID3D11ShaderResourceView* aoCsSrv[] = {aoTopDownSrv_.Get(), aoOcclSrv_.Get()};
+        ctx_->CSSetShaderResources(8, 2, aoCsSrv);
         // Depth SRV source:
         //   block-CS splat-route  → splatBlockDepthSrv_ (R32F UAV-bound tex)
         //   point HW splat-route  → splatDepthSrv_ (DSV-bound tex via SRV view)
@@ -2803,6 +3086,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->CSSetShaderResources(0, 4, nullCsSrvs);
         ID3D11ShaderResourceView* nullShCS[] = {nullptr};
         ctx_->CSSetShaderResources(6, 1, nullShCS);
+        ID3D11ShaderResourceView* nullAoCS[] = {nullptr, nullptr};
+        ctx_->CSSetShaderResources(8, 2, nullAoCS);
         ID3D11UnorderedAccessView* nullCsUavs[] = {nullptr, nullptr, nullptr};
         ctx_->CSSetUnorderedAccessViews(0, 3, nullCsUavs, initc);
         ctx_->CSSetShader(nullptr, nullptr, 0);
@@ -2890,9 +3175,11 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         UINT zS = 0, zO = 0;
         ctx_->IASetVertexBuffers(0, 1, nullVb, &zS, &zO);
         ctx_->VSSetShader(vsLwBlockPoint_.Get(), nullptr, 0);
-        ID3D11Buffer* ptCbs[] = {cbLwFrame_.Get(), cbLwLod_.Get()};
-        ctx_->VSSetConstantBuffers(0, 2, ptCbs);
-        ctx_->PSSetConstantBuffers(0, 2, ptCbs);
+        ID3D11Buffer* ptCbs[] = {cbLwFrame_.Get(), cbLwLod_.Get(), nullptr, nullptr, cbLwAo_.Get()};
+        ctx_->VSSetConstantBuffers(0, 5, ptCbs);
+        ctx_->PSSetConstantBuffers(0, 5, ptCbs);
+        ID3D11ShaderResourceView* aoPsSrv2[] = {aoTopDownSrv_.Get(), aoOcclSrv_.Get()};
+        ctx_->PSSetShaderResources(8, 2, aoPsSrv2);
 
         for (int L = lw::kLodCount - 1; L >= 0; --L)
         {

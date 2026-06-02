@@ -82,6 +82,10 @@ struct DrawSceneParams
     bool lwShowBounds = false;
     bool lwPolyAxis = false;
     bool csUsePointList = false; // A/B: dispatch per-voxel point CS instead of per-block
+    bool cheapAO = false;        // top-down depth-based AO (multiplied in pass2)
+    float aoFadeUnits = 16.0f;   // world units of soft falloff below top
+    float aoPushTexels = 1.0f;   // lateral neighbour push distance (texels)
+    float aoStrength = 1.0f;     // 0..1 multiplier on final AO darkening
     bool skipBackbufferClear = false; // post pass writes every pixel
     float godrayStrength = 0.55f;
     float godrayAngleDeg = 10.0f; // angular extent of texture; real sun = 0.5° (tiny), 10° = nice halo
@@ -425,6 +429,24 @@ private:
     ComPtr<ID3D11ComputeShader> csLwBlockDepthWorklist_; // pass1
     ComPtr<ID3D11ComputeShader> csLwBlockColorWorklist_; // pass2 → R16 RGB565
     ComPtr<ID3D11ComputeShader> csLwBlockSplatWorklist_; // pass2 → splat-format targets
+    // ---- Cheap top-down AO ----
+    // R32_UINT 2048x2048 mapped over the scene X-Z AABB. Each occupied voxel
+    // does InterlockedMax(worldY) at its (worldX, worldZ) UV → texture stores
+    // the maximum-Y opaque voxel per column. AO at shading = function of
+    // (maxY - voxelY): top of column → fully lit, deep below → darker.
+    ComPtr<ID3D11Texture2D> aoTopDownTex_;
+    ComPtr<ID3D11UnorderedAccessView> aoTopDownUav_;
+    ComPtr<ID3D11ShaderResourceView> aoTopDownSrv_;
+    ComPtr<ID3D11Texture2D> aoOcclTex_;       // R8_UNORM HBAO sweep result
+    ComPtr<ID3D11UnorderedAccessView> aoOcclUav_;
+    ComPtr<ID3D11ShaderResourceView> aoOcclSrv_;
+    ComPtr<ID3D11ComputeShader> csAoTopDownBuild_;
+    ComPtr<ID3D11ComputeShader> csAoHbaoFilter_;
+    ComPtr<ID3D11Buffer> cbLwAo_; // b4
+    bool aoDirty_ = true; // rebuild on next frame
+    uint32_t aoTexSize_ = 0; // 0 = not yet created
+    static constexpr uint32_t kAoTexSizeMax = 2048;
+    bool EnsureAoTextures(uint32_t size);
     ComPtr<ID3D11VertexShader>  vsLwBlockPoint_;      // A/B: HW point primitive rasterizer
     ComPtr<ID3D11PixelShader>   psLwBlockPoint_;
     ComPtr<ID3D11PixelShader>   psLwBlockPointSplat_; // writes splat MRT for csSplat

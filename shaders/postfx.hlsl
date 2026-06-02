@@ -360,7 +360,10 @@ float4 psmain_post(VTaaOut i) : SV_Target
         float2 screenUV    = (float2(pix) + 0.5) * gInvScreenSize;
         float2 off         = (screenUV - gSunScreenUV) / gGodrayHalfScreenUV;
         float  rOff        = length(off);
-        if (rOff > 1.0) off *= (1.0 / rOff);
+       
+        if (rOff > 1.0) 
+            off *= (1.0 / rOff);
+        
         float2 godrayUV    = 0.5 + off * 0.5;
         float  gr          = saturate(gGodrayTex.SampleLevel(gTaaSamp, godrayUV, 0));
         float2 dScreen     = (screenUV - gSunScreenUV) * float2(gAspect, 1.0);
@@ -368,5 +371,7 @@ float4 psmain_post(VTaaOut i) : SV_Target
         float  fade        = saturate(1.0 - dist * 1.5);
         c += gGodrayTint * gr * gGodrayStrength * fade * facingFade;
     }
+
+    
     return float4(c, 1.0);
 }

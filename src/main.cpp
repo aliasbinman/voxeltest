@@ -170,6 +170,21 @@ struct AppState
     bool rmbDown = false;
     POINT lastMouse = {0, 0};
     bool keys[256] = {};
+    // ---- Camera recording / playback ----
+    enum class RecMode { Idle, Recording, Playing };
+    struct CamSample { float dt; float pos[3]; float yaw; float pitch; };
+    RecMode recMode = RecMode::Idle;
+    std::vector<CamSample> recSamples;
+    std::vector<std::string> recClips; // filenames under recordings/
+    int recSelected = -1;
+    std::vector<CamSample> playSamples;
+    float playT = 0.0f;
+    float playTotal = 0.0f;
+    bool  playPaused = false;
+    float smoothSec = 0.0f;
+    bool  showRecording = true;
+    bool  recDirScanned = false;
+    bool  recCursorHidden = false;
     bool wantQuit = false;
     bool sceneReady = false;
     std::string loadStatus = "Loading...";
@@ -179,6 +194,10 @@ struct AppState
     bool lwShowBounds = false;                 // debug: draw per-chunk AABBs
     bool lwPolyAxis = false;                   // render cube faces instead of splats
     bool csUsePointList = false;               // A/B: per-voxel point CS vs per-block CS
+    bool cheapAO = false;                      // top-down depth-based AO
+    float aoFadeUnits = 16.0f;
+    float aoPushTexels = 1.0f;
+    float aoStrength = 1.0f;
     // Saved camera views. view1 = auto-fit from world AABB (legacy default,
     // captured on first load). view2 = curated viewpoint hardcoded below.
     float view1Pos[3] = {0.0f, 0.0f, 0.0f};
@@ -258,6 +277,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_app.keys[wp] = false;
         return 0;
     case WM_RBUTTONDOWN:
+        // While recording, RMB stops the take (don't enter normal rotate-mode).
+        if (g_app.recMode == AppState::RecMode::Recording)
+        {
+            // signal stop; main loop saves the clip.
+            g_app.recMode = AppState::RecMode::Idle;
+            return 0;
+        }
         g_app.rmbDown = true;
         GetCursorPos(&g_app.lastMouse);
         SetCapture(hwnd);
@@ -270,7 +296,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_MOUSEWHEEL:
     {
-        if (ImGui::GetIO().WantCaptureMouse)
+        // Recording captures the cursor — let wheel through even if a hidden
+        // ImGui window thinks it wants the mouse.
+        if (ImGui::GetIO().WantCaptureMouse &&
+            g_app.recMode != AppState::RecMode::Recording)
             return 0;
         short delta = (short)HIWORD(wp);
         float notches = (float)delta / (float)WHEEL_DELTA;
@@ -279,7 +308,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_MOUSEMOVE:
-        if (g_app.rmbDown)
+    {
+        bool freeLook = g_app.rmbDown || g_app.recMode == AppState::RecMode::Recording;
+        if (freeLook)
         {
             POINT cur;
             GetCursorPos(&cur);
@@ -293,13 +324,195 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
+
+// ---- Camera recording / playback helpers ----
+namespace recfx
+{
+constexpr uint32_t kMagic = 0x434D5243u; // 'CRMC'
+const char* kDir = "recordings";
+
+void EnsureDir()
+{
+    std::error_code ec;
+    std::filesystem::create_directories(kDir, ec);
+}
+
+std::string MakeFilename()
+{
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "clip_%04d%02d%02d_%02d%02d%02d.cam",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                  tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return std::string(kDir) + "/" + buf;
+}
+
+bool Save(const std::string& path, const std::vector<AppState::CamSample>& s)
+{
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    uint32_t mag = kMagic;
+    uint32_t n = (uint32_t)s.size();
+    f.write((const char*)&mag, 4);
+    f.write((const char*)&n, 4);
+    if (n) f.write((const char*)s.data(), n * sizeof(AppState::CamSample));
+    return (bool)f;
+}
+
+bool Load(const std::string& path, std::vector<AppState::CamSample>& out)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    uint32_t mag = 0, n = 0;
+    f.read((char*)&mag, 4); f.read((char*)&n, 4);
+    if (mag != kMagic) return false;
+    out.resize(n);
+    if (n) f.read((char*)out.data(), n * sizeof(AppState::CamSample));
+    return (bool)f;
+}
+
+void ScanDir(std::vector<std::string>& out)
+{
+    out.clear();
+    EnsureDir();
+    std::error_code ec;
+    for (auto& e : std::filesystem::directory_iterator(kDir, ec))
+    {
+        if (!e.is_regular_file()) continue;
+        if (e.path().extension() == ".cam")
+            out.push_back(e.path().filename().string());
+    }
+    std::sort(out.begin(), out.end());
+}
+
+// Catmull-Rom on 4 control points, t in [0,1].
+inline float CR(float p0, float p1, float p2, float p3, float t)
+{
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return 0.5f * (
+        (2.0f * p1) +
+        (-p0 + p2) * t +
+        (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+        (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
+// Subsample raw samples at fixed time intervals → keyframes for spline.
+struct Key { float t; float pos[3]; float yaw; float pitch; };
+void BuildKeyframes(const std::vector<AppState::CamSample>& s,
+                    float interval, std::vector<Key>& out)
+{
+    out.clear();
+    if (s.empty()) return;
+    // Build cumulative times.
+    std::vector<float> times(s.size());
+    float tAcc = 0.0f;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        tAcc += s[i].dt;
+        times[i] = tAcc;
+    }
+    float total = times.back();
+    if (interval <= 1e-3f)
+    {
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i)
+        {
+            Key k; k.t = times[i];
+            k.pos[0] = s[i].pos[0]; k.pos[1] = s[i].pos[1]; k.pos[2] = s[i].pos[2];
+            k.yaw = s[i].yaw; k.pitch = s[i].pitch;
+            out.push_back(k);
+        }
+        return;
+    }
+    auto lerpAt = [&](float t, Key& k)
+    {
+        if (t <= 0.0f) { k.pos[0]=s.front().pos[0]; k.pos[1]=s.front().pos[1]; k.pos[2]=s.front().pos[2]; k.yaw=s.front().yaw; k.pitch=s.front().pitch; return; }
+        if (t >= total) { k.pos[0]=s.back().pos[0]; k.pos[1]=s.back().pos[1]; k.pos[2]=s.back().pos[2]; k.yaw=s.back().yaw; k.pitch=s.back().pitch; return; }
+        size_t i = 1;
+        while (i < times.size() && times[i] < t) ++i;
+        float t0 = times[i - 1], t1 = times[i];
+        float u = (t - t0) / std::max(1e-5f, t1 - t0);
+        for (int a = 0; a < 3; ++a)
+            k.pos[a] = s[i-1].pos[a] + (s[i].pos[a] - s[i-1].pos[a]) * u;
+        k.yaw   = s[i-1].yaw   + (s[i].yaw   - s[i-1].yaw)   * u;
+        k.pitch = s[i-1].pitch + (s[i].pitch - s[i-1].pitch) * u;
+    };
+    for (float t = 0.0f; t < total; t += interval)
+    {
+        Key k; k.t = t; lerpAt(t, k); out.push_back(k);
+    }
+    Key kEnd; kEnd.t = total; lerpAt(total, kEnd); out.push_back(kEnd);
+}
+
+void Evaluate(const std::vector<Key>& keys, float t,
+              float outPos[3], float& outYaw, float& outPitch)
+{
+    if (keys.empty()) return;
+    if (t <= keys.front().t) {
+        outPos[0]=keys.front().pos[0]; outPos[1]=keys.front().pos[1]; outPos[2]=keys.front().pos[2];
+        outYaw=keys.front().yaw; outPitch=keys.front().pitch; return;
+    }
+    if (t >= keys.back().t) {
+        outPos[0]=keys.back().pos[0]; outPos[1]=keys.back().pos[1]; outPos[2]=keys.back().pos[2];
+        outYaw=keys.back().yaw; outPitch=keys.back().pitch; return;
+    }
+    size_t i = 1;
+    while (i < keys.size() && keys[i].t < t) ++i;
+    size_t i0 = (i >= 2) ? i - 2 : 0;
+    size_t i1 = i - 1;
+    size_t i2 = i;
+    size_t i3 = (i + 1 < keys.size()) ? i + 1 : i;
+    float u = (t - keys[i1].t) / std::max(1e-5f, keys[i2].t - keys[i1].t);
+    for (int a = 0; a < 3; ++a)
+        outPos[a] = CR(keys[i0].pos[a], keys[i1].pos[a], keys[i2].pos[a], keys[i3].pos[a], u);
+    outYaw   = CR(keys[i0].yaw,   keys[i1].yaw,   keys[i2].yaw,   keys[i3].yaw,   u);
+    outPitch = CR(keys[i0].pitch, keys[i1].pitch, keys[i2].pitch, keys[i3].pitch, u);
+}
+} // namespace recfx
 
 void UpdateCamera(float dt)
 {
     if (ImGui::GetIO().WantTextInput)
         return;
+    // Playback overrides camera entirely.
+    if (g_app.recMode == AppState::RecMode::Playing)
+    {
+        if (g_app.keys[VK_ESCAPE])
+        {
+            g_app.recMode = AppState::RecMode::Idle;
+            g_app.playPaused = false;
+            return;
+        }
+        if (!g_app.playPaused)
+            g_app.playT += dt;
+        std::vector<recfx::Key> keys;
+        recfx::BuildKeyframes(g_app.playSamples, g_app.smoothSec, keys);
+        if (!keys.empty())
+        {
+            float p[3]; float yaw, pitch;
+            recfx::Evaluate(keys, g_app.playT, p, yaw, pitch);
+            g_app.camera.position = hlslpp::float3(p[0], p[1], p[2]);
+            g_app.camera.yaw   = yaw;
+            g_app.camera.pitch = pitch;
+        }
+        if (!g_app.playPaused && g_app.playT >= g_app.playTotal)
+        {
+            g_app.playT = g_app.playTotal;
+            g_app.playPaused = true; // hold at end; user can scrub or stop
+        }
+        return;
+    }
     Camera& c = g_app.camera;
     float speed = c.moveSpeed * dt;
 
@@ -337,10 +550,119 @@ void FrameMenuBar()
             ImGui::MenuItem("Controls", nullptr, &g_app.showControls);
             ImGui::MenuItem("FPS", nullptr, &g_app.showFps);
             ImGui::MenuItem("Stats", nullptr, &g_app.showStats);
+            ImGui::MenuItem("Recording", nullptr, &g_app.showRecording);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
     }
+}
+
+void FrameRecordingWindow()
+{
+    if (!g_app.showRecording) return;
+    if (!ImGui::Begin("Recording", &g_app.showRecording))
+    {
+        ImGui::End();
+        return;
+    }
+    if (!g_app.recDirScanned)
+    {
+        recfx::ScanDir(g_app.recClips);
+        g_app.recDirScanned = true;
+        if (g_app.recSelected >= (int)g_app.recClips.size())
+            g_app.recSelected = -1;
+    }
+
+    const char* stateStr =
+        g_app.recMode == AppState::RecMode::Recording ? "RECORDING (RMB to stop)" :
+        g_app.recMode == AppState::RecMode::Playing   ? "PLAYING (Esc to stop)"   :
+        "Idle";
+    ImGui::Text("State: %s", stateStr);
+
+    ImGui::BeginDisabled(g_app.recMode != AppState::RecMode::Idle);
+    if (ImGui::Button("Start recording"))
+    {
+        g_app.recSamples.clear();
+        g_app.recMode = AppState::RecMode::Recording;
+    }
+    ImGui::EndDisabled();
+
+    if (g_app.recMode == AppState::RecMode::Recording)
+        ImGui::Text("Samples: %zu", g_app.recSamples.size());
+
+    ImGui::Separator();
+    ImGui::SliderFloat("Smoothing (s)", &g_app.smoothSec, 0.0f, 10.0f, "%.2f");
+
+    ImGui::Text("Clips:");
+    ImGui::BeginChild("##clips", ImVec2(0, 200), true);
+    for (int i = 0; i < (int)g_app.recClips.size(); ++i)
+    {
+        bool sel = (i == g_app.recSelected);
+        if (ImGui::Selectable(g_app.recClips[i].c_str(), sel))
+            g_app.recSelected = i;
+    }
+    ImGui::EndChild();
+
+    bool canPlay = (g_app.recMode == AppState::RecMode::Idle) &&
+                   (g_app.recSelected >= 0) &&
+                   (g_app.recSelected < (int)g_app.recClips.size());
+    ImGui::BeginDisabled(!canPlay);
+    if (ImGui::Button("Play"))
+    {
+        std::string path = std::string(recfx::kDir) + "/" + g_app.recClips[g_app.recSelected];
+        if (recfx::Load(path, g_app.playSamples) && !g_app.playSamples.empty())
+        {
+            g_app.playT = 0.0f;
+            g_app.playTotal = 0.0f;
+            for (auto& s : g_app.playSamples) g_app.playTotal += s.dt;
+            g_app.playPaused = false;
+            g_app.recMode = AppState::RecMode::Playing;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh"))
+        g_app.recDirScanned = false;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!canPlay);
+    if (ImGui::Button("Delete"))
+    {
+        std::error_code ec;
+        std::filesystem::remove(std::string(recfx::kDir) + "/" +
+                                g_app.recClips[g_app.recSelected], ec);
+        g_app.recSelected = -1;
+        g_app.recDirScanned = false;
+    }
+    ImGui::EndDisabled();
+
+    // ---- Playback transport ----
+    if (g_app.recMode == AppState::RecMode::Playing)
+    {
+        ImGui::Separator();
+        if (ImGui::Button("Stop"))
+        {
+            g_app.recMode = AppState::RecMode::Idle;
+            g_app.playPaused = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(g_app.playPaused ? "Resume" : "Pause"))
+            g_app.playPaused = !g_app.playPaused;
+        ImGui::SameLine();
+        if (ImGui::Button("Restart"))
+        {
+            g_app.playT = 0.0f;
+            g_app.playPaused = false;
+        }
+        // Scrub bar.
+        float t = g_app.playT;
+        if (ImGui::SliderFloat("Time", &t, 0.0f, g_app.playTotal, "%.2f s"))
+        {
+            g_app.playT = std::clamp(t, 0.0f, g_app.playTotal);
+            g_app.playPaused = true; // pause while scrubbing
+        }
+    }
+
+    ImGui::End();
 }
 
 void FrameFpsWindow()
@@ -615,6 +937,13 @@ void FrameControlsWindow()
             ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
             ImGui::Checkbox("LW: PolyAxis (cube faces, per-face AO)", &g_app.lwPolyAxis);
             ImGui::Checkbox("LW: PointCS A/B — per-voxel CS (vs per-block)", &g_app.csUsePointList);
+            ImGui::Checkbox("LW: Cheap top-down AO", &g_app.cheapAO);
+            if (g_app.cheapAO)
+            {
+                ImGui::SliderFloat("  AO strength",   &g_app.aoStrength,   0.0f, 1.0f,  "%.2f");
+                ImGui::SliderFloat("  AO fade units", &g_app.aoFadeUnits,  1.0f, 64.0f, "%.1f");
+                ImGui::SliderFloat("  AO push (tx)",  &g_app.aoPushTexels, 0.0f, 8.0f,  "%.1f");
+            }
             {
                 float rs = g_app.streamRadiusScale.load();
                 if (ImGui::SliderFloat("Stream radius", &rs, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic))
@@ -1099,7 +1428,58 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             g_app.sceneReady = true;
         }
 
+        // Manage cursor capture for recording (rmb-less fly mode).
+        {
+            bool wantCapture = (g_app.recMode == AppState::RecMode::Recording);
+            if (wantCapture && !g_app.recCursorHidden)
+            {
+                GetCursorPos(&g_app.lastMouse);
+                SetCapture(hwnd);
+                ShowCursor(FALSE);
+                g_app.recCursorHidden = true;
+            }
+            else if (!wantCapture && g_app.recCursorHidden && !g_app.rmbDown)
+            {
+                ReleaseCapture();
+                ShowCursor(TRUE);
+                g_app.recCursorHidden = false;
+            }
+        }
+
+        // Capture pending recording stop: WM_RBUTTONDOWN flipped recMode to Idle.
+        static AppState::RecMode prevRec = AppState::RecMode::Idle;
+        if (prevRec == AppState::RecMode::Recording &&
+            g_app.recMode == AppState::RecMode::Idle &&
+            !g_app.recSamples.empty())
+        {
+            std::string path = recfx::MakeFilename();
+            recfx::Save(path, g_app.recSamples);
+            g_app.recSamples.clear();
+            g_app.recDirScanned = false; // refresh list
+        }
+        prevRec = g_app.recMode;
+
+        // View hotkeys — work in playback too. Only suppressed for text input.
+        if (!ImGui::GetIO().WantTextInput)
+        {
+            if (g_app.keys['1']) g_app.mode = ShadingMode::Lit;
+            if (g_app.keys['2']) g_app.mode = ShadingMode::Ao;
+            if (g_app.keys['3']) g_app.mode = ShadingMode::LodViz;
+        }
+
         UpdateCamera(dt);
+
+        // Record sample after camera updated.
+        if (g_app.recMode == AppState::RecMode::Recording)
+        {
+            AppState::CamSample s;
+            s.dt = dt;
+            float p[3]; hlslpp::store(p, g_app.camera.position);
+            s.pos[0] = p[0]; s.pos[1] = p[1]; s.pos[2] = p[2];
+            s.yaw   = g_app.camera.yaw;
+            s.pitch = g_app.camera.pitch;
+            g_app.recSamples.push_back(s);
+        }
 
         // Publish cam pos + frustum planes for streaming loader; trigger
         // re-stream when moved > 1 chunk width.
@@ -1147,6 +1527,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         FrameMenuBar();
+        FrameRecordingWindow();
         FrameFpsWindow();
         FrameStatsWindow();
         FrameControlsWindow();
@@ -1256,6 +1637,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.lwShowBounds = g_app.lwShowBounds;
             ps.lwPolyAxis = g_app.lwPolyAxis;
             ps.csUsePointList = g_app.csUsePointList;
+            ps.cheapAO = g_app.cheapAO;
+            ps.aoStrength = g_app.aoStrength;
+            ps.aoFadeUnits = g_app.aoFadeUnits;
+            ps.aoPushTexels = g_app.aoPushTexels;
             ps.exposure = exp2f(g_app.exposureEV);
             ps.roughness = g_app.roughness;
             if (g_app.renderer.HasLwWorld())

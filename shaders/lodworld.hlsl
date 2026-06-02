@@ -341,6 +341,25 @@ StructuredBuffer<uint4> gLwWorkItems : register(t6);
 // PointCS A/B per-voxel expanded points. Packed: x|y<<8|z<<16|palIdx<<24.
 StructuredBuffer<uint> gLwBlockPoints : register(t7);
 
+// ---- Cheap top-down AO map ----
+// R32_UINT atomic-max of voxel Y per (X, Z) texel. UV maps the scene X-Z AABB
+// 1:1 to the texture extents.
+// AO build UAVs (CB + SRVs come from shading.hlsli).
+RWTexture2D<uint>        gAoTopDownUav : register(u1);
+RWTexture2D<unorm float> gAoOcclUav    : register(u2);
+
+uint AoEncodeY(float worldY)
+{
+    return (uint)max(0.0, (worldY - gAoYMin) * gAoYScale);
+}
+
+// Normal-less wrapper for paths without per-voxel normal (block color RGB565,
+// HW point non-splat PS). Just samples in-place.
+float AoSample(float3 world)
+{
+    return AoSampleAt(world, float2(0, 0));
+}
+
 // ---- Linear-depth encoding for the atomic-min visibility buffer ----
 // Linear view-Z mapped to uint: 0 at near plane, kLinDepthMax at 100km.
 // Uniform precision (~23.3 µm per uint) → constant tolerance in pass2 works
@@ -540,9 +559,10 @@ void csmain_lw_block_color_worklist(uint3 dt : SV_DispatchThreadID)
             rgb565 = (rR << 11) | (rG << 5) | rB;
         } else {
             uint colPck = gLwPalette[ci.paletteBase + palIdx];
-            uint rR = (uint)(((colPck >>  0) & 0xFFu) >> 3);
-            uint rG = (uint)(((colPck >>  8) & 0xFFu) >> 2);
-            uint rB = (uint)(((colPck >> 16) & 0xFFu) >> 3);
+            float ao = AoSample(world);
+            uint rR = (uint)((float)((colPck >>  0) & 0xFFu) * ao * (31.0/255.0));
+            uint rG = (uint)((float)((colPck >>  8) & 0xFFu) * ao * (63.0/255.0));
+            uint rB = (uint)((float)((colPck >> 16) & 0xFFu) * ao * (31.0/255.0));
             rgb565 = (rR << 11) | (rG << 5) | rB;
         }
         gLwVisUav[pix] = rgb565;
@@ -631,6 +651,9 @@ void csmain_lw_block_splat_worklist(uint3 dt : SV_DispatchThreadID)
         float g = (float)((colPck >>  8u) & 0xFFu) / 255.0;
         float b = (float)((colPck >> 16u) & 0xFFu) / 255.0;
 
+        // AO applied later in csSplat dilate (it has reconstructed normals
+        // to push the AO lookup into the open neighbour column).
+
         // Cluster parity (32 voxels per cluster = vx>>5 etc).
         uint cx = vx >> 5u;
         uint cy = vy >> 5u;
@@ -660,6 +683,7 @@ struct VSOutBlockPt {
     float4 svpos  : SV_Position;
     nointerpolation uint3 vxyz : COLOR0;
     nointerpolation uint  palIdx : COLOR1;
+    nointerpolation float3 world : COLOR2;
 };
 
 VSOutBlockPt vsmain_lw_blockpoint(uint vid : SV_VertexID)
@@ -680,6 +704,7 @@ VSOutBlockPt vsmain_lw_blockpoint(uint vid : SV_VertexID)
     o.svpos = mul(float4(world, 1.0), gViewProj);
     o.vxyz  = uint3(vx, vy, vz);
     o.palIdx = palIdx;
+    o.world  = world;
     return o;
 }
 
@@ -704,6 +729,7 @@ float4 psmain_lw_blockpoint(VSOutBlockPt i) : SV_Target
     float3 col = float3((float)( colPck         & 0xFFu),
                         (float)((colPck >>  8u) & 0xFFu),
                         (float)((colPck >> 16u) & 0xFFu)) / 255.0;
+    col *= AoSample(i.world);
     return float4(col, 1.0);
 }
 
@@ -721,6 +747,7 @@ PSOutSplat psmain_lw_blockpoint_splat(VSOutBlockPt i)
     float3 rgb = float3((float)( colPck         & 0xFFu),
                         (float)((colPck >>  8u) & 0xFFu),
                         (float)((colPck >> 16u) & 0xFFu)) / 255.0;
+    // AO applied later in csSplat dilate (normal-aware lookup there).
     // Splat alpha encoding (mirrors EncodeSplatAlpha): bit 7 marker, bits 6:4
     // lodIdx (3 bits), bits 3:0 AO 4-bit (15 = max).
     uint a8 = 0x80u | ((gLodIdx & 7u) << 4) | 0xFu;
@@ -736,4 +763,90 @@ PSOutSplat psmain_lw_blockpoint_splat(VSOutBlockPt i)
     o.col  = float4(rgb, alpha);
     o.mask = mask;
     return o;
+}
+
+// ============================================================
+// AO top-down build. One thread per block (worklist dispatch). For each
+// occupied voxel, project worldXZ → texel and InterlockedMax(worldY → uint).
+// ============================================================
+[numthreads(64, 1, 1)]
+void csmain_ao_build_topdown(uint3 dt : SV_DispatchThreadID)
+{
+    uint gid = dt.x;
+    if (gid >= gLwPointCount) return;
+
+    uint lo = 0u, hi = gLwNumWorkItems;
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (gLwWorkItems[mid].w <= gid) lo = mid;
+        else                            hi = mid;
+    }
+    uint4 item = gLwWorkItems[lo];
+    uint slot        = item.x;
+    uint blockBase   = item.y;
+    uint count       = item.z;
+    uint firstThread = item.w;
+    if (gid - firstThread >= count) return;
+
+    LwChunkInfo ci = gLwChunkInfos[slot];
+    uint pack0 = gLwBlockPos[blockBase + (gid - firstThread)];
+    uint bx  = (pack0 >>  0) & 0xFFu;
+    uint by  = (pack0 >>  8) & 0xFFu;
+    uint bz  = (pack0 >> 16) & 0xFFu;
+    uint occ = (pack0 >> 24) & 0xFFu;
+
+    [unroll] for (uint i = 0; i < 8; ++i) {
+        if (((occ >> i) & 1u) == 0u) continue;
+        uint lx = (i >> 0) & 1u;
+        uint ly = (i >> 1) & 1u;
+        uint lz = (i >> 2) & 1u;
+        float3 local = float3((float)(bx * 2u + lx),
+                              (float)(by * 2u + ly),
+                              (float)(bz * 2u + lz)) + 0.5;
+        float3 world = ci.worldOrigin + local * ci.lodScale;
+        float2 uv = (world.xz - gAoOriginXZ) * gAoInvSizeXZ;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) continue;
+        int2 px = int2(uv * gAoTexSizeF);
+        InterlockedMax(gAoTopDownUav[px], AoEncodeY(world.y));
+    }
+}
+
+// ============================================================
+// HBAO sweep on the top-down depth map. For each texel, walk 8 directions
+// out to log-spaced radii, record max horizon angle, integrate visible
+// hemisphere. Output 0..1 occlusion (1 = fully open).
+// ============================================================
+[numthreads(8, 8, 1)]
+void csmain_ao_hbao_filter(uint3 dt : SV_DispatchThreadID)
+{
+    uint texSize = (uint)gAoTexSizeF;
+    if (dt.x >= texSize || dt.y >= texSize) return;
+    int2 baseT = (int2)dt.xy;
+    float myY = AoDecodeY(gAoTopDownSrv.Load(int3(baseT, 0)));
+
+    const int kDirs = 8;
+    const int kSteps = 8;
+    // Log-spaced texel radii: covers ~1..128 texels (~world units near building scale).
+    const int kRadii[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+
+    float aoSum = 0.0;
+    [unroll] for (int d = 0; d < kDirs; ++d) {
+        float ang = (float)d * (6.2831853 / (float)kDirs);
+        float2 dir = float2(cos(ang), sin(ang));
+        float maxSin = 0.0;
+        [unroll] for (int s = 0; s < kSteps; ++s) {
+            float r = (float)kRadii[s];
+            int2 t = baseT + int2(dir * r);
+            t = clamp(t, int2(0,0), int2((int)texSize - 1, (int)texSize - 1));
+            float h = AoDecodeY(gAoTopDownSrv.Load(int3(t, 0)));
+            float dh   = h - myY;
+            float dist = r * gAoWorldPerTexel;
+            float sH   = dh / max(sqrt(dh * dh + dist * dist), 1e-4);
+            maxSin = max(maxSin, sH);
+        }
+        // Visible hemisphere fraction along this direction.
+        aoSum += saturate(1.0 - max(0.0, maxSin));
+    }
+    float ao = aoSum / (float)kDirs;
+    gAoOcclUav[baseT] = ao;
 }

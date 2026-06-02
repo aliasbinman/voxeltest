@@ -129,3 +129,52 @@ float3 ShadeWithLighting(float3 albedo, float3 N, float3 wpos, float ao,
     float3 tint  = (gColorizeClusters > 0.5) ? ClusterTint(2u + lodIdx) : float3(1, 1, 1);
     return Tonemap(ApplyFog(lit * tint, wpos));
 }
+
+// ============================================================
+// Top-down cheap AO (depth map built in lodworld.hlsl). Shared by csSplat
+// dilate which has reconstructed normals — push lookup along normal so
+// vertical faces read their open neighbour column.
+// ============================================================
+cbuffer CBLwAo : register(b4)
+{
+    float2 gAoOriginXZ;
+    float2 gAoInvSizeXZ;
+    float  gAoTexSizeF;
+    float  gAoYMin;
+    float  gAoYScale;
+    float  gAoStrength;
+    float  gAoFadeUnits;
+    float  gAoPushTexels;
+    float  gAoWorldPerTexel;
+    float  _padAo;
+};
+Texture2D<uint>  gAoTopDownSrv : register(t8);
+Texture2D<float> gAoOcclSrv    : register(t9);
+
+float AoDecodeY(uint encY) { return (float)encY / gAoYScale + gAoYMin; }
+
+// Raw lookup — no depth check, no neighbour blend. Just sample HBAO at
+// world-XZ projection.
+float AoSampleAt(float3 world, float2 lateralTexelOfs)
+{
+    if (gAoStrength <= 0.0) return 1.0;
+    float2 uv = (world.xz - gAoOriginXZ) * gAoInvSizeXZ;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    int2 baseT = int2(uv * gAoTexSizeF);
+    int2 t = clamp(baseT + (int2)lateralTexelOfs, int2(0,0),
+                   int2((int)gAoTexSizeF - 1, (int)gAoTexSizeF - 1));
+    float occ = gAoOcclSrv.Load(int3(t, 0));
+    return lerp(1.0, occ, gAoStrength);
+}
+
+float AoSampleWithNormal(float3 world, float3 N)
+{
+    float2 nXZ = N.xz;
+    float  l2  = dot(nXZ, nXZ);
+    float2 ofs = float2(0, 0);
+    if (l2 > 1e-4) {
+        nXZ *= rsqrt(l2);
+        ofs  = nXZ * gAoPushTexels;
+    }
+    return AoSampleAt(world, ofs);
+}

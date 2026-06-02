@@ -232,8 +232,22 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
 
     if (anyHit) {
         float3 hit = ro + rd * bestT;
-        float3 outRgb = ShadeWithLighting(bestAlbedo, bestN, hit, bestAo,
-                                          bestLodIdx, bestParity, (int)gMode);
+        // Cheap top-down AO: push lookup along surface normal so vertical
+        // faces sample the open neighbour column instead of their own roof.
+        float aoTop = AoSampleWithNormal(hit, bestN);
+        bestAlbedo *= aoTop;
+        float3 outRgb;
+        if ((int)gMode == 3) {
+            // AO viz: top-down AO directly.
+            outRgb = aoTop.xxx;
+        } else if ((int)gMode == 4) {
+            // AO + LOD viz: top-down AO tinted by per-LOD colour + cluster checker.
+            float check = (bestParity == 0u) ? 0.55 : 1.00;
+            outRgb = aoTop * ClusterTint(2u + bestLodIdx) * check;
+        } else {
+            outRgb = ShadeWithLighting(bestAlbedo, bestN, hit, bestAo,
+                                       bestLodIdx, bestParity, (int)gMode);
+        }
         gSplatFinalUav[pix] = float4(outRgb, 1.0);
         // Reproject winning hit -> clip depth (more accurate than the
         // un-dilated source depth, which is 0 at filled-in pixels).
