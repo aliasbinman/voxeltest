@@ -263,6 +263,224 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
     }
 }
 
+// ---------- Shared splat-lighting helper (used by R=0 / R=1 LDS variants) ----------
+// Shoot ray from `pix` against the LOD voxel AABB reconstructed at sample pixel
+// `sp` and shade. Returns false if sp isn't a marker, has no depth, or AABB miss.
+bool LightSplatSampled(int2 pix, int2 sp, int W, int H,
+                      out float3 outRgb, out float outDepth)
+{
+    outRgb   = float3(0, 0, 0);
+    outDepth = 0.0;
+    float4 s = gSplatColorSrv.Load(int3(sp, 0));
+    uint a8 = (uint)(s.a * 255.0 + 0.5);
+    if ((a8 & 0x80u) == 0u) return false;
+    float zN = gSplatDepth.Load(int3(sp, 0));
+    if (zN <= 0.0) return false;
+
+    uint lodIdx  = (a8 >> 4) & 7u;
+    uint ao4     = a8 & 0xFu;
+    float halfExt = 0.5 * (float)(1u << lodIdx);
+    uint maskFull = gSplatMaskSrv.Load(int3(sp, 0));
+    uint visMaskN = maskFull & 0x3Fu;
+    uint parityN  = (maskFull >> 30u) & 1u;
+
+    float3 ro = gCamPos;
+    float3 rd = PixelWorldDir(pix, W, H);
+    float3 invRd = 1.0 / rd;
+    float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
+    float  S    = 2.0 * halfExt;
+    float3 vmin = floor(wp / S) * S;
+    float3 vmax = vmin + S;
+    float3 t0v = (vmin - ro) * invRd;
+    float3 t1v = (vmax - ro) * invRd;
+    float3 tmn = min(t0v, t1v);
+    float3 tmx = max(t0v, t1v);
+    float tNear = max(max(tmn.x, tmn.y), tmn.z);
+    float tFar  = min(min(tmx.x, tmx.y), tmx.z);
+    if (tFar < 0.0 || tNear > tFar) return false;
+    float tHit = max(tNear, 0.0);
+    float3 hit = ro + rd * tHit;
+    float3 center = (vmin + vmax) * 0.5;
+    float3 d = hit - center;
+    float bestProj = -1.0;
+    float3 n = float3(0, 1, 0);
+    float pickedFaceAo = (float)ao4 / 15.0;
+    [unroll] for (uint fi = 0u; fi < 6u; ++fi) {
+        if (((visMaskN >> fi) & 1u) == 0u) continue;
+        float3 fn = float3(0, 0, 0);
+        if      (fi == 0u) fn = float3( 1, 0, 0);
+        else if (fi == 1u) fn = float3(-1, 0, 0);
+        else if (fi == 2u) fn = float3( 0, 1, 0);
+        else if (fi == 3u) fn = float3( 0,-1, 0);
+        else if (fi == 4u) fn = float3( 0, 0, 1);
+        else               fn = float3( 0, 0,-1);
+        float p = dot(d, fn);
+        if (p > bestProj) {
+            bestProj = p; n = fn;
+            uint nib = (maskFull >> (6u + fi * 4u)) & 0xFu;
+            pickedFaceAo = (float)nib / 15.0;
+        }
+    }
+    float aoTop = AoSampleWithNormal(hit, n);
+    float3 albedo = s.rgb * aoTop;
+    float3 rgb;
+    if ((int)gMode == 3) {
+        rgb = aoTop.xxx;
+    } else if ((int)gMode == 4) {
+        float check = (parityN == 0u) ? 0.55 : 1.00;
+        rgb = aoTop * ClusterTint(2u + lodIdx) * check;
+    } else {
+        rgb = ShadeWithLighting(albedo, n, hit, pickedFaceAo, lodIdx, parityN, (int)gMode);
+    }
+    float4 clipHit = mul(float4(hit, 1.0), gViewProj);
+    outRgb   = rgb;
+    outDepth = saturate(clipHit.z / max(clipHit.w, 1e-6));
+    return true;
+}
+
+// R=0 variant: light self splat only. No neighbour search.
+// Also used as pass 1 of the light-first colour-avg fill variant.
+[numthreads(8, 8, 1)]
+void csmain_splat_r0(uint3 dt : SV_DispatchThreadID)
+{
+    int2 pix = (int2)dt.xy;
+    int W = (int)gScreenSize.x;
+    int H = (int)gScreenSize.y;
+    if (pix.x >= W || pix.y >= H) return;
+    float3 rgb;
+    float  dep;
+    if (LightSplatSampled(pix, pix, W, H, rgb, dep)) {
+        gSplatFinalUav[pix]      = float4(rgb, 1.0);
+        gSplatFinalDepthUav[pix] = dep;
+    } else {
+        gSplatFinalUav[pix]      = float4(0, 0, 0, 0);
+        gSplatFinalDepthUav[pix] = 0.0;
+    }
+}
+
+// R=1 variant A: 8x8 threadgroup cooperatively caches a 10x10 depth halo in
+// LDS. Each thread checks its own pixel; if no marker, scans the 3x3 LDS
+// window and picks the closest (highest zN) neighbour to inherit, then runs
+// the shared AABB raycast against that neighbour's voxel.
+groupshared float gLdsSplatDepth[10][10];
+
+[numthreads(8, 8, 1)]
+void csmain_splat_r1_lds(uint3 dt  : SV_DispatchThreadID,
+                         uint3 gt  : SV_GroupThreadID,
+                         uint3 gid : SV_GroupID)
+{
+    int W = (int)gScreenSize.x;
+    int H = (int)gScreenSize.y;
+    int2 base = int2(gid.xy) * 8 - 1; // top-left of 10x10 halo in screen pixels
+
+    int tx = (int)gt.x;
+    int ty = (int)gt.y;
+    int tid = ty * 8 + tx;
+
+    // 64 threads: center 8x8 of LDS at [1..8][1..8].
+    {
+        int2 sp = base + int2(tx + 1, ty + 1);
+        float z = 0.0;
+        if (sp.x >= 0 && sp.x < W && sp.y >= 0 && sp.y < H)
+            z = gSplatDepth.Load(int3(sp, 0));
+        gLdsSplatDepth[ty + 1][tx + 1] = z;
+    }
+    // First 36 threads: 10x10 - 8x8 halo ring (10 top + 10 bottom + 8 left + 8 right).
+    if (tid < 36) {
+        int lx, ly;
+        if      (tid < 10) { lx = tid;        ly = 0; }
+        else if (tid < 20) { lx = tid - 10;   ly = 9; }
+        else if (tid < 28) { lx = 0;          ly = tid - 19; } // 1..8
+        else               { lx = 9;          ly = tid - 27; } // 1..8
+        int2 sp = base + int2(lx, ly);
+        float z = 0.0;
+        if (sp.x >= 0 && sp.x < W && sp.y >= 0 && sp.y < H)
+            z = gSplatDepth.Load(int3(sp, 0));
+        gLdsSplatDepth[ly][lx] = z;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    int2 pix = (int2)dt.xy;
+    if (pix.x >= W || pix.y >= H) return;
+
+    int lcx = tx + 1;
+    int lcy = ty + 1;
+    int2 srcPix = pix;
+    float selfZ = gLdsSplatDepth[lcy][lcx];
+    if (selfZ <= 0.0) {
+        float bestZ = -1.0;
+        int2  bestOff = int2(0, 0);
+        [unroll] for (int dy = -1; dy <= 1; ++dy) {
+            [unroll] for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                float z = gLdsSplatDepth[lcy + dy][lcx + dx];
+                if (z > bestZ) { bestZ = z; bestOff = int2(dx, dy); }
+            }
+        }
+        if (bestZ <= 0.0) {
+            gSplatFinalUav[pix]      = float4(0, 0, 0, 0);
+            gSplatFinalDepthUav[pix] = 0.0;
+            return;
+        }
+        srcPix = pix + bestOff;
+    }
+
+    float3 rgb;
+    float  dep;
+    if (LightSplatSampled(pix, srcPix, W, H, rgb, dep)) {
+        gSplatFinalUav[pix]      = float4(rgb, 1.0);
+        gSplatFinalDepthUav[pix] = dep;
+    } else {
+        gSplatFinalUav[pix]      = float4(0, 0, 0, 0);
+        gSplatFinalDepthUav[pix] = 0.0;
+    }
+}
+
+// R=1 variant B pass 2: reads already-lit colour/depth (caller binds the
+// splatFinal2 ping-pong textures at the gSplatColorSrv/gSplatDepth slots) and
+// fills gap pixels (alpha < 0.5) with the avg of non-gap 3x3 neighbours.
+[numthreads(8, 8, 1)]
+void csmain_splat_color_fill(uint3 dt : SV_DispatchThreadID)
+{
+    int2 pix = (int2)dt.xy;
+    int W = (int)gScreenSize.x;
+    int H = (int)gScreenSize.y;
+    if (pix.x >= W || pix.y >= H) return;
+
+    float4 c0 = gSplatColorSrv.Load(int3(pix, 0));
+    float  z0 = gSplatDepth.Load(int3(pix, 0));
+    if (c0.a > 0.5) {
+        gSplatFinalUav[pix]      = c0;
+        gSplatFinalDepthUav[pix] = z0;
+        return;
+    }
+    float3 sumC = float3(0, 0, 0);
+    float  sumZ = 0.0;
+    int    cnt  = 0;
+    [unroll] for (int dy = -1; dy <= 1; ++dy) {
+        [unroll] for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int2 sp = pix + int2(dx, dy);
+            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
+            float4 sc = gSplatColorSrv.Load(int3(sp, 0));
+            if (sc.a < 0.5) continue;
+            float sz = gSplatDepth.Load(int3(sp, 0));
+            sumC += sc.rgb;
+            sumZ += sz;
+            ++cnt;
+        }
+    }
+    if (cnt == 0) {
+        gSplatFinalUav[pix]      = float4(0, 0, 0, 0);
+        gSplatFinalDepthUav[pix] = 0.0;
+    } else {
+        float inv = 1.0 / (float)cnt;
+        gSplatFinalUav[pix]      = float4(sumC * inv, 1.0);
+        gSplatFinalDepthUav[pix] = sumZ * inv;
+    }
+}
+
 // Pass 2: fill holes left by pass 1. Scan small kernel for nearest-Z filled
 // neighbour. Already-filled pixels pass through.
 [numthreads(8, 8, 1)]
