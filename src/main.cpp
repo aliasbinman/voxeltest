@@ -184,6 +184,7 @@ struct AppState
     float smoothSec = 0.0f;
     bool  showRecording = true;
     bool  showGpuProfile = false;
+    bool  showGpuRes  = false;
     static constexpr int kGpuProfHistory = 10;
     float  gpuProfHist[1024][kGpuProfHistory] = {};
     // Parallel ring: did the marker actually fire this frame? Avg ignores
@@ -564,6 +565,7 @@ void FrameMenuBar()
             ImGui::MenuItem("Stats", nullptr, &g_app.showStats);
             ImGui::MenuItem("Recording", nullptr, &g_app.showRecording);
             ImGui::MenuItem("GPU Profile", nullptr, &g_app.showGpuProfile);
+            ImGui::MenuItem("GPU Resources", nullptr, &g_app.showGpuRes);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -694,6 +696,63 @@ void FrameFpsWindow()
     ImGui::Text("CPU frame: %.2f ms (%.0f FPS)", g_app.cpuFrameMs, g_app.fpsAvg);
     ImGui::PlotLines("FPS", g_app.fpsHist, IM_ARRAYSIZE(g_app.fpsHist),
                      g_app.fpsHistIdx, nullptr, 0.0f, 240.0f, ImVec2(0, 60));
+    ImGui::End();
+}
+
+void FrameGpuResourcesWindow()
+{
+    if (!g_app.showGpuRes) return;
+    if (!ImGui::Begin("GPU Resources", &g_app.showGpuRes))
+    {
+        ImGui::End();
+        return;
+    }
+    auto fmtBytes = [](uint64_t b) -> std::string {
+        char buf[32];
+        if (b >= (1ull << 30))      std::snprintf(buf, sizeof(buf), "%.2f GB", b / 1073741824.0);
+        else if (b >= (1ull << 20)) std::snprintf(buf, sizeof(buf), "%.2f MB", b / 1048576.0);
+        else if (b >= (1ull << 10)) std::snprintf(buf, sizeof(buf), "%.1f KB", b / 1024.0);
+        else                        std::snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)b);
+        return std::string(buf);
+    };
+    const ImU32 colFill = IM_COL32(60, 200, 60, 255);
+    const ImU32 colBack = IM_COL32(60, 60, 60, 160);
+
+    // Find max per-LOD total bytes so bars use a common scale within the window.
+    uint64_t maxLodTotal = 1;
+    Renderer::StreamLodInfo cached[lw::kLodCount];
+    for (int L = 0; L < lw::kLodCount; ++L)
+    {
+        cached[L] = g_app.renderer.GetStreamLodInfo(L);
+        uint64_t t = 0;
+        for (const auto& p : cached[L].pools) t += p.bytes;
+        if (t > maxLodTotal) maxLodTotal = t;
+    }
+
+    for (int L = 0; L < lw::kLodCount; ++L)
+    {
+        const auto& li = cached[L];
+        uint64_t totalBytes = 0;
+        for (const auto& p : li.pools) totalBytes += p.bytes;
+        ImGui::PushID(L);
+        ImGui::Text("LOD %d  total %s", L, fmtBytes(totalBytes).c_str());
+        for (const auto& p : li.pools)
+        {
+            ImGui::Text("  %-13s elem %u (stride %u)  %s",
+                        p.name, p.numElements, p.stride, fmtBytes(p.bytes).c_str());
+            ImVec2 size(ImGui::GetContentRegionAvail().x - 8.0f, 12.0f);
+            ImVec2 pos = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), colBack, 2.0f);
+            float w = size.x * (float)((double)p.bytes / (double)maxLodTotal);
+            if (w > 0.0f)
+                dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + size.y), colFill, 2.0f);
+            ImGui::Dummy(size);
+        }
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::TextDisabled("Bars scaled to largest per-LOD total. Buffers are IMMUTABLE — used == capacity.");
     ImGui::End();
 }
 
@@ -1666,6 +1725,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         FrameStatsWindow();
         FrameControlsWindow();
         FrameGpuProfileWindow();
+        FrameGpuResourcesWindow();
         ImGui::Render();
 
         float clear[4];

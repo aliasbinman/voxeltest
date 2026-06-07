@@ -186,7 +186,7 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
         gi.worldOriginY = (float)rc.worldOriginY;
         gi.worldOriginZ = (float)rc.worldOriginZ;
         gi.lodScale = (float)src.lodScale;
-        gi.poolBase = rc.poolBase;
+        gi._unused0 = 0;
         gi.paletteBase = i * lw::kPaletteSize;
         gi._pad[0] = gi._pad[1] = 0;
     }
@@ -276,7 +276,33 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
     g.bytes = infos.size() * sizeof(lw::GpuChunkInfo) + atlas.size() * sizeof(uint32_t) + posBytes + colBytes;
     std::printf("[lw] LOD %d uploaded: %u slots, %u blocks, %.2f MB GPU\n",
                 L, g.slotCount, g.blockCount, g.bytes / (1024.0 * 1024.0));
+    shadowMapDirty_ = true;
+    lwHasWorld_ = true;
     return true;
+}
+
+Renderer::StreamLodInfo Renderer::GetStreamLodInfo(int L) const
+{
+    StreamLodInfo info{};
+    if (L < 0 || L >= lw::kLodCount) return info;
+    const LwGpu& g = lwGpu_[L];
+    auto fill = [](StreamPoolInfo& p, const char* name, ID3D11Buffer* buf,
+                   uint32_t stride) {
+        p.name = name;
+        p.stride = stride;
+        if (buf)
+        {
+            D3D11_BUFFER_DESC bd{};
+            buf->GetDesc(&bd);
+            p.bytes = bd.ByteWidth;
+            p.numElements = stride ? bd.ByteWidth / stride : 0;
+        }
+    };
+    fill(info.pools[0], "chunkInfoSb", g.chunkInfoSb.Get(), (uint32_t)sizeof(lw::GpuChunkInfo));
+    fill(info.pools[1], "paletteSb",   g.paletteSb.Get(),   (uint32_t)sizeof(uint32_t));
+    fill(info.pools[2], "blockPosSb",  g.blockPosSb.Get(),  (uint32_t)sizeof(lw::BlockPos));
+    fill(info.pools[3], "blockColSb",  g.blockColSb.Get(),  (uint32_t)sizeof(lw::BlockCol));
+    return info;
 }
 
 bool Renderer::UploadLwWorld(const lw::World& w)
@@ -296,21 +322,18 @@ bool Renderer::UploadLwWorld(const lw::World& w)
         lwWorld_.lods[L].blockColPool.clear();
         lwWorld_.lods[L].blockColPool.shrink_to_fit();
     }
-    return RebuildLwIdentityIb();
+    return true;
 }
 
 bool Renderer::UploadLwLodOnly(const lw::World& w, int L)
 {
-    // Streaming entry: copies this LOD's metadata into lwWorld_, uploads GPU
-    // buffers, refreshes identity IB. Caller must have already called
-    // PrepLwWorld with the file's AABB (other LODs may still be loading).
     if (L < 0 || L >= lw::kLodCount)
         return false;
     lwWorld_.lods[L] = w.lods[L]; // copy this LOD only (safe to read)
     if (!UploadLwLod(w, L))
         return false;
     if (L == 0) aoDirty_ = true; // top-down depth derived from LOD0
-    return RebuildLwIdentityIb();
+    return true;
 }
 
 bool Renderer::FinalizeLwUploads()
@@ -371,7 +394,7 @@ bool Renderer::RebuildCombinedLwGpu()
                 gi.worldOriginY = (float)rc.worldOriginY;
                 gi.worldOriginZ = (float)rc.worldOriginZ;
                 gi.lodScale = (float)lw.lodScale;
-                gi.poolBase = rc.poolBase;
+                gi._unused0 = 0;
                 gi.paletteBase = (base + i) * lw::kPaletteSize;
                 gi._pad[0] = gi._pad[1] = 0;
             }
@@ -546,46 +569,6 @@ void Renderer::PrepLwWorld(const lw::World& w)
     EnsureAoTextures(pow2);
 }
 
-bool Renderer::RebuildLwIdentityIb()
-{
-    // ---- Identity IB ----
-    // Size = max chunk poolCount across all LODs (each draw indexes 0..N-1).
-    uint32_t maxChunkPoints = 0;
-    for (int L = 0; L < lw::kLodCount; ++L)
-    {
-        for (const auto& rc : lwWorld_.lods[L].chunks)
-        {
-            if (rc.poolCount > maxChunkPoints)
-                maxChunkPoints = rc.poolCount;
-        }
-    }
-    if (maxChunkPoints > 0 && maxChunkPoints != lwIdentityIbCount_)
-    {
-        std::vector<uint32_t> ib(maxChunkPoints);
-        for (uint32_t i = 0; i < maxChunkPoints; ++i)
-            ib[i] = i;
-        D3D11_BUFFER_DESC bd = {};
-        bd.Usage = D3D11_USAGE_IMMUTABLE;
-        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        bd.ByteWidth = (UINT)(ib.size() * sizeof(uint32_t));
-        D3D11_SUBRESOURCE_DATA sd = {ib.data(), 0, 0};
-        lwIdentityIb_.Reset();
-        if (FAILED(device_->CreateBuffer(&bd, &sd, lwIdentityIb_.GetAddressOf())))
-        {
-            std::fprintf(stderr, "[lw] identity IB CreateBuffer failed (%u uints)\n", maxChunkPoints);
-            return false;
-        }
-        lwIdentityIbCount_ = maxChunkPoints;
-        std::printf("[lw] identity IB: %u uint32 (%.2f MB)\n",
-                    maxChunkPoints, maxChunkPoints * 4.0 / (1024.0 * 1024.0));
-    }
-
-    // New world means any cached shadow map is stale.
-    shadowMapDirty_ = true;
-
-    lwHasWorld_ = true;
-    return true;
-}
 
 std::vector<std::string> Renderer::EnumerateAdapters()
 {
@@ -2118,10 +2101,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
         // Treat "child chunk not resident" (streaming/shell) as no-child so
         // we render this coarser LOD instead of dropping the chunk entirely.
-        // Use blockCount (set only after the block stream walk completes) rather
-        // than poolCount (which uses a dummy=1 during chunk init). Avoids
-        // recursing into a chunk that's been partially populated by the loader
-        // thread but has no actual block data yet.
+        // blockCount is the residency gate (loader sets it after octet walk).
         bool childLoaded = (L > 0) && (childChunkId != lw::kNoChild) && (childChunkId < lwWorld_.lods[L - 1].chunks.size()) && (lwWorld_.lods[L - 1].chunks[childChunkId].blockCount > 0);
 
         // Recurse only when the cluster's nearest point wants finer than L.
@@ -2168,7 +2148,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         if (cullAabb(mnX, mnY, mnZ, mxX, mxY, mxZ))
             return;
         const lw::RuntimeChunk& rc = lwL.chunks[slot];
-        if (rc.poolCount == 0)
+        if (rc.blockCount == 0)
             return;
 
         (void)farAabbDist;

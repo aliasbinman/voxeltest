@@ -105,11 +105,25 @@ public:
     bool UploadLwWorld(const lw::World& w);
     // Streaming entry points:
     //   PrepLwWorld    — stash world metadata (chunk AABBs / childId / cull arrays).
-    //   UploadLwLodOnly — upload one LOD's GPU buffers (points/chunkInfo/palette),
-    //                     drop its CPU pointPool, refresh identity IB.
+    //   UploadLwLodOnly — upload one LOD's GPU buffers (chunkInfo / palette /
+    //                     blockPos / blockCol).
     // Use these when loading LODs incrementally; render starts once any LOD is up.
     void PrepLwWorld(const lw::World& w);
     bool UploadLwLodOnly(const lw::World& w, int L);
+
+    // ---- GPU resource inspection (debug window) ----
+    struct StreamPoolInfo
+    {
+        const char* name = "";
+        uint64_t bytes      = 0; // total bytes the SB occupies
+        uint32_t numElements = 0;
+        uint32_t stride      = 0;
+    };
+    struct StreamLodInfo
+    {
+        StreamPoolInfo pools[4] = {}; // chunkInfo, palette, blockPos, blockCol
+    };
+    StreamLodInfo GetStreamLodInfo(int L) const;
     // Call once after a batch of UploadLwLodOnly calls (a stream cycle's worth
     // of LOD updates). Rebuilds the combined-LOD GPU buffers if invalidated.
     bool FinalizeLwUploads();
@@ -238,7 +252,6 @@ private:
     bool CreatePipelineState();
     void TryHotReloadShaders();
     bool UploadLwLod(const lw::World& w, int L);
-    bool RebuildLwIdentityIb();
     void FillCbPerFrame(const Camera& cam,
                         const DrawSceneParams& args,
                         const hlslpp::float4x4& vp,
@@ -402,8 +415,6 @@ private:
     ComPtr<ID3D11Buffer> cbLwLod_;
     ComPtr<ID3D11Buffer> cbLwBounds_;
     bool tearingSupported_ = false;
-    ComPtr<ID3D11Buffer> lwIdentityIb_;
-    uint32_t lwIdentityIbCount_ = 0;
 
     // ---- Compute rasterizer (PointCS_Block two-pass worklist) ----
     // Pass1 writes R32 depth (atomic). Pass2 reads depth, writes R16 colour.

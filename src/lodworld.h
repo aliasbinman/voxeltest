@@ -62,25 +62,6 @@ inline constexpr int kPaletteSize = 256;
 inline constexpr uint16_t kNoChild = 0xFFFFu;
 
 // =====================================================================
-// Disk-resident point (8 bytes).
-// Position is CHUNK-local (NOT cluster-local). Y range only uses low 6
-// bits; the wasted 2 bits keep the struct 8-byte aligned and avoid bit
-// packing in the hot path.
-// =====================================================================
-#pragma pack(push, 1)
-struct DiskPoint
-{
-    uint8_t posX;        // 0..kChunkVoxX-1
-    uint8_t posY;        // 0..kChunkVoxY-1
-    uint8_t posZ;        // 0..kChunkVoxZ-1
-    uint8_t palIdx;      // index into chunk's palette[]
-    uint8_t visMask;     // low 6 bits = face visibility (+X,-X,+Y,-Y,+Z,-Z)
-    uint8_t aoPacked[3]; // 6 faces * 4 bits AO = 24 bits
-};
-#pragma pack(pop)
-static_assert(sizeof(DiskPoint) == 8, "");
-
-// =====================================================================
 // Runtime BLOCK split into two parallel SoA arrays for the
 // PointCS_Block path. Same index used into both pools.
 //
@@ -147,13 +128,12 @@ inline constexpr uint8_t kOctetModeUniformNew = 1u;
 inline constexpr uint8_t kOctetModeVaried = 2u;
 
 // =====================================================================
-// Disk-resident cluster header (12 bytes).
+// Per-cluster runtime info (12 bytes). Despite the "Disk" prefix it's
+// rebuilt by the loader from the OCTET stream — not read off disk.
 // bounds packs start/end XYZ in cluster-local voxel coords (5 bits each,
 // 30 bits total, top 2 spare). Used for tighter VFC than the nominal
-// cluster AABB.
-// numPoints == 0 means empty slot in the dense cluster array.
-// pointFirst is offset (in DiskPoint units) into the CHUNK's point array.
-// The renderer translates to pool offset by adding the chunk's poolBase.
+// cluster AABB. numPoints != 0 = cluster present (1 dummy, real count is
+// clusterBlockCount[]).
 // =====================================================================
 #pragma pack(push, 1)
 struct DiskCluster
@@ -161,7 +141,7 @@ struct DiskCluster
     uint32_t bounds;
     uint16_t numPoints;
     uint16_t _pad;
-    uint32_t pointFirst;
+    uint32_t pointFirst; // unused (kept for layout)
 };
 #pragma pack(pop)
 static_assert(sizeof(DiskCluster) == 12, "");
@@ -182,19 +162,14 @@ inline void UnpackClusterBounds(uint32_t b, uint8_t out[6])
 }
 
 // =====================================================================
-// Disk-resident chunk header (56 bytes).
-// Followed in the blob by:
-//   uint32_t   palette[paletteCount];          // 0x00BBGGRR
-//   DiskCluster clusters[kClustersPerChunk];   // dense; numPoints=0 = empty
-//   DiskPoint   points[totalPoints];
+// Disk-resident chunk header (60 bytes). Followed in the blob by:
+//   uint32_t palette[paletteCount];   // 0x00BBGGRR
+//   <octet stream>                    // see kFlagBlocks doc
 //
 // gridX/Y/Z are this chunk's coords in its LOD's chunk grid. worldOrigin
-// is the corner of the chunk in LOD0 voxel units (always, regardless of
-// the chunk's own LOD). aabb is tight, in chunk-local LOD-voxel coords.
-//
-// childId[8] indexes into LOD(N-1).chunks at file-load time and is used
-// for top-down recursion. Bit 0=X, bit 1=Y, bit 2=Z of the child quadrant.
-// 0xFFFF = no child authored.
+// is the corner of the chunk in LOD0 voxel units. aabb is tight, in
+// chunk-local LOD-voxel coords. childId[8] indexes LOD(N-1).chunks for
+// recursion. 0xFFFF = no child authored.
 // =====================================================================
 #pragma pack(push, 1)
 struct DiskChunkHeader
@@ -203,7 +178,7 @@ struct DiskChunkHeader
     int32_t worldOriginX, worldOriginY, worldOriginZ; // LOD0 voxel units
     uint32_t lodLevel;                                // 0..kLodCount-1
     uint32_t paletteCount;                            // <= kPaletteSize
-    uint32_t totalPoints;
+    uint32_t _unusedTotalPoints;                      // kept for wire layout
     uint16_t childId[8];
     uint8_t aabbMin[3]; // chunk-local LOD-voxel coords
     uint8_t aabbMax[3];
@@ -219,23 +194,18 @@ static_assert(sizeof(DiskChunkHeader) == 60, "");
 //   LODHeader[kLodCount]
 //   for each lod:
 //     ChunkEntry[lod.chunkCount]           // sorted by gridZ,gridY,gridX
-//     <chunk blob 0>                       // header+palette+clusters+points
+//     <chunk blob 0>                       // DiskChunkHeader + palette + octet stream
 //     <chunk blob 1>
 //     ...
 //
-// ChunkEntry contains both compressed and raw byte sizes so the streamer
-// can decide buffer sizes without seeking into the blob. Phase 1 emits
-// raw blobs (flags = 0); Phase 2 wraps in LZ4 (flags |= kFlagLz4).
+// ChunkEntry holds compressed + raw byte sizes so the streamer sizes
+// buffers without seeking into the blob. Optional LZ4 wrap (kFlagLz4).
 // =====================================================================
 
 inline constexpr uint32_t kFileMagic = 0x31574F4Cu; // "LOW1" little-endian
 inline constexpr uint32_t kFileVersion = 2u;
 
 inline constexpr uint32_t kFlagLz4 = 1u << 0;
-inline constexpr uint32_t kFlagBitGrid = 1u << 1; // per-cluster bit-grid + color stream
-inline constexpr uint32_t kFlagAo = 1u << 2;      // per-cluster appends 3 bytes AO per occupied cell
-inline constexpr uint32_t kFlagVisMask = 1u << 3; // per-cluster appends 1 byte visMask per occupied cell
-inline constexpr uint32_t kFlagCellAo = 1u << 4;  // per-cluster appends 4-bit AO per "AO cell"
                                                   // (empty cell adjacent to solid voxel in chunk grid)
 
 // =====================================================================
@@ -425,9 +395,6 @@ struct RuntimeChunk
     uint16_t childId[8];                     // LOD(N-1) chunk index
     DiskCluster clusters[kClustersPerChunk]; // dense; numPoints=0 = empty
 
-    // GPU residency (set by renderer when chunk goes resident).
-    uint32_t poolBase;  // first DiskPoint index in the LOD's point pool
-    uint32_t poolCount; // total points uploaded (sum of cluster numPoints)
     uint32_t slotIdx;   // index into LODWorld's ChunkInfo SRV; top byte
                         //  of startVertex during Draw.
 
@@ -484,7 +451,7 @@ struct GpuChunkInfo
 {
     float worldOriginX, worldOriginY, worldOriginZ;
     float lodScale;       // multiplier from LOD-voxel to world units
-    uint32_t poolBase;    // first DiskPoint index in pool
+    uint32_t _unused0;    // was poolBase (point pool dropped with CS-only path)
     uint32_t paletteBase; // slotIdx * kPaletteSize, offset into palette atlas
     uint32_t _pad[2];
 };
@@ -494,12 +461,7 @@ static_assert(sizeof(GpuChunkInfo) == 32, "");
 // =====================================================================
 // startVertex packing for the cluster-fused draw scheme.
 //   [slot : 8 bits | vtxIdx : 24 bits]
-// VS:
-//   uint sv      = SV_VertexID;
-//   uint slot    = sv >> 24;
-//   uint vtxIdx  = sv & 0xFFFFFFu;
-//   ChunkInfo ci = gChunkInfos[slot];
-//   DiskPoint p  = gPointPool[ci.poolBase + vtxIdx];
+// (point-VS path retired; helpers retained for future revivals.)
 // =====================================================================
 inline constexpr int kStartVertexSlotBits = 8;
 inline constexpr int kStartVertexVtxBits = 24;

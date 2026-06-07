@@ -1,9 +1,8 @@
 // lw_loader.cpp — read .lw (LODWorld) into runtime World.
 //
-// Phase 1: synchronous, whole-file load. Concatenates each LOD's chunk
-// points into a single CPU pool (LODWorld::pointPool); RuntimeChunk.poolBase
-// is the offset into that pool. Renderer uploads the pool to GPU and uses
-// the same offset for vertex addressing.
+// Synchronous whole-file load. Reads chunk header + palette + OCTET stream
+// (kFlagBlocks). Builds per-LOD blockPosPool/blockColPool which the CS
+// worklist path consumes directly.
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "lodworld.h"
@@ -274,8 +273,6 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                 memcpy(rc.palette, p, palBytes);
             p += palBytes;
 
-            rc.poolBase = 0;
-            rc.poolCount = 1; // dummy non-zero so visit()/childChunks check passes
             rc.slotIdx = i;
             memset(rc.clusters, 0, sizeof(rc.clusters));
             // Per-cluster numPoints + bounds filled below as the V3 stream walk
@@ -442,9 +439,6 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                 }
                 tBlocksMs += std::chrono::duration<double, std::milli>(clk::now() - tBlk0).count();
                 totalBlocks += rc.blockCount;
-                // Reflect block count into poolCount so visit() / childLoaded
-                // gating treats this chunk as resident only when it has blocks.
-                rc.poolCount = rc.blockCount;
             }
         } // end of for(size_t r ...) chunk loop
 

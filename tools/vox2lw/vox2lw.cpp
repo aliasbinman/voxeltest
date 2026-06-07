@@ -104,12 +104,28 @@ struct CellAcc
     uint8_t aoMax[6] = {0, 0, 0, 0, 0, 0};
 };
 
+// Baker-local per-voxel record. Was DiskPoint when point pools were
+// uploaded directly to GPU; now used solely as scratch while encoding
+// the octet stream.
+#pragma pack(push, 1)
+struct DiskPoint
+{
+    uint8_t posX;        // 0..kChunkVoxX-1
+    uint8_t posY;        // 0..kChunkVoxY-1
+    uint8_t posZ;        // 0..kChunkVoxZ-1
+    uint8_t palIdx;      // index into chunk's palette[]
+    uint8_t visMask;     // low 6 bits = face visibility
+    uint8_t aoPacked[3]; // 6 faces * 4 bits AO
+};
+#pragma pack(pop)
+static_assert(sizeof(DiskPoint) == 8, "");
+
 struct BakedChunk
 {
     lw::DiskChunkHeader hdr;
     std::vector<uint32_t> palette;
     lw::DiskCluster clusters[lw::kClustersPerChunk];
-    std::vector<lw::DiskPoint> points;
+    std::vector<DiskPoint> points;
 };
 
 // Per-cluster compression encoded data. Chosen ordering = smaller of
@@ -161,7 +177,7 @@ struct ChunkBits
 
 // `chunkBits` and `clusterOrigin{X,Y,Z}` are only used when g_storeCellAo is
 // true; pass nullptr/zeros otherwise.
-static ClusterEnc EncodeClusterTryBoth(const lw::DiskPoint* pts, uint32_t numPts,
+static ClusterEnc EncodeClusterTryBoth(const DiskPoint* pts, uint32_t numPts,
                                        uint64_t& outYBytes, uint64_t& outMBytes,
                                        const ChunkBits* chunkBits = nullptr,
                                        int clusterOriginX = 0,
@@ -177,7 +193,7 @@ static ClusterEnc EncodeClusterTryBoth(const lw::DiskPoint* pts, uint32_t numPts
         uint8_t vmAt[lw::kClusterCellCount];
         for (uint32_t i = 0; i < numPts; ++i)
         {
-            const lw::DiskPoint& p = pts[i];
+            const DiskPoint& p = pts[i];
             uint32_t lx = (uint32_t)(p.posX % lw::kClusterVoxX);
             uint32_t ly = (uint32_t)(p.posY % lw::kClusterVoxY);
             uint32_t lz = (uint32_t)(p.posZ % lw::kClusterVoxZ);
@@ -1244,7 +1260,7 @@ int main(int argc, char** argv)
             };
 
             // Bucket voxels into clusters (dense slots; empty slots untouched).
-            std::vector<lw::DiskPoint> bucket[lw::kClustersPerChunk];
+            std::vector<DiskPoint> bucket[lw::kClustersPerChunk];
             uint8_t cMn[lw::kClustersPerChunk][3];
             uint8_t cMx[lw::kClustersPerChunk][3];
             for (int s = 0; s < lw::kClustersPerChunk; ++s)
@@ -1264,7 +1280,7 @@ int main(int argc, char** argv)
                 int sly = ly - cy * lw::kClusterVoxY;
                 int slz = lz - cz * lw::kClusterVoxZ;
                 int slot = lw::ClusterIdx(cx, cy, cz);
-                lw::DiskPoint p;
+                DiskPoint p;
                 p.posX = (uint8_t)lx;
                 p.posY = (uint8_t)ly;
                 p.posZ = (uint8_t)lz;
@@ -1548,7 +1564,7 @@ int main(int argc, char** argv)
             bc.hdr.worldOriginZ = ck.gz * lw::kChunkVoxZ * step;
             bc.hdr.lodLevel = (uint32_t)L;
             bc.hdr.paletteCount = (uint32_t)bc.palette.size();
-            bc.hdr.totalPoints = (uint32_t)bc.points.size();
+            bc.hdr._unusedTotalPoints = (uint32_t)bc.points.size();
             for (int i = 0; i < 8; ++i)
                 bc.hdr.childId[i] = lw::kNoChild;
             bc.hdr.aabbMin[0] = aMn[0];
@@ -2012,7 +2028,7 @@ int main(int argc, char** argv)
                 chunkHdrBytes += sizeof(lw::DiskChunkHeader);
                 chunkPalBytes += bc.palette.size() * sizeof(uint32_t);
                 chunkMaskBytes += 16;
-                gpuPointBytes += bc.points.size() * sizeof(lw::DiskPoint);
+                gpuPointBytes += bc.points.size() * sizeof(DiskPoint);
 
                 fileRawBytes += entries[i].blobBytesRaw;
                 fileCompBytes += entries[i].blobBytes;
