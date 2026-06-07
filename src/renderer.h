@@ -23,13 +23,13 @@ enum class ShadingMode : int
 
 // Surviving render techs (LW path). Splat is the default; PolyAxis renders
 // real cube faces post-dilate. Others kept for reference / port targets.
+// Render technique selector. Only PointCS_Block is wired up today; other
+// entries kept for future resurrection (octet-driven polyaxis, etc).
 enum class RenderTech : int
 {
-    Splat = 9,
-    PolyAxis = 11,
-    PolyAxisInstanced = 12,
-    HexSprite = 3,
-    PointCS_Block = 15, // 2x2x2 block layout + LOD pop-hide fade (only working CS tech)
+    PointCS_Block = 0, // CS worklist Pass1 depth + Pass2 colour (active path)
+    PolyAxis      = 1, // reserved — cube faces from octet stream (future)
+    Splat         = 2, // reserved — HW point splat (future)
 };
 
 enum class PointLighting : int
@@ -51,10 +51,10 @@ struct DrawSceneParams
 {
     ShadingMode mode = ShadingMode::Lit;
     int gridSize = 1;
-    RenderTech tech = RenderTech::Splat;
-    RenderTech techFar = RenderTech::Splat;
+    RenderTech tech    = RenderTech::PointCS_Block; // close-ring technique
+    RenderTech techFar = RenderTech::PointCS_Block; // far-ring technique
     bool closeEnabled = true;
-    bool farEnabled = true;
+    bool farEnabled   = true;
     PointLighting pointLight = PointLighting::Complex;
     PointLod pointLod = PointLod::Auto;
     float pointLodScale = 1.0f;
@@ -80,8 +80,6 @@ struct DrawSceneParams
     bool splatDilate2Pass = false;
     bool shadowBlur = false;
     bool lwShowBounds = false;
-    bool lwPolyAxis = false;
-    bool csUsePointList = false; // A/B: dispatch per-voxel point CS instead of per-block
     bool cheapAO = false;        // top-down depth-based AO (multiplied in pass2)
     float aoFadeUnits = 16.0f;   // world units of soft falloff below top
     float aoPushTexels = 1.0f;   // lateral neighbour push distance (texels)
@@ -126,9 +124,9 @@ public:
     {
         return (L >= 0 && L < lw::kLodCount) ? lwGpu_[L].slotCount : 0;
     }
-    uint32_t LwPointCount(int L) const
+    uint32_t LwPointCount(int /*L*/) const
     {
-        return (L >= 0 && L < lw::kLodCount) ? lwGpu_[L].pointCount : 0;
+        return 0;
     }
     uint64_t LwBytes(int L) const
     {
@@ -355,8 +353,6 @@ private:
     // ---- LW (lodworld) GPU resources ----
     struct LwGpu
     {
-        ComPtr<ID3D11Buffer> pointSb;
-        ComPtr<ID3D11ShaderResourceView> pointSrv;
         ComPtr<ID3D11Buffer> chunkInfoSb;
         ComPtr<ID3D11ShaderResourceView> chunkInfoSrv;
         ComPtr<ID3D11Buffer> paletteSb;
@@ -365,12 +361,8 @@ private:
         ComPtr<ID3D11ShaderResourceView> blockPosSrv;
         ComPtr<ID3D11Buffer> blockColSb; // BlockCol pool (8B/block: palIdx[8])
         ComPtr<ID3D11ShaderResourceView> blockColSrv;
-        ComPtr<ID3D11Buffer> blockPointSb; // PointCS A/B: per-voxel uint32_t list
-        ComPtr<ID3D11ShaderResourceView> blockPointSrv;
         uint32_t slotCount = 0;
-        uint32_t pointCount = 0;
         uint32_t blockCount = 0;
-        uint32_t blockPointCount = 0;
         uint64_t bytes = 0;
     };
     LwGpu lwGpu_[lw::kLodCount];
@@ -388,11 +380,8 @@ private:
         ComPtr<ID3D11ShaderResourceView> blockPosSrv;
         ComPtr<ID3D11Buffer> blockColSb;
         ComPtr<ID3D11ShaderResourceView> blockColSrv;
-        ComPtr<ID3D11Buffer> blockPointSb;
-        ComPtr<ID3D11ShaderResourceView> blockPointSrv;
         uint32_t lodSlotBase[lw::kLodCount]   = {};
         uint32_t lodBlockBase[lw::kLodCount]  = {};
-        uint32_t lodPointBase[lw::kLodCount]  = {};
         uint32_t lodPaletteBase[lw::kLodCount]= {};
         bool     valid = false;
     };

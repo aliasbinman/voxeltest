@@ -110,10 +110,8 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         lw.lodLevel = (uint8_t)L;
         lw.lodScale = 1u << L;
         lw.chunks.clear();
-        lw.pointPool.clear();
         lw.blockPosPool.clear();
         lw.blockColPool.clear();
-        lw.blockPointPool.clear();
         const uint32_t cc = lh[L].chunkCount;
         if (cc == 0)
             continue;
@@ -291,10 +289,6 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
             rc.blockCount = 0;
             memset(rc.clusterBlockFirst, 0, sizeof(rc.clusterBlockFirst));
             memset(rc.clusterBlockCount, 0, sizeof(rc.clusterBlockCount));
-            rc.blockPointBase = (uint32_t)lw.blockPointPool.size();
-            rc.blockPointCount = 0;
-            memset(rc.clusterPointFirst, 0, sizeof(rc.clusterPointFirst));
-            memset(rc.clusterPointCount, 0, sizeof(rc.clusterPointCount));
             auto tBlk0 = clk::now();
             if (ce.flags & kFlagBlocks)
             {
@@ -308,8 +302,6 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                         bool lastCluster = (cid & 0x80u) != 0;
                         uint32_t ci = (uint32_t)(cid & 0x7Fu);
                         uint32_t clusterBlockFirst = (uint32_t)lw.blockPosPool.size() - rc.blockBase;
-                        uint32_t clusterPointFirst = (uint32_t)lw.blockPointPool.size() - rc.blockPointBase;
-                        uint32_t clusterPointEmitted = 0;
                         uint32_t cx = ci % kClustersX;
                         uint32_t cy = (ci / kClustersX) % kClustersY;
                         uint32_t cz = ci / (kClustersX * kClustersY);
@@ -423,24 +415,9 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                             for (int vi = 0; vi < 8; ++vi)
                                 bc.palIdx[vi] = palFull[vi];
                             lw.blockColPool.push_back(bc);
-                            // PointCS A/B: expand each occupied voxel to a packed uint.
-                            for (int vi = 0; vi < 8; ++vi)
-                            {
-                                if (!(mask & (1u << vi))) continue;
-                                uint32_t lvx = (vi >> 0) & 1u;
-                                uint32_t lvy = (vi >> 1) & 1u;
-                                uint32_t lvz = (vi >> 2) & 1u;
-                                uint32_t vx = blockX * 2u + lvx;
-                                uint32_t vy = blockY * 2u + lvy;
-                                uint32_t vz = blockZ * 2u + lvz;
-                                uint32_t pck = (vx & 0xFFu)
-                                              | ((vy & 0xFFu) << 8)
-                                              | ((vz & 0xFFu) << 16)
-                                              | ((uint32_t)palFull[vi] << 24);
-                                lw.blockPointPool.push_back(pck);
-                                ++clusterPointEmitted;
-                                ++rc.blockPointCount;
-                            }
+                            // blockPointPool fill removed (CS-only path doesn't need
+                            // per-voxel data — block-VS polyaxis route is dead until
+                            // resurrected on octet stream).
                             ++rc.blockCount;
                             ++octetCount;
                             if (clusterEnd && implicitRemaining == 0)
@@ -451,8 +428,6 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                         {
                             rc.clusterBlockFirst[ci] = clusterBlockFirst;
                             rc.clusterBlockCount[ci] = octetCount;
-                            rc.clusterPointFirst[ci] = clusterPointFirst;
-                            rc.clusterPointCount[ci] = clusterPointEmitted;
                             if (octetCount > 0)
                             {
                                 rc.clusters[ci].numPoints = 1; // visitCluster gate

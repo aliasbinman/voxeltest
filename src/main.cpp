@@ -127,10 +127,10 @@ struct AppState
     Renderer renderer;
     Camera camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech tech = RenderTech::PointCS_Block;    // close tech
-    RenderTech techFar = RenderTech::PointCS_Block; // far tech
+    RenderTech tech    = RenderTech::PointCS_Block; // close-ring tech
+    RenderTech techFar = RenderTech::PointCS_Block; // far-ring tech
     bool closeEnabled = true;
-    bool farEnabled = true;
+    bool farEnabled   = true;
     float sunPitchDeg = 10.0f;
     float sunYawDeg = 63.0f;
     float sunIntensityEV = 0.0f; // log2 stops; linear = 2^EV
@@ -204,8 +204,6 @@ struct AppState
     int adapterIdx = -1;                       // selected adapter idx (-1=default)
     int activeAdapterIdx = -1;                 // adapter actually in use this run
     bool lwShowBounds = false;                 // debug: draw per-chunk AABBs
-    bool lwPolyAxis = false;                   // render cube faces instead of splats
-    bool csUsePointList = false;               // A/B: per-voxel point CS vs per-block CS
     bool cheapAO = false;                      // top-down depth-based AO
     float aoFadeUnits = 16.0f;
     float aoPushTexels = 1.0f;
@@ -980,47 +978,34 @@ void FrameControlsWindow()
             }
         }
     }
-    struct TechEntry
-    {
-        const char* name;
-        RenderTech val;
-    };
+    // Tech pulldowns — only PointCS_Block wired today; others reserved for
+    // future octet-based revivals. Close/Far checkboxes gate each ring.
+    struct TechEntry { const char* name; RenderTech val; };
     static const TechEntry kTechList[] = {
-        {"Splat", RenderTech::Splat},
-        {"PolyAxis", RenderTech::PolyAxis},
-        {"PolyAxisInst", RenderTech::PolyAxisInstanced},
-        {"HexSprite", RenderTech::HexSprite},
         {"PointCS_Block", RenderTech::PointCS_Block},
+        {"PolyAxis",      RenderTech::PolyAxis},
+        {"Splat",         RenderTech::Splat},
     };
     const int kTechCount = (int)(sizeof(kTechList) / sizeof(kTechList[0]));
-    auto techIdxFrom = [&](RenderTech v) -> int
-    {
+    auto techIdxFrom = [&](RenderTech v) -> int {
         for (int k = 0; k < kTechCount; ++k)
-            if (kTechList[k].val == v)
-                return k;
+            if (kTechList[k].val == v) return k;
         return 0;
     };
     {
         const char* techNames[16];
-        for (int k = 0; k < kTechCount; ++k)
-            techNames[k] = kTechList[k].name;
-        // Close (near) tech
+        for (int k = 0; k < kTechCount; ++k) techNames[k] = kTechList[k].name;
         int tt = techIdxFrom(g_app.tech);
         ImGui::PushItemWidth(180.0f);
         if (ImGui::Combo("##TechClose", &tt, techNames, kTechCount, kTechCount))
-        {
             g_app.tech = kTechList[tt].val;
-        }
         ImGui::PopItemWidth();
         ImGui::SameLine();
         ImGui::Checkbox("Close", &g_app.closeEnabled);
-        // Far tech
         int tf = techIdxFrom(g_app.techFar);
         ImGui::PushItemWidth(180.0f);
         if (ImGui::Combo("##TechFar", &tf, techNames, kTechCount, kTechCount))
-        {
             g_app.techFar = kTechList[tf].val;
-        }
         ImGui::PopItemWidth();
         ImGui::SameLine();
         ImGui::Checkbox("Far", &g_app.farEnabled);
@@ -1086,8 +1071,6 @@ void FrameControlsWindow()
             ImGui::SliderFloat("Roughness", &g_app.roughness, 0.05f, 1.0f, "%.2f");
             ImGui::ColorEdit3("Clear color", g_app.bgColor);
             ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
-            ImGui::Checkbox("LW: PolyAxis (cube faces, per-face AO)", &g_app.lwPolyAxis);
-            ImGui::Checkbox("LW: PointCS A/B — per-voxel CS (vs per-block)", &g_app.csUsePointList);
             ImGui::Checkbox("LW: Cheap top-down AO", &g_app.cheapAO);
             if (g_app.cheapAO)
             {
@@ -1700,12 +1683,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             clear[2] = g_app.bgColor[2];
             clear[3] = g_app.bgColor[3];
         }
-        // Main DSV is only read by polyaxis, HW point CS_Block direct, and
-        // wireframe bounds. If none of those will run, the depth clear is a
-        // pure waste.
-        bool dsvUnused = !g_app.lwPolyAxis
-                      && !g_app.csUsePointList
-                      && !g_app.lwShowBounds;
+        // Main DSV only read by wireframe bounds debug path.
+        bool dsvUnused = !g_app.lwShowBounds;
         g_app.renderer.BeginFrame(clear, g_app.skipBackbufferClear, dsvUnused);
         // Draw as soon as ANY LOD is uploaded — streaming flips sceneReady on
         // first LOD ready. loadOk only flips after the worker has finished
@@ -1793,8 +1772,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.shadowLod = g_app.shadowLodIdx - 1; // 0 -> Auto (-1)
             ps.shadowBlur = g_app.shadowBlur;
             ps.lwShowBounds = g_app.lwShowBounds;
-            ps.lwPolyAxis = g_app.lwPolyAxis;
-            ps.csUsePointList = g_app.csUsePointList;
             ps.cheapAO = g_app.cheapAO;
             ps.aoStrength = g_app.aoStrength;
             ps.aoFadeUnits = g_app.aoFadeUnits;
