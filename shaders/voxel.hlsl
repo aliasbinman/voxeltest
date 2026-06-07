@@ -2,6 +2,12 @@
 // VS/PS passes (TAA, post, godrays, splat composite) live in postfx.hlsl.
 // LW point/cube draws live in lodworld.hlsl.
 
+// A/B switch between 3-face area-weighted view-direction blend (0) and
+// single ray-hit-face lighting (1). The 1 path uses the dominant axis of
+// (hit - cubeCenter) to pick one face per pixel — sharper face shading on
+// big cubes that span many pixels.
+#define USE_6FACE_LIGHTING 1
+
 cbuffer cbPerFrame : register(b0)
 {
     row_major float4x4 gViewProj;
@@ -145,7 +151,7 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
     int R = (int)max(1.0, _pad1.x);
     float  bestT      = 1e30;
     float3 bestAlbedo = float3(0, 0, 0);
-    float3 bestN      = float3(0, 0, 1);
+    float3 bestCenter = float3(0, 0, 0);
     uint   bestMask   = 0x3Fu;
     bool   anyHit     = false;
 
@@ -194,32 +200,11 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             if (tFar < 0.0 || tNear > tFar) continue;
             float tHit = max(tNear, 0.0);
             if (tHit < bestT) {
-                float3 hit = ro + rd * tHit;
-                float3 center = (vmin + vmax) * 0.5;
-                float3 d = hit - center;
-                // Pick face: dominant axis of (hit-center) restricted to faces
-                // present in visMask. Decode that face's AO from packed mask.
-                float bestProj = -1.0;
-                float3 n = float3(0, 1, 0);
-                float pickedFaceAo = aoN;
-                [unroll] for (uint fi = 0u; fi < 6u; ++fi) {
-                    float3 fn = float3(0, 0, 0);
-                    if      (fi == 0u) fn = float3( 1, 0, 0);
-                    else if (fi == 1u) fn = float3(-1, 0, 0);
-                    else if (fi == 2u) fn = float3( 0, 1, 0);
-                    else if (fi == 3u) fn = float3( 0,-1, 0);
-                    else if (fi == 4u) fn = float3( 0, 0, 1);
-                    else               fn = float3( 0, 0,-1);
-                    float p = dot(d, fn);
-                    if (p > bestProj) {
-                        bestProj = p; n = fn;
-                    }
-                }
                 bestT      = tHit;
                 bestAlbedo = s.rgb;
-                bestN      = n;
+                bestCenter = (vmin + vmax) * 0.5;
                 bestMask   = visMaskN;
-                bestAo     = pickedFaceAo;
+                bestAo     = aoN;
                 bestLodIdx = lodIdx;
                 bestParity = parityN;
                 anyHit     = true;
@@ -229,25 +214,46 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
 
     if (anyHit) {
         float3 hit = ro + rd * bestT;
-        // Cheap top-down AO: push lookup along surface normal so vertical
-        // faces sample the open neighbour column instead of their own roof.
-        float aoTop = AoSampleWithNormal(hit, bestN);
+        // 3-face area-weighted lighting: viewDir from cube centre picks the
+        // 3 visible face normals (sign per axis) and weighs each by its
+        // projected screen area = (viewDir.axis)². Sum of weights == 1.
+        float3 vdir = normalize(gCamPos - bestCenter);
+        float3 N0 = float3(sign(vdir.x), 0, 0);
+        float3 N1 = float3(0, sign(vdir.y), 0);
+        float3 N2 = float3(0, 0, sign(vdir.z));
+        float w0 = vdir.x * vdir.x;
+        float w1 = vdir.y * vdir.y;
+        float w2 = vdir.z * vdir.z;
+        // Dominant face for AO sample + viz modes.
+        float3 nDom = (w0 >= w1 && w0 >= w2) ? N0 : ((w1 >= w2) ? N1 : N2);
+        float aoTop = AoSampleWithNormal(hit, nDom);
         bestAlbedo *= aoTop;
         float3 outRgb;
         if ((int)gMode == 3) {
-            // AO viz: top-down AO directly.
             outRgb = aoTop.xxx;
         } else if ((int)gMode == 4) {
-            // AO + LOD viz: top-down AO tinted by per-LOD colour + cluster checker.
             float check = (bestParity == 0u) ? 0.55 : 1.00;
             outRgb = aoTop * ClusterTint(2u + bestLodIdx) * check;
         } else {
-            outRgb = ShadeWithLighting(bestAlbedo, bestN, hit, bestAo,
+#if USE_6FACE_LIGHTING
+            // Per-pixel ray-hit picks the cube face: dominant axis of
+            // (hit - center). Light that face only — gives sharp face
+            // shading on big cubes that span many pixels.
+            float3 d = hit - bestCenter;
+            float3 ad = abs(d);
+            float3 nHit = (ad.x >= ad.y && ad.x >= ad.z)
+                            ? float3(sign(d.x), 0, 0)
+                            : ((ad.y >= ad.z)
+                                ? float3(0, sign(d.y), 0)
+                                : float3(0, 0, sign(d.z)));
+            outRgb = ShadeWithLighting(bestAlbedo, nHit, hit, bestAo,
                                        bestLodIdx, bestParity, (int)gMode);
+#else
+            outRgb = ShadeWithLighting3Face(bestAlbedo, N0, N1, N2, w0, w1, w2,
+                                            hit, bestAo, bestLodIdx, bestParity, (int)gMode);
+#endif
         }
         gSplatFinalUav[pix] = float4(outRgb, 1.0);
-        // Reproject winning hit -> clip depth (more accurate than the
-        // un-dilated source depth, which is 0 at filled-in pixels).
         float4 clipHit = mul(float4(hit, 1.0), gViewProj);
         gSplatFinalDepthUav[pix] = saturate(clipHit.z / max(clipHit.w, 1e-6));
     } else {
@@ -298,24 +304,17 @@ bool LightSplatSampled(int2 pix, int2 sp, int W, int H,
     float tHit = max(tNear, 0.0);
     float3 hit = ro + rd * tHit;
     float3 center = (vmin + vmax) * 0.5;
-    float3 d = hit - center;
-    float bestProj = -1.0;
-    float3 n = float3(0, 1, 0);
+    // 3-face area-weighted lighting (see csmain_splat for derivation).
+    float3 vdir = normalize(gCamPos - center);
+    float3 N0 = float3(sign(vdir.x), 0, 0);
+    float3 N1 = float3(0, sign(vdir.y), 0);
+    float3 N2 = float3(0, 0, sign(vdir.z));
+    float w0 = vdir.x * vdir.x;
+    float w1 = vdir.y * vdir.y;
+    float w2 = vdir.z * vdir.z;
+    float3 nDom = (w0 >= w1 && w0 >= w2) ? N0 : ((w1 >= w2) ? N1 : N2);
     float pickedFaceAo = (float)ao4 / 15.0;
-    [unroll] for (uint fi = 0u; fi < 6u; ++fi) {
-        float3 fn = float3(0, 0, 0);
-        if      (fi == 0u) fn = float3( 1, 0, 0);
-        else if (fi == 1u) fn = float3(-1, 0, 0);
-        else if (fi == 2u) fn = float3( 0, 1, 0);
-        else if (fi == 3u) fn = float3( 0,-1, 0);
-        else if (fi == 4u) fn = float3( 0, 0, 1);
-        else               fn = float3( 0, 0,-1);
-        float p = dot(d, fn);
-        if (p > bestProj) {
-            bestProj = p; n = fn;
-        }
-    }
-    float aoTop = AoSampleWithNormal(hit, n);
+    float aoTop = AoSampleWithNormal(hit, nDom);
     float3 albedo = s.rgb * aoTop;
     float3 rgb;
     if ((int)gMode == 3) {
@@ -324,7 +323,20 @@ bool LightSplatSampled(int2 pix, int2 sp, int W, int H,
         float check = (parityN == 0u) ? 0.55 : 1.00;
         rgb = aoTop * ClusterTint(2u + lodIdx) * check;
     } else {
-        rgb = ShadeWithLighting(albedo, n, hit, pickedFaceAo, lodIdx, parityN, (int)gMode);
+#if USE_6FACE_LIGHTING
+        float3 d = hit - center;
+        float3 ad = abs(d);
+        float3 nHit = (ad.x >= ad.y && ad.x >= ad.z)
+                        ? float3(sign(d.x), 0, 0)
+                        : ((ad.y >= ad.z)
+                            ? float3(0, sign(d.y), 0)
+                            : float3(0, 0, sign(d.z)));
+        rgb = ShadeWithLighting(albedo, nHit, hit, pickedFaceAo,
+                                lodIdx, parityN, (int)gMode);
+#else
+        rgb = ShadeWithLighting3Face(albedo, N0, N1, N2, w0, w1, w2,
+                                     hit, pickedFaceAo, lodIdx, parityN, (int)gMode);
+#endif
     }
     float4 clipHit = mul(float4(hit, 1.0), gViewProj);
     outRgb   = rgb;

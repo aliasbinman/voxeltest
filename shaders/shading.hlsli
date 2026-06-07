@@ -127,7 +127,40 @@ float3 ShadeWithLighting(float3 albedo, float3 N, float3 wpos, float ao,
     float3 light = amb + gAmbient * sun;
     float3 lit   = albedo * light;
     float3 tint  = (gColorizeClusters > 0.5) ? ClusterTint(2u + lodIdx) : float3(1, 1, 1);
-    return Tonemap(ApplyFog(lit * tint, wpos));
+    return ApplyFog(lit * tint, wpos); // tonemap deferred to final post
+}
+
+// 3-face area-weighted variant. Shares shadow tap + fog.
+// Per-face only ambient cube fetch + ndotl. Weights must sum to 1.
+float3 ShadeWithLighting3Face(float3 albedo,
+                              float3 N0, float3 N1, float3 N2,
+                              float w0, float w1, float w2,
+                              float3 wpos, float ao,
+                              uint lodIdx, uint parity, int mode)
+{
+    if (mode == 1) return ApplyFog(albedo, wpos);
+    if (mode == 2) {
+        float3 Nb = w0 * N0 + w1 * N1 + w2 * N2;
+        return ApplyFog(Nb * 0.5 + 0.5, wpos);
+    }
+    if (mode == 3) return ao.xxx;
+    if (mode == 4) {
+        float check = (parity == 0u) ? 0.55 : 1.00;
+        return ao * ClusterTint(2u + lodIdx) * check;
+    }
+    float3 L = normalize(gLightDir);
+    float3 amb = (w0 * SampleAmbientCubeTriplanar(N0)
+                + w1 * SampleAmbientCubeTriplanar(N1)
+                + w2 * SampleAmbientCubeTriplanar(N2)) * ao;
+    float ndotl = w0 * saturate(dot(N0, L))
+                + w1 * saturate(dot(N1, L))
+                + w2 * saturate(dot(N2, L));
+    float  shad  = SampleShadow(wpos);
+    float3 sun   = float3(1.10, 1.00, 0.85) * ndotl * shad * gSunIntensity;
+    float3 light = amb + gAmbient * sun;
+    float3 lit   = albedo * light;
+    float3 tint  = (gColorizeClusters > 0.5) ? ClusterTint(2u + lodIdx) : float3(1, 1, 1);
+    return ApplyFog(lit * tint, wpos); // tonemap deferred to final post
 }
 
 // ============================================================

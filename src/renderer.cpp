@@ -820,7 +820,9 @@ bool Renderer::CreateRenderTargets()
         ct.Height = height_;
         ct.MipLevels = 1;
         ct.ArraySize = 1;
-        ct.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // HDR scene RT: lighting kept linear unbounded, tonemap at final post.
+        // Alpha retained as sky mask (post pass branches on alpha < 0.5).
+        ct.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         ct.SampleDesc.Count = 1;
         ct.Usage = D3D11_USAGE_DEFAULT;
         ct.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -901,6 +903,9 @@ bool Renderer::CreateRenderTargets()
     if (FAILED(device_->CreateUnorderedAccessView(splatColorTex_.Get(), nullptr, splatColorUav_.GetAddressOf())))
         return false;
 
+    // HDR splat-final: csmain_splat writes linear unbounded lit colour.
+    // No alpha needed. R11G11B10_FLOAT keeps it at 32 bpp.
+    sd2.Format = DXGI_FORMAT_R11G11B10_FLOAT;
     sd2.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(device_->CreateTexture2D(&sd2, nullptr, splatFinalTex_.GetAddressOf())))
         return false;
@@ -992,7 +997,7 @@ bool Renderer::CreateRenderTargets()
     };
     uint64_t pix = (uint64_t)width_ * (uint64_t)height_;
     splatRtBytes_ = pix * (bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM)   // splatColorTex_
-                           + bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM) // splatFinalTex_
+                           + bytesOf(DXGI_FORMAT_R11G11B10_FLOAT)// splatFinalTex_ (HDR)
                            + bytesOf(DXGI_FORMAT_R32_FLOAT)      // splatFinalDepthTex_
                            + bytesOf(DXGI_FORMAT_R32_TYPELESS)); // splatDepthTex_
     return true;

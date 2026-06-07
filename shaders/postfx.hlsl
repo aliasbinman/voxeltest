@@ -372,6 +372,11 @@ float4 psmain_post(VTaaOut i) : SV_Target
         c += gGodrayTint * gr * gGodrayStrength * fade * facingFade;
     }
 
-    
+
+    // Final ACES tonemap (lighting kept linear HDR through splat → TAA → fog
+    // → godray; clamp + display transform happens here).
+    c = c * gExposure;
+    const float a = 2.51, ta = 0.03, tc = 2.43, td = 0.59, te = 0.14;
+    c = saturate((c * (a * c + ta)) / (c * (tc * c + td) + te));
     return float4(c, 1.0);
 }
