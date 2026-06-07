@@ -855,7 +855,6 @@ bool Renderer::CreateRenderTargets()
     splatColorTex_.Reset();
     splatColorRtv_.Reset();
     splatColorUav_.Reset();
-    splatMaskUav_.Reset();
     splatDepthUavF_.Reset();
     splatBlockDepthTex_.Reset();
     splatBlockDepthSrv_.Reset();
@@ -873,9 +872,6 @@ bool Renderer::CreateRenderTargets()
     splatFinal2DepthTex_.Reset();
     splatFinal2DepthUav_.Reset();
     splatFinal2DepthSrv_.Reset();
-    splatMaskTex_.Reset();
-    splatMaskRtv_.Reset();
-    splatMaskSrv_.Reset();
 
     ComPtr<ID3D11Texture2D> backBuf;
     HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(backBuf.GetAddressOf()));
@@ -1019,20 +1015,6 @@ bool Renderer::CreateRenderTargets()
     if (FAILED(device_->CreateShaderResourceView(splatFinalTex_.Get(), nullptr, splatFinalSrv_.GetAddressOf())))
         return false;
 
-    // Per-pixel splat info emitted by point PS (MRT slot 1), consumed by CS.
-    // Layout: visMask(6) | face0_ao(4) | face1_ao(4) | ... | face5_ao(4) = 30 bits.
-    // R32_UINT — CS picks the relevant face during dilate and decodes its AO.
-    D3D11_TEXTURE2D_DESC smd = sd2;
-    smd.Format = DXGI_FORMAT_R32_UINT;
-    smd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-    if (FAILED(device_->CreateTexture2D(&smd, nullptr, splatMaskTex_.GetAddressOf())))
-        return false;
-    if (FAILED(device_->CreateRenderTargetView(splatMaskTex_.Get(), nullptr, splatMaskRtv_.GetAddressOf())))
-        return false;
-    if (FAILED(device_->CreateShaderResourceView(splatMaskTex_.Get(), nullptr, splatMaskSrv_.GetAddressOf())))
-        return false;
-    if (FAILED(device_->CreateUnorderedAccessView(splatMaskTex_.Get(), nullptr, splatMaskUav_.GetAddressOf())))
-        return false;
 
     // Dilated depth target.
     D3D11_TEXTURE2D_DESC sdf = sd2;
@@ -1117,7 +1099,6 @@ bool Renderer::CreateRenderTargets()
     uint64_t pix = (uint64_t)width_ * (uint64_t)height_;
     splatRtBytes_ = pix * (bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM)   // splatColorTex_
                            + bytesOf(DXGI_FORMAT_R8G8B8A8_UNORM) // splatFinalTex_
-                           + bytesOf(DXGI_FORMAT_R32_UINT)       // splatMaskTex_
                            + bytesOf(DXGI_FORMAT_R32_FLOAT)      // splatFinalDepthTex_
                            + bytesOf(DXGI_FORMAT_R32_TYPELESS)); // splatDepthTex_
     return true;
@@ -1605,7 +1586,7 @@ void Renderer::TryHotReloadShaders()
     shaderMtime_ = mtime;
 }
 
-void Renderer::BeginFrame(float clear[4], bool skipClear)
+void Renderer::BeginFrame(float clear[4], bool skipClear, bool skipDsvClear)
 {
     TryHotReloadShaders();
     lastClear_[0] = clear[0];
@@ -1616,9 +1597,14 @@ void Renderer::BeginFrame(float clear[4], bool skipClear)
     ctx_->OMSetRenderTargets(1, rtvs, dsv_.Get());
     if (!skipClear)
     {
+        MICROPROFILE_SCOPEGPUI("BeginFrame/ClearRTV", 0xff60a0c0);
         ctx_->ClearRenderTargetView(rtv_.Get(), clear);
     }
-    ctx_->ClearDepthStencilView(dsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+    if (!skipDsvClear)
+    {
+        MICROPROFILE_SCOPEGPUI("BeginFrame/ClearDSV", 0xff60c0a0);
+        ctx_->ClearDepthStencilView(dsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+    }
 
     D3D11_VIEWPORT vp = {};
     vp.Width = (float)width_;
@@ -1972,7 +1958,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
         ID3D11RenderTargetView* nullRtv[] = {nullptr};
         ctx_->OMSetRenderTargets(1, nullRtv, shadowDsv_.Get());
-        ctx_->ClearDepthStencilView(shadowDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        {
+            MICROPROFILE_SCOPEGPUI("Clear/Shadow", 0xff80a0c0);
+            ctx_->ClearDepthStencilView(shadowDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        }
         D3D11_VIEWPORT svp = {0, 0, (float)shadowSize_, (float)shadowSize_, 0.0f, 1.0f};
         ctx_->RSSetViewports(1, &svp);
         ctx_->RSSetState(args.shadowCullFront ? rsShadowFront_.Get() : rsShadowBack_.Get());
@@ -2084,14 +2073,13 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     const bool needSplat = (args.tech == RenderTech::Splat) || (args.techFar == RenderTech::Splat);
     if (needSplat)
     {
+        MICROPROFILE_SCOPEGPUI("LW/ClearSplatRTs", 0xff80a0c0);
         float clr[4] = {lastClear_[0], lastClear_[1], lastClear_[2], 0.0f};
         ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clr);
-        const float zeroClr[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        ctx_->ClearRenderTargetView(splatMaskRtv_.Get(), zeroClr);
         ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
     }
-    ID3D11RenderTargetView* mrt[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
-    ctx_->OMSetRenderTargets(2, mrt, splatDsv_.Get());
+    ID3D11RenderTargetView* mrt[] = {splatColorRtv_.Get()};
+    ctx_->OMSetRenderTargets(1, mrt, splatDsv_.Get());
 
     // ---- Shader setup (per-LOD sub-passes pick splat vs polyaxis VS) ----
     ctx_->IASetInputLayout(nullptr);
@@ -2356,8 +2344,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->ClearUnorderedAccessViewUint(visDepthUav_.Get(), clearVis);
         ctx_->ClearUnorderedAccessViewUint(visColorUav_.Get(), clearVis);
         // Restore splat RTs for the splat draws inside the loop.
-        ID3D11RenderTargetView* mrtA[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
-        ctx_->OMSetRenderTargets(2, mrtA, splatDsv_.Get());
+        ID3D11RenderTargetView* mrtA[] = {splatColorRtv_.Get()};
+        ctx_->OMSetRenderTargets(1, mrtA, splatDsv_.Get());
     }
 
     // ---- CBLwAo upload (only when enabled) + one-shot build ----
@@ -2554,8 +2542,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                 }
 
                 // Restore splat RTs.
-                ID3D11RenderTargetView* mrtRestore[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
-                ctx_->OMSetRenderTargets(2, mrtRestore, splatDsv_.Get());
+                ID3D11RenderTargetView* mrtRestore[] = {splatColorRtv_.Get()};
+                ctx_->OMSetRenderTargets(1, mrtRestore, splatDsv_.Get());
             }
         }
     }
@@ -2806,8 +2794,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
             ID3D11ShaderResourceView* nullCsSrvB[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
             ctx_->CSSetShaderResources(0, 5, nullCsSrvB);
-            ID3D11RenderTargetView* mrtRestoreB[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
-            ctx_->OMSetRenderTargets(2, mrtRestoreB, splatDsv_.Get());
+            ID3D11RenderTargetView* mrtRestoreB[] = {splatColorRtv_.Get()};
+            ctx_->OMSetRenderTargets(1, mrtRestoreB, splatDsv_.Get());
             ctx_->VSSetShaderResources(0, 3, vsSrvs);
 
             blockTotalAll += blockTotal;
@@ -2823,7 +2811,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     // existing resolve PS path.
     const bool blockSplatRoute = !args.csUsePointList && args.splatFilter
                                  && csLwBlockSplatWorklist_ && splatColorUav_
-                                 && splatMaskUav_ && splatDepthUavF_;
+                                 && splatDepthUavF_;
     if (!args.csUsePointList && !twoPassLods.empty() && csLwBlockColorWorklist_ && visColorUav_ && visDepthSrv_)
     {
         MICROPROFILE_SCOPEGPUI("LW/PointCS_Block/Pass2Color", 0xffe080ff);
@@ -2838,19 +2826,23 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             // Clear splat targets; pass2 only writes where it wins depth, so
             // unwritten pixels need sentinel state for splatCS.
             float clearC[4] = {0, 0, 0, 0};
-            uint32_t clearM[4] = {0, 0, 0, 0};
             float clearD[4] = {0, 0, 0, 0}; // reverse-Z far = 0
-            ctx_->ClearUnorderedAccessViewFloat(splatColorUav_.Get(), clearC);
-            ctx_->ClearUnorderedAccessViewUint(splatMaskUav_.Get(), clearM);
-            ctx_->ClearUnorderedAccessViewFloat(splatDepthUavF_.Get(), clearD);
+            {
+                MICROPROFILE_SCOPEGPUI("LW/Pass2/ClearColor", 0xffd06090);
+                ctx_->ClearUnorderedAccessViewFloat(splatColorUav_.Get(), clearC);
+            }
+            {
+                MICROPROFILE_SCOPEGPUI("LW/Pass2/ClearDepth", 0xffd08090);
+                ctx_->ClearUnorderedAccessViewFloat(splatDepthUavF_.Get(), clearD);
+            }
             ctx_->CSSetShader(csLwBlockSplatWorklist_.Get(), nullptr, 0);
             ID3D11ShaderResourceView* dSrv[] = {visDepthSrv_.Get()};
             ctx_->CSSetShaderResources(5, 1, dSrv);
-            // u0 unused by splat shader; bind splat UAVs at u1..u3.
+            // Bind color UAV at u1 and depth UAV at u3 (mask slot u2 unused).
             ID3D11UnorderedAccessView* uavP2[] = {
                 nullptr,
                 splatColorUav_.Get(),
-                splatMaskUav_.Get(),
+                nullptr,
                 splatDepthUavF_.Get()};
             ctx_->CSSetUnorderedAccessViews(0, 4, uavP2, initP2);
         }
@@ -2955,15 +2947,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ctx_->CSSetShaderResources(5, 1, nullDSrv);
         ID3D11ShaderResourceView* nullAo[] = {nullptr, nullptr};
         ctx_->CSSetShaderResources(8, 2, nullAo);
-        ID3D11RenderTargetView* mrtRestoreP2[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
-        ctx_->OMSetRenderTargets(2, mrtRestoreP2, splatDsv_.Get());
+        ID3D11RenderTargetView* mrtRestoreP2[] = {splatColorRtv_.Get()};
+        ctx_->OMSetRenderTargets(1, mrtRestoreP2, splatDsv_.Get());
     }
 
     // pointSplatRoute hoisted here so the splat dilate + composite can see it
     // and run BEFORE the HW point draw block below would normally fire.
     const bool pointSplatRoute = args.csUsePointList && args.splatFilter
                                  && vsLwBlockPoint_ && psLwBlockPointSplat_
-                                 && splatColorRtv_ && splatMaskRtv_ && splatDsv_;
+                                 && splatColorRtv_ && splatDsv_;
 
     // ---- HW point A/B splat-route: draw points to splat MRT + DSV ----
     bool anyPointSplat = false;
@@ -2976,12 +2968,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     {
         MICROPROFILE_SCOPEGPUI("LW/BlockPoints/DrawSplat", 0xff80ffe0);
         float clearC[4] = {0, 0, 0, 0};
-        uint32_t clearMu[4] = {0, 0, 0, 0};
         ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clearC);
-        ctx_->ClearRenderTargetView(splatMaskRtv_.Get(), (const float*)clearMu);
         ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
-        ID3D11RenderTargetView* mrt[] = {splatColorRtv_.Get(), splatMaskRtv_.Get()};
-        ctx_->OMSetRenderTargets(2, mrt, splatDsv_.Get());
+        ID3D11RenderTargetView* mrt[] = {splatColorRtv_.Get()};
+        ctx_->OMSetRenderTargets(1, mrt, splatDsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
         ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
         ctx_->RSSetState(rsNoCull_.Get());
@@ -3057,9 +3047,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11ShaderResourceView* csSrvs[] = {
             nullptr,
             depthSrvForCS,
-            splatColorSrv_.Get(),
-            splatMaskSrv_.Get()};
-        ctx_->CSSetShaderResources(0, 4, csSrvs);
+            splatColorSrv_.Get()};
+        ctx_->CSSetShaderResources(0, 3, csSrvs);
         // Shadow map at t6 + sampler at s1 (ApplyShadowLighting reads these).
         if (sunShadowsOn && shadowSrv_)
         {

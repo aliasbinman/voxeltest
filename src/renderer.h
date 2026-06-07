@@ -143,7 +143,10 @@ public:
     }
 
     void Resize(uint32_t w, uint32_t h);
-    void BeginFrame(float clear[4], bool skipClear = false);
+    // skipClear:    swapchain RTV clear (psmain_post writes every pixel → safe).
+    // skipDsvClear: main depth clear (only needed when a depth-reader runs:
+    //               polyaxis, HW point CS_Block direct, lwShowBounds wireframe).
+    void BeginFrame(float clear[4], bool skipClear = false, bool skipDsvClear = false);
     void EndFrame(bool vsync);
 
     ID3D11Device* Device() const
@@ -283,10 +286,6 @@ private:
     ComPtr<ID3D11ShaderResourceView> splatFinal2DepthSrv_;
     ComPtr<ID3D11ComputeShader> csSplat_;
     ComPtr<ID3D11ComputeShader> csSplatFill_;
-    ComPtr<ID3D11Texture2D> splatMaskTex_;
-    ComPtr<ID3D11RenderTargetView> splatMaskRtv_;
-    ComPtr<ID3D11ShaderResourceView> splatMaskSrv_;
-    ComPtr<ID3D11UnorderedAccessView> splatMaskUav_; // PointCS_Block → splat path
     ComPtr<ID3D11PixelShader> psSplatComposite_;
 
     ComPtr<ID3D11RasterizerState> rsSolid_;

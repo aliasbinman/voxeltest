@@ -98,7 +98,6 @@ void csmain_shadow_blur(uint3 dt : SV_DispatchThreadID)
 //   bits 6-29 = 6 face AOs × 4 bits (face f at bit 6+f*4)
 Texture2D<float>    gSplatDepth    : register(t1);
 Texture2D<float4>   gSplatColorSrv : register(t2);
-Texture2D<uint>     gSplatMaskSrv  : register(t3);
 RWTexture2D<float4> gSplatFinalUav      : register(u1);
 RWTexture2D<float>  gSplatFinalDepthUav : register(u2);
 
@@ -175,9 +174,10 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
             float zN = gSplatDepth.Load(int3(sp, 0));
             if (zN <= 0.0) continue;
             if (zN > fbZ) { fbZ = zN; fbHave = true; }
-            uint maskFull = gSplatMaskSrv.Load(int3(sp, 0));
-            uint visMaskN = maskFull & 0x3Fu;
-            parityN = (maskFull >> 30u) & 1u;   // cluster checker parity
+            // Mask buffer dropped; assume all 6 faces visible, no parity, and
+            // use the alpha-averaged AO for whatever face is picked.
+            uint visMaskN = 0x3Fu;
+            parityN = 0u;
             float3 wp = ReconstructNeighborWorld(sp, zN, W, H);
             // Snap to LOD-aligned voxel grid: collapses adjacent splats from
             // the same cluster onto the same AABB (kills cube-edge seams on
@@ -203,7 +203,6 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                 float3 n = float3(0, 1, 0);
                 float pickedFaceAo = aoN;
                 [unroll] for (uint fi = 0u; fi < 6u; ++fi) {
-                    if (((visMaskN >> fi) & 1u) == 0u) continue;
                     float3 fn = float3(0, 0, 0);
                     if      (fi == 0u) fn = float3( 1, 0, 0);
                     else if (fi == 1u) fn = float3(-1, 0, 0);
@@ -214,8 +213,6 @@ void csmain_splat(uint3 dt : SV_DispatchThreadID)
                     float p = dot(d, fn);
                     if (p > bestProj) {
                         bestProj = p; n = fn;
-                        uint nib = (maskFull >> (6u + fi * 4u)) & 0xFu;
-                        pickedFaceAo = (float)nib / 15.0;
                     }
                 }
                 bestT      = tHit;
@@ -280,9 +277,9 @@ bool LightSplatSampled(int2 pix, int2 sp, int W, int H,
     uint lodIdx  = (a8 >> 4) & 7u;
     uint ao4     = a8 & 0xFu;
     float halfExt = 0.5 * (float)(1u << lodIdx);
-    uint maskFull = gSplatMaskSrv.Load(int3(sp, 0));
-    uint visMaskN = maskFull & 0x3Fu;
-    uint parityN  = (maskFull >> 30u) & 1u;
+    // Mask buffer gone — assume all 6 faces visible, no parity, single AO.
+    uint visMaskN = 0x3Fu;
+    uint parityN  = 0u;
 
     float3 ro = gCamPos;
     float3 rd = PixelWorldDir(pix, W, H);
@@ -306,7 +303,6 @@ bool LightSplatSampled(int2 pix, int2 sp, int W, int H,
     float3 n = float3(0, 1, 0);
     float pickedFaceAo = (float)ao4 / 15.0;
     [unroll] for (uint fi = 0u; fi < 6u; ++fi) {
-        if (((visMaskN >> fi) & 1u) == 0u) continue;
         float3 fn = float3(0, 0, 0);
         if      (fi == 0u) fn = float3( 1, 0, 0);
         else if (fi == 1u) fn = float3(-1, 0, 0);
@@ -317,8 +313,6 @@ bool LightSplatSampled(int2 pix, int2 sp, int W, int H,
         float p = dot(d, fn);
         if (p > bestProj) {
             bestProj = p; n = fn;
-            uint nib = (maskFull >> (6u + fi * 4u)) & 0xFu;
-            pickedFaceAo = (float)nib / 15.0;
         }
     }
     float aoTop = AoSampleWithNormal(hit, n);

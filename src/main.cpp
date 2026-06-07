@@ -183,6 +183,18 @@ struct AppState
     bool  playPaused = false;
     float smoothSec = 0.0f;
     bool  showRecording = true;
+    bool  showGpuProfile = false;
+    static constexpr int kGpuProfHistory = 10;
+    float  gpuProfHist[1024][kGpuProfHistory] = {};
+    // Parallel ring: did the marker actually fire this frame? Avg ignores
+    // non-firing frames so toggles don't poison the rolling average.
+    bool   gpuProfFired[1024][kGpuProfHistory] = {};
+    int    gpuProfHistIdx = 0;
+    float  gpuProfUsPerPx = 10.0f; // µs of GPU time per displayed pixel
+    // Sticky "first-seen" registry — once a GPU timer fires it stays in the
+    // table (in registration / first-seen order) so rows don't jump as
+    // features get toggled.
+    bool  gpuProfSeen[1024] = {};
     bool  recDirScanned = false;
     bool  recCursorHidden = false;
     bool wantQuit = false;
@@ -220,7 +232,9 @@ struct AppState
     std::atomic<bool> loaderQuit{false};
     std::atomic<bool> loaderTrigger{false};
     std::atomic<float> streamRadiusScale{3.0f}; // wider shells preload finer LODs farther out → less pop-in
-    bool skipBackbufferClear = false;           // skip swapchain RTV clear (post pass covers all pixels)
+    // psmain_post writes every pixel (sky branch + scene branch both emit
+    // float4(c, 1.0)) so the swapchain RTV clear is redundant when post is on.
+    bool skipBackbufferClear = true;
     std::mutex loaderMu;
     std::condition_variable loaderCv;
     std::thread loaderThread;
@@ -551,6 +565,7 @@ void FrameMenuBar()
             ImGui::MenuItem("FPS", nullptr, &g_app.showFps);
             ImGui::MenuItem("Stats", nullptr, &g_app.showStats);
             ImGui::MenuItem("Recording", nullptr, &g_app.showRecording);
+            ImGui::MenuItem("GPU Profile", nullptr, &g_app.showGpuProfile);
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -681,6 +696,142 @@ void FrameFpsWindow()
     ImGui::Text("CPU frame: %.2f ms (%.0f FPS)", g_app.cpuFrameMs, g_app.fpsAvg);
     ImGui::PlotLines("FPS", g_app.fpsHist, IM_ARRAYSIZE(g_app.fpsHist),
                      g_app.fpsHistIdx, nullptr, 0.0f, 240.0f, ImVec2(0, 60));
+    ImGui::End();
+}
+
+void FrameGpuProfileWindow()
+{
+    if (!g_app.showGpuProfile) return;
+    if (!ImGui::Begin("GPU Profile", &g_app.showGpuProfile))
+    {
+        ImGui::End();
+        return;
+    }
+    MicroProfile* mp = MicroProfileGet();
+    const float fToMsGpu = MicroProfileTickToMsMultiplier(MicroProfileTicksPerSecondGpu());
+    // Advance ring buffer first; record this frame's raw values into slot.
+    int slot = g_app.gpuProfHistIdx;
+    g_app.gpuProfHistIdx = (g_app.gpuProfHistIdx + 1) %
+                           AppState::kGpuProfHistory;
+    for (uint32_t i = 0; i < mp->nTotalTimers; ++i)
+    {
+        const MicroProfileTimerInfo& ti = mp->TimerInfo[i];
+        const MicroProfileGroupInfo& gi = mp->GroupInfo[ti.nGroupIndex];
+        if (gi.Type != MicroProfileTokenTypeGpu) continue;
+        float ms = (float)mp->Frame[i].nTicks * fToMsGpu;
+        bool fired = mp->Frame[i].nCount > 0;
+        if (i < 1024)
+        {
+            g_app.gpuProfHist[i][slot]  = ms;
+            g_app.gpuProfFired[i][slot] = fired;
+        }
+    }
+    // Sort entries by smoothed ms desc for readability.
+    struct Row {
+        uint32_t idx;
+        float raw;
+        float avg;
+        float maxV;
+    };
+    std::vector<Row> rows;
+    rows.reserve(64);
+    for (uint32_t i = 0; i < mp->nTotalTimers && i < 1024; ++i)
+    {
+        const MicroProfileTimerInfo& ti = mp->TimerInfo[i];
+        const MicroProfileGroupInfo& gi = mp->GroupInfo[ti.nGroupIndex];
+        if (gi.Type != MicroProfileTokenTypeGpu) continue;
+        float sum = 0.0f, mx = 0.0f;
+        int   firedCount = 0;
+        for (int s = 0; s < AppState::kGpuProfHistory; ++s)
+        {
+            if (!g_app.gpuProfFired[i][s]) continue;
+            float v = g_app.gpuProfHist[i][s];
+            sum += v;
+            ++firedCount;
+            if (v > mx) mx = v;
+        }
+        float avg = (firedCount > 0) ? (sum / (float)firedCount) : 0.0f;
+        float raw = g_app.gpuProfFired[i][slot] ? g_app.gpuProfHist[i][slot] : 0.0f;
+        // Stick the row on first non-zero appearance; from then on it's shown
+        // even if its current avg drops to 0. Keeps positions stable.
+        if (mx > 0.0f) g_app.gpuProfSeen[i] = true;
+        if (!g_app.gpuProfSeen[i]) continue;
+        rows.push_back({i, raw, avg, mx});
+    }
+    // µs/pixel — bar widths stay constant across frames + toggles.
+    ImGui::SetNextItemWidth(180.0f);
+    ImGui::SliderFloat("µs / pixel", &g_app.gpuProfUsPerPx, 0.5f, 200.0f, "%.1f",
+                       ImGuiSliderFlags_Logarithmic);
+    ImGui::SameLine();
+    ImGui::Text("smooth %df    active %d", AppState::kGpuProfHistory, (int)rows.size());
+
+    const float usPerPx = std::max(0.1f, g_app.gpuProfUsPerPx);
+    auto barPxFor = [&](float ms) { return (ms * 1000.0f) / usPerPx; };
+
+    const float rowH    = ImGui::GetTextLineHeightWithSpacing();
+    const ImU32 colAvg  = IM_COL32( 80, 180,  80, 255);
+    const ImU32 colRaw  = IM_COL32(240, 220,  60, 200);
+    const ImU32 colMax  = IM_COL32(255,  80,  80, 200);
+    const ImU32 colGrid = IM_COL32(120, 120, 120,  60);
+
+    if (ImGui::BeginTable("gpu_prof_bars", 4,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                          ImGuiTableFlags_ScrollY))
+    {
+        ImGui::TableSetupColumn("Marker", ImGuiTableColumnFlags_WidthFixed, 360.0f);
+        ImGui::TableSetupColumn("Avg",    ImGuiTableColumnFlags_WidthFixed,  64.0f);
+        ImGui::TableSetupColumn("Raw",    ImGuiTableColumnFlags_WidthFixed,  64.0f);
+        ImGui::TableSetupColumn("Bar",    ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        for (const Row& r : rows)
+        {
+            const MicroProfileTimerInfo& ti = mp->TimerInfo[r.idx];
+            const MicroProfileGroupInfo& gi = mp->GroupInfo[ti.nGroupIndex];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%s/%s", gi.pName, ti.pName);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.3f", r.avg);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%.3f", r.raw);
+            ImGui::TableSetColumnIndex(3);
+            ImVec2 cursor = ImGui::GetCursorScreenPos();
+            float avail = ImGui::GetContentRegionAvail().x;
+            float h = rowH - 4.0f;
+            // Reserve space so the table row claims the right height.
+            ImGui::Dummy(ImVec2(avail, rowH));
+            float barX0 = cursor.x;
+            float barY  = cursor.y + 2.0f;
+            float avgW  = std::min(avail, barPxFor(r.avg));
+            float rawW  = std::min(avail, barPxFor(r.raw));
+            float maxX  = barX0 + std::min(avail, barPxFor(r.maxV));
+            for (int ms = 1; ms <= 64; ++ms)
+            {
+                float gx = barX0 + barPxFor((float)ms);
+                if (gx > barX0 + avail) break;
+                dl->AddLine(ImVec2(gx, barY),
+                            ImVec2(gx, barY + h),
+                            colGrid, 1.0f);
+            }
+            if (avgW > 0.0f)
+                dl->AddRectFilled(ImVec2(barX0, barY),
+                                  ImVec2(barX0 + avgW, barY + h),
+                                  colAvg, 2.0f);
+            if (rawW > 0.0f)
+                dl->AddRectFilled(ImVec2(barX0, barY),
+                                  ImVec2(barX0 + rawW, barY + h * 0.35f),
+                                  colRaw, 2.0f);
+            dl->AddLine(ImVec2(maxX, barY),
+                        ImVec2(maxX, barY + h),
+                        colMax, 2.0f);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::TextDisabled("green = avg10ms    yellow = raw    red = max10ms    "
+                        "grey ticks = 1 ms");
     ImGui::End();
 }
 
@@ -1531,6 +1682,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         FrameFpsWindow();
         FrameStatsWindow();
         FrameControlsWindow();
+        FrameGpuProfileWindow();
         ImGui::Render();
 
         float clear[4];
@@ -1548,7 +1700,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             clear[2] = g_app.bgColor[2];
             clear[3] = g_app.bgColor[3];
         }
-        g_app.renderer.BeginFrame(clear, g_app.skipBackbufferClear);
+        // Main DSV is only read by polyaxis, HW point CS_Block direct, and
+        // wireframe bounds. If none of those will run, the depth clear is a
+        // pure waste.
+        bool dsvUnused = !g_app.lwPolyAxis
+                      && !g_app.csUsePointList
+                      && !g_app.lwShowBounds;
+        g_app.renderer.BeginFrame(clear, g_app.skipBackbufferClear, dsvUnused);
         // Draw as soon as ANY LOD is uploaded — streaming flips sceneReady on
         // first LOD ready. loadOk only flips after the worker has finished
         // every LOD; gating on it hides the coarse scene until full load.

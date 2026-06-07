@@ -201,18 +201,10 @@ VSOut vsmain_lw_polyaxis(uint vid : SV_VertexID)
     return o;
 }
 
-// ---- PS: splat albedo ----
-struct SplatOut {
-    float4 col  : SV_Target0;
-    uint   mask : SV_Target1;
-};
-
-SplatOut psmain_lw_splat_albedo(VSOut i)
+// ---- PS: splat albedo (mask output dropped) ----
+float4 psmain_lw_splat_albedo(VSOut i) : SV_Target
 {
-    SplatOut o;
-    o.col  = float4(i.colAO.rgb, EncodeSplatAlpha(i.colAO.a, gLodIdx, i.parity));
-    o.mask = i.mask;     // full 30-bit packed: visMask(6) + 6 face AOs(24)
-    return o;
+    return float4(i.colAO.rgb, EncodeSplatAlpha(i.colAO.a, gLodIdx, i.parity));
 }
 
 // ---- PS: opaque debug (no splat encoding — for "just see voxels" sanity) ----
@@ -323,7 +315,6 @@ RWTexture2D<uint>         gLwVisUav      : register(u0);
 // PointCS_Block → splat path UAVs (used by csmain_lw_block_splat_worklist).
 // Bound at u1..u3 so they don't alias the u0 used by other pass1/pass2 shaders.
 RWTexture2D<float4> gLwSplatColorUav : register(u1); // RGBA8 albedo + alpha = EncodeSplatAlpha
-RWTexture2D<uint>   gLwSplatMaskUav  : register(u2); // visMask(6) + 6 face AO(24) + parity(1)
 RWTexture2D<float>  gLwSplatDepthUav : register(u3); // reverse-Z (0..1)
 // Split SoA blocks:
 //   gLwBlockPos at t3: 4B/block — pack0 = bx|by|bz|occ (low..high bytes)
@@ -665,11 +656,7 @@ void csmain_lw_block_splat_worklist(uint3 dt : SV_DispatchThreadID)
         uint a8 = 0x80u | ((gLwLodIdx & 7u) << 4) | 0xFu;
         float alpha = (float)a8 / 255.0;
 
-        // Mask channel: synthetic visMask+AO + parity in bit 30.
-        uint mask = kSyntheticMaskBase | (parity << 30u);
-
         gLwSplatColorUav[pix] = float4(r, g, b, alpha);
-        gLwSplatMaskUav[pix]  = mask;
         gLwSplatDepthUav[pix] = saturate(ndc.z); // reverse-Z (near=1, far=0)
     }
 }
