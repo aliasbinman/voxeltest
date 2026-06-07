@@ -1600,7 +1600,10 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool skipDsvClear)
         MICROPROFILE_SCOPEGPUI("BeginFrame/ClearRTV", 0xff60a0c0);
         ctx_->ClearRenderTargetView(rtv_.Get(), clear);
     }
-    if (!skipDsvClear)
+    // dsv_ underlying texture (depthSrv_) is sampled by TAA, godray mark, and
+    // the post pass — must be a known value even when no scene-draw writes
+    // depth (PointCS_Block writes its own UAVs, not main dsv_).
+    (void)skipDsvClear;
     {
         MICROPROFILE_SCOPEGPUI("BeginFrame/ClearDSV", 0xff60c0a0);
         ctx_->ClearDepthStencilView(dsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
@@ -2341,8 +2344,12 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11RenderTargetView* nullRtvsA[] = {nullptr, nullptr};
         ctx_->OMSetRenderTargets(2, nullRtvsA, nullptr);
         uint32_t clearVis[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-        ctx_->ClearUnorderedAccessViewUint(visDepthUav_.Get(), clearVis);
-        ctx_->ClearUnorderedAccessViewUint(visColorUav_.Get(), clearVis);
+        {
+            MICROPROFILE_SCOPEGPUI("Clear/VisDepth", 0xff506070);
+            ctx_->ClearUnorderedAccessViewUint(visDepthUav_.Get(), clearVis);
+        }
+        // visColor clear removed: resolve PS branches on visDepth sentinel
+        // (no hit → sky/transparent), never samples visColor for those pixels.
         // Restore splat RTs for the splat draws inside the loop.
         ID3D11RenderTargetView* mrtA[] = {splatColorRtv_.Get()};
         ctx_->OMSetRenderTargets(1, mrtA, splatDsv_.Get());
@@ -2419,7 +2426,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     {
         MICROPROFILE_SCOPEGPUI("LW/AO/BuildTopDown", 0xff80a0e0);
         uint32_t clearZero[4] = {0, 0, 0, 0};
-        ctx_->ClearUnorderedAccessViewUint(aoTopDownUav_.Get(), clearZero);
+        {
+            MICROPROFILE_SCOPEGPUI("Clear/AoTopDown", 0xff70a070);
+            ctx_->ClearUnorderedAccessViewUint(aoTopDownUav_.Get(), clearZero);
+        }
 
         // Walk LOD0 only — finest data → tightest top-down depth map.
         const int Lao = 0;
@@ -2968,8 +2978,14 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     {
         MICROPROFILE_SCOPEGPUI("LW/BlockPoints/DrawSplat", 0xff80ffe0);
         float clearC[4] = {0, 0, 0, 0};
-        ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clearC);
-        ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        {
+            MICROPROFILE_SCOPEGPUI("Clear/PtSplatColor", 0xff60a08c);
+            ctx_->ClearRenderTargetView(splatColorRtv_.Get(), clearC);
+        }
+        {
+            MICROPROFILE_SCOPEGPUI("Clear/PtSplatDsv", 0xff60a08c);
+            ctx_->ClearDepthStencilView(splatDsv_.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        }
         ID3D11RenderTargetView* mrt[] = {splatColorRtv_.Get()};
         ctx_->OMSetRenderTargets(1, mrt, splatDsv_.Get());
         ctx_->OMSetDepthStencilState(dsTest_.Get(), 0);
@@ -3088,7 +3104,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         ID3D11RenderTargetView* sceneRtv = postEnabled ? taaSceneRtv_.Get() : rtv_.Get();
         // Scene RT alpha = sky mask (post pass draws sky/godrays where alpha<0.5).
         float sceneClear[4] = {lastClear_[0], lastClear_[1], lastClear_[2], postEnabled ? 0.0f : lastClear_[3]};
-        ctx_->ClearRenderTargetView(sceneRtv, sceneClear);
+        {
+            MICROPROFILE_SCOPEGPUI("Clear/SceneRT", 0xff6080a0);
+            ctx_->ClearRenderTargetView(sceneRtv, sceneClear);
+        }
         // dsv already cleared in BeginFrame; no other path writes it before here.
         ID3D11RenderTargetView* compositeRtv[] = {sceneRtv};
         ctx_->OMSetRenderTargets(1, compositeRtv, dsv_.Get());
