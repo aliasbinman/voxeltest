@@ -965,7 +965,7 @@ bool Renderer::CreateRenderTargets()
         device_->CreateShaderResourceView(godrayTex_[i].Get(), nullptr, godraySrv_[i].GetAddressOf());
     }
 
-    // Two-pass split vis textures: depth R32_UINT + colour R16_UINT.
+    // Two-pass split vis textures: depth R32_UINT + colour R32_UINT (ARGB32).
     {
         D3D11_TEXTURE2D_DESC vd = {};
         vd.Width = width_;
@@ -982,7 +982,7 @@ bool Renderer::CreateRenderTargets()
         device_->CreateUnorderedAccessView(visDepthTex_.Get(), nullptr, visDepthUav_.GetAddressOf());
         device_->CreateShaderResourceView(visDepthTex_.Get(), nullptr, visDepthSrv_.GetAddressOf());
         D3D11_TEXTURE2D_DESC vcd = vd;
-        vcd.Format = DXGI_FORMAT_R16_UINT;
+        vcd.Format = DXGI_FORMAT_R32_UINT;
         device_->CreateTexture2D(&vcd, nullptr, visColorTex_.GetAddressOf());
         device_->CreateUnorderedAccessView(visColorTex_.Get(), nullptr, visColorUav_.GetAddressOf());
         device_->CreateShaderResourceView(visColorTex_.Get(), nullptr, visColorSrv_.GetAddressOf());

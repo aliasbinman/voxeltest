@@ -364,7 +364,7 @@ uint EncodeLinDepth(float viewZ)
     return (uint)clamp(viewZ * kLinDepthScale, 0.0, kLinDepthMaxF);
 }
 
-// Resolve PS bindings (two-pass): t3 = depth (R32_UINT), t4 = color (R16_UINT).
+// Resolve PS bindings (two-pass): t3 = depth (R32_UINT), t4 = color (R32_UINT ARGB).
 Texture2D<uint> gLwTpDepthSrv : register(t3);
 Texture2D<uint> gLwTpColorSrv : register(t4);
 
@@ -378,17 +378,16 @@ VLwResolveOut vsmain_lw_resolve(uint vid : SV_VertexID)
     return o;
 }
 
-// Two-pass resolve: depth UAV (t3) gates discard, colour UAV (t4) supplies RGB565.
 float4 psmain_lw_resolve_twopass(VLwResolveOut i) : SV_Target
 {
     int2 pix = int2(i.pos.xy);
     uint depth = gLwTpDepthSrv.Load(int3(pix, 0));
     if (depth == 0xFFFFFFFFu) discard;
-    uint rgb565 = gLwTpColorSrv.Load(int3(pix, 0)) & 0xFFFFu;
-    uint r = (rgb565 >> 11) & 0x1Fu;
-    uint g = (rgb565 >>  5) & 0x3Fu;
-    uint b =  rgb565        & 0x1Fu;
-    return float4((float)r / 31.0, (float)g / 63.0, (float)b / 31.0, 1.0);
+    uint argb = gLwTpColorSrv.Load(int3(pix, 0));
+    float r = (float)( argb        & 0xFFu) / 255.0;
+    float g = (float)((argb >>  8) & 0xFFu) / 255.0;
+    float b = (float)((argb >> 16) & 0xFFu) / 255.0;
+    return float4(r, g, b, 1.0);
 }
 
 
@@ -525,10 +524,8 @@ void csmain_lw_block_color_worklist(uint3 dt : SV_DispatchThreadID)
         const uint kLinDepthSlop = 64u; // ~1.5 mm tolerance for FP non-det
         if (myLin > winDepth + kLinDepthSlop) continue;
 
-        uint rgb565;
+        uint argb32;
         if (gMode == 4u) {
-            // LodViz: per-LOD tint × per-cluster checker. AO unavailable in V3
-            // block data so the AO modulation from the splat path is dropped.
             static const float3 kLodTints[5] = {
                 float3(1.00, 0.40, 0.40),
                 float3(1.00, 0.80, 0.30),
@@ -537,26 +534,25 @@ void csmain_lw_block_color_worklist(uint3 dt : SV_DispatchThreadID)
                 float3(0.90, 0.40, 1.00),
             };
             float3 tint = kLodTints[min(gLwLodIdx, 4u)];
-            // Cluster within chunk: each cluster spans 32 voxels = 16 blocks.
             uint cx = bx >> 4u;
             uint cy = by >> 4u;
             uint cz = bz >> 4u;
             uint parity = (cx + cy + cz) & 1u;
             float check = (parity == 0u) ? 0.55 : 1.0;
             float3 col = saturate(tint * check);
-            uint rR = (uint)(col.r * 31.0);
-            uint rG = (uint)(col.g * 63.0);
-            uint rB = (uint)(col.b * 31.0);
-            rgb565 = (rR << 11) | (rG << 5) | rB;
+            uint rR = (uint)(col.r * 255.0);
+            uint rG = (uint)(col.g * 255.0);
+            uint rB = (uint)(col.b * 255.0);
+            argb32 = 0xFF000000u | (rB << 16) | (rG << 8) | rR;
         } else {
             uint colPck = gLwPalette[ci.paletteBase + palIdx];
             float ao = AoSample(world);
-            uint rR = (uint)((float)((colPck >>  0) & 0xFFu) * ao * (31.0/255.0));
-            uint rG = (uint)((float)((colPck >>  8) & 0xFFu) * ao * (63.0/255.0));
-            uint rB = (uint)((float)((colPck >> 16) & 0xFFu) * ao * (31.0/255.0));
-            rgb565 = (rR << 11) | (rG << 5) | rB;
+            uint rR = (uint)((float)((colPck >>  0) & 0xFFu) * ao);
+            uint rG = (uint)((float)((colPck >>  8) & 0xFFu) * ao);
+            uint rB = (uint)((float)((colPck >> 16) & 0xFFu) * ao);
+            argb32 = 0xFF000000u | (rB << 16) | (rG << 8) | rR;
         }
-        gLwVisUav[pix] = rgb565;
+        gLwVisUav[pix] = argb32;
     }
 }
 
