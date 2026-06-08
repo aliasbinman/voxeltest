@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -21,6 +23,36 @@
 
 namespace
 {
+    // 6 frustum planes from a row-major viewProj. Sign: plane.xyz dot p + .w
+    // >= 0 = inside.
+    void ExtractFrustumPlanes(const float M[16], float planes[6][4])
+    {
+        planes[0][0] = M[0] + M[3];
+        planes[0][1] = M[4] + M[7];
+        planes[0][2] = M[8] + M[11];
+        planes[0][3] = M[12] + M[15];
+        planes[1][0] = M[3] - M[0];
+        planes[1][1] = M[7] - M[4];
+        planes[1][2] = M[11] - M[8];
+        planes[1][3] = M[15] - M[12];
+        planes[2][0] = M[1] + M[3];
+        planes[2][1] = M[5] + M[7];
+        planes[2][2] = M[9] + M[11];
+        planes[2][3] = M[13] + M[15];
+        planes[3][0] = M[3] - M[1];
+        planes[3][1] = M[7] - M[5];
+        planes[3][2] = M[11] - M[9];
+        planes[3][3] = M[15] - M[13];
+        planes[4][0] = M[2];
+        planes[4][1] = M[6];
+        planes[4][2] = M[10];
+        planes[4][3] = M[14];
+        planes[5][0] = M[3] - M[2];
+        planes[5][1] = M[7] - M[6];
+        planes[5][2] = M[11] - M[10];
+        planes[5][3] = M[15] - M[14];
+    }
+
     void ThrowIfFailed(HRESULT hr, const char* what)
     {
         if (FAILED(hr))
@@ -1039,72 +1071,202 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 {
     if (!lwHasWorld_ || !m4Pass1Pso_ || !visDepthTex_) return;
 
-    // M4a — LOD0 only, no cull. All chunks contribute their full block range.
-    const int L = 0;
-    const LwGpu& g = lwGpu_[L];
-    const lw::LODWorld& lw = lwWorld_.lods[L];
-    if (g.slotCount == 0 || g.blockCount == 0) return;
+    // ---- Frustum + LOD heuristic ----
+    hlslpp::float4x4 view = cam.view();
+    hlslpp::float4x4 proj = cam.proj((float)width_ / (float)std::max(1u, height_));
+    hlslpp::float4x4 vp   = hlslpp::mul(view, proj);
+    float M[16];
+    hlslpp::store(M, vp);
+    float planes[6][4];
+    ExtractFrustumPlanes(M, planes);
 
-    // ---- Build worklist (host) ----
-    struct WI { uint32_t slot, baseGlobal, count, first; };
-    std::vector<WI> wl;
-    wl.reserve(g.slotCount);
-    uint32_t cumul = 0;
-    for (uint32_t i = 0; i < g.slotCount; ++i)
+    auto cullAabb = [&](float mnx, float mny, float mnz, float mxx, float mxy, float mxz) -> bool
     {
-        const lw::RuntimeChunk& rc = lw.chunks[i];
-        uint32_t count = rc.blockCount;
-        if (count == 0) continue;
-        wl.push_back({ rc.slotIdx, rc.blockBase, count, cumul });
-        cumul += count;
+        // Skip far plane (5): reverse-Z infinite-far is ill-defined.
+        for (int pi = 0; pi < 5; ++pi)
+        {
+            float a = planes[pi][0], b = planes[pi][1], c = planes[pi][2], d = planes[pi][3];
+            float px = a >= 0 ? mxx : mnx;
+            float py = b >= 0 ? mxy : mny;
+            float pz = c >= 0 ? mxz : mnz;
+            if (a * px + b * py + c * pz + d < 0.0f) return true;
+        }
+        return false;
+    };
+
+    float camP[3];
+    hlslpp::store(camP, cam.position);
+    const float fovRad   = cam.fovDeg * 3.14159265358979f / 180.0f;
+    const float focalPx  = (float)height_ / (2.0f * tanf(fovRad * 0.5f));
+    const float lodScaleUi = std::max(args.pointLodScale, 0.01f);
+    const float thresh   = 1.0f / lodScaleUi;
+
+    auto desiredLodForDist = [&](float dist) -> int
+    {
+        if (dist < 1.0f) return 0;
+        for (int L = 0; L < lw::kLodCount; ++L)
+        {
+            float ppv = focalPx * (float)(1u << L) / dist;
+            if (ppv >= thresh) return L;
+        }
+        return lw::kLodCount - 1;
+    };
+    auto nearAabbDist = [&](float mnx, float mny, float mnz, float mxx, float mxy, float mxz) -> float
+    {
+        float dx = (camP[0] < mnx) ? (mnx - camP[0]) : (camP[0] > mxx) ? (camP[0] - mxx) : 0.0f;
+        float dy = (camP[1] < mny) ? (mny - camP[1]) : (camP[1] > mxy) ? (camP[1] - mxy) : 0.0f;
+        float dz = (camP[2] < mnz) ? (mnz - camP[2]) : (camP[2] > mxz) ? (camP[2] - mxz) : 0.0f;
+        return sqrtf(dx*dx + dy*dy + dz*dz);
+    };
+
+    // ---- Per-LOD draw lists. Walker = port of CSTiles per-cluster recursion.
+    struct DrawItem { uint32_t slot, blockFirst, blockCount; };
+    std::vector<DrawItem> drawList[lw::kLodCount];
+
+    std::function<void(int, uint32_t, int)> visitCluster =
+        [&](int L, uint32_t chunkSlot, int clSlot)
+    {
+        const lw::LODWorld& lwL = lwWorld_.lods[L];
+        if (chunkSlot >= lwL.chunks.size()) return;
+        const lw::RuntimeChunk& rc = lwL.chunks[chunkSlot];
+        const lw::DiskCluster&  cl = rc.clusters[clSlot];
+        if (cl.numPoints == 0) return;
+
+        int cz_g = clSlot / (lw::kClustersX * lw::kClustersY);
+        int cy_g = (clSlot / lw::kClustersX) % lw::kClustersY;
+        int cx_g = clSlot % lw::kClustersX;
+        const float lodScaleF = (float)lwL.lodScale;
+        uint8_t bnds[6];
+        lw::UnpackClusterBounds(cl.bounds, bnds);
+        float mnx = (float)rc.worldOriginX + ((float)(cx_g * lw::kClusterVoxX + bnds[0])) * lodScaleF;
+        float mny = (float)rc.worldOriginY + ((float)(cy_g * lw::kClusterVoxY + bnds[1])) * lodScaleF;
+        float mnz = (float)rc.worldOriginZ + ((float)(cz_g * lw::kClusterVoxZ + bnds[2])) * lodScaleF;
+        float mxx = (float)rc.worldOriginX + ((float)(cx_g * lw::kClusterVoxX + bnds[3] + 1)) * lodScaleF;
+        float mxy = (float)rc.worldOriginY + ((float)(cy_g * lw::kClusterVoxY + bnds[4] + 1)) * lodScaleF;
+        float mxz = (float)rc.worldOriginZ + ((float)(cz_g * lw::kClusterVoxZ + bnds[5] + 1)) * lodScaleF;
+        if (cullAabb(mnx, mny, mnz, mxx, mxy, mxz)) return;
+
+        float distNearC = nearAabbDist(mnx, mny, mnz, mxx, mxy, mxz);
+        int   desNearC  = desiredLodForDist(distNearC);
+
+        int oct = (cx_g >> 2) | ((cy_g & 1) << 1) | ((cz_g >> 2) << 2);
+        uint32_t childChunkId = rc.childId[oct];
+        bool childLoaded = (L > 0)
+                        && (childChunkId != lw::kNoChild)
+                        && (childChunkId < lwWorld_.lods[L-1].chunks.size())
+                        && (lwWorld_.lods[L-1].chunks[childChunkId].blockCount > 0);
+
+        if (desNearC >= L || !childLoaded || L == 0)
+        {
+            drawList[L].push_back({chunkSlot,
+                                   rc.clusterBlockFirst[clSlot],
+                                   rc.clusterBlockCount[clSlot]});
+            return;
+        }
+
+        int lcx = cx_g & 3;
+        int lcz = cz_g & 3;
+        for (int dx = 0; dx < 2; ++dx)
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dz = 0; dz < 2; ++dz)
+                {
+                    int childCx = 2*lcx + dx;
+                    int childCy = dy;
+                    int childCz = 2*lcz + dz;
+                    int childSlot = childCz * (lw::kClustersX * lw::kClustersY)
+                                  + childCy * lw::kClustersX + childCx;
+                    visitCluster(L-1, childChunkId, childSlot);
+                }
+    };
+
+    const int topL = lw::kLodCount - 1;
+    for (uint32_t i = 0; i < (uint32_t)lwWorld_.lods[topL].chunks.size(); ++i)
+    {
+        const lw::LODWorld& lwT = lwWorld_.lods[topL];
+        float mnX = lwT.cull.minX[i], mnY = lwT.cull.minY[i], mnZ = lwT.cull.minZ[i];
+        float mxX = lwT.cull.maxX[i], mxY = lwT.cull.maxY[i], mxZ = lwT.cull.maxZ[i];
+        if (cullAabb(mnX, mnY, mnZ, mxX, mxY, mxZ)) continue;
+        const lw::RuntimeChunk& rc = lwT.chunks[i];
+        if (rc.blockCount == 0) continue;
+        for (int c = 0; c < lw::kClustersPerChunk; ++c)
+        {
+            if (rc.clusters[c].numPoints == 0) continue;
+            visitCluster(topL, i, c);
+        }
     }
-    if (wl.empty()) return;
 
-    // ---- Upload-heap allocations via GraphicsMemory (frame-managed) ----
-    auto wlAlloc = graphicsMemory_->Allocate(wl.size() * sizeof(WI));
-    std::memcpy(wlAlloc.Memory(), wl.data(), wl.size() * sizeof(WI));
+    bool anyDraw = false;
+    for (int L = 0; L < lw::kLodCount; ++L)
+        if (!drawList[L].empty()) { anyDraw = true; break; }
+    if (!anyDraw) return;
 
-    // CB layouts must match m4_lw.hlsl cbuffers exactly.
-    struct CBFrame
+    // ---- Per-LOD sort + coalesce contiguous items in the same chunk. ----
+    struct WI { uint32_t slot, baseGlobal, count, first; };
+    std::vector<WI> perLodWl[lw::kLodCount];
+    uint32_t perLodTotal[lw::kLodCount] = {};
+    for (int L = 0; L < lw::kLodCount; ++L)
     {
-        float viewProj[16];   // row-major
-        uint32_t mode;
-        uint32_t _pad[3];
-    };
-    struct CBLwCs
-    {
-        uint32_t vwSize[2];
-        uint32_t pointCount;
-        uint32_t numItems;
-        uint32_t lodIdx;
-        uint32_t _pad[3];
-    };
+        auto& dl = drawList[L];
+        if (dl.empty()) continue;
+        std::sort(dl.begin(), dl.end(),
+                  [](const DrawItem& a, const DrawItem& b) {
+                      if (a.slot != b.slot) return a.slot < b.slot;
+                      return a.blockFirst < b.blockFirst;
+                  });
+        size_t w = 0;
+        for (size_t r = 0; r < dl.size(); ++r) {
+            if (w > 0 && dl[w-1].slot == dl[r].slot &&
+                dl[w-1].blockFirst + dl[w-1].blockCount == dl[r].blockFirst)
+                dl[w-1].blockCount += dl[r].blockCount;
+            else
+                dl[w++] = dl[r];
+        }
+        dl.resize(w);
+
+        const lw::LODWorld& lwL = lwWorld_.lods[L];
+        auto& wl = perLodWl[L];
+        wl.reserve(dl.size());
+        uint32_t cumul = 0;
+        for (const DrawItem& it : dl)
+        {
+            if (it.blockCount == 0) continue;
+            const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
+            wl.push_back({ rc.slotIdx, rc.blockBase + it.blockFirst, it.blockCount, cumul });
+            cumul += it.blockCount;
+        }
+        perLodTotal[L] = cumul;
+    }
+
+    // ---- CB layouts (must match m4_lw.hlsl) ----
+    struct CBFrame { float viewProj[16]; uint32_t mode; uint32_t _pad[3]; };
+    struct CBLwCs  { uint32_t vwSize[2]; uint32_t pointCount; uint32_t numItems;
+                     uint32_t lodIdx; uint32_t _pad[3]; };
 
     CBFrame cbf{};
+    hlslpp::store(cbf.viewProj, vp);
+    cbf.mode = (uint32_t)args.mode;
+    auto cbfAlloc = graphicsMemory_->AllocateConstant(cbf);
+
+    // Per-LOD CB + worklist allocations.
+    DirectX::GraphicsResource cbcsAlloc[lw::kLodCount];
+    DirectX::GraphicsResource wlAlloc[lw::kLodCount];
+    for (int L = 0; L < lw::kLodCount; ++L)
     {
-        // Build viewProj from camera. Row-major store (HLSL row_major).
-        hlslpp::float4x4 view = cam.view();
-        hlslpp::float4x4 proj = cam.proj((float)width_ / (float)std::max(1u, height_));
-        hlslpp::float4x4 vp   = hlslpp::mul(view, proj);
-        hlslpp::store(cbf.viewProj, vp);
-        cbf.mode = (uint32_t)args.mode;
+        if (perLodWl[L].empty()) continue;
+        CBLwCs cbcs{};
+        cbcs.vwSize[0] = visTexW_;
+        cbcs.vwSize[1] = visTexH_;
+        cbcs.pointCount = perLodTotal[L];
+        cbcs.numItems   = (uint32_t)perLodWl[L].size();
+        cbcs.lodIdx     = (uint32_t)L;
+        cbcsAlloc[L] = graphicsMemory_->AllocateConstant(cbcs);
+        wlAlloc[L]   = graphicsMemory_->Allocate(perLodWl[L].size() * sizeof(WI));
+        std::memcpy(wlAlloc[L].Memory(), perLodWl[L].data(), perLodWl[L].size() * sizeof(WI));
     }
-    CBLwCs cbcs{};
-    cbcs.vwSize[0] = visTexW_;
-    cbcs.vwSize[1] = visTexH_;
-    cbcs.pointCount = cumul;
-    cbcs.numItems = (uint32_t)wl.size();
-    cbcs.lodIdx = (uint32_t)L;
 
-    auto cbfAlloc  = graphicsMemory_->AllocateConstant(cbf);
-    auto cbcsAlloc = graphicsMemory_->AllocateConstant(cbcs);
-
-    // ---- Bind heap for descriptor tables (depth/color UAV+SRV) ----
+    // ---- Bind heap + descriptor handle helpers ----
     ID3D12DescriptorHeap* heaps[] = { m4TexHeap_.Get() };
     cmdList_->SetDescriptorHeaps(1, heaps);
-
-    // ---- Clear visDepth (UINT max = sky sentinel) + visColor (0) ----
-    // ClearUAV requires GPU handle (shader-visible heap) + CPU handle (non-vis).
     auto gpu = [&](UINT slot) {
         D3D12_GPU_DESCRIPTOR_HANDLE h = m4TexHeap_->GetGPUDescriptorHandleForHeapStart();
         h.ptr += UINT64(slot) * m4TexDescSize_;
@@ -1115,28 +1277,47 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         h.ptr += SIZE_T(slot) * m4TexDescSize_;
         return h;
     };
-    UINT clearMax[4] = { 0xFFFFFFFFu, 0, 0, 0 };
-    UINT clearZero[4] = { 0, 0, 0, 0 };
-    cmdList_->ClearUnorderedAccessViewUint(gpu(0), cpuClr(0), visDepthTex_.Get(),
-                                            clearMax, 0, nullptr);
-    cmdList_->ClearUnorderedAccessViewUint(gpu(1), cpuClr(1), visColorTex_.Get(),
-                                            clearZero, 0, nullptr);
 
-    // ---- Pass1 — depth ----
+    // ---- Clear vis textures ----
+    UINT clearMax[4]  = { 0xFFFFFFFFu, 0, 0, 0 };
+    UINT clearZero[4] = { 0, 0, 0, 0 };
+    cmdList_->ClearUnorderedAccessViewUint(gpu(0), cpuClr(0), visDepthTex_.Get(), clearMax,  0, nullptr);
+    cmdList_->ClearUnorderedAccessViewUint(gpu(1), cpuClr(1), visColorTex_.Get(), clearZero, 0, nullptr);
+
+    auto uavBarrierDepth = [&](){
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = visDepthTex_.Get();
+        cmdList_->ResourceBarrier(1, &b);
+    };
+    auto uavBarrierColor = [&](){
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = visColorTex_.Get();
+        cmdList_->ResourceBarrier(1, &b);
+    };
+
+    // ---- Pass1 across LODs ----
+    cmdList_->SetComputeRootSignature(m4Pass1RootSig_.Get());
+    cmdList_->SetPipelineState(m4Pass1Pso_.Get());
+    cmdList_->SetComputeRootConstantBufferView(0, cbfAlloc.GpuAddress());
+    cmdList_->SetComputeRootDescriptorTable(5, gpu(0)); // u0 = depthUav
+    bool firstPass1 = true;
+    for (int L = 0; L < lw::kLodCount; ++L)
     {
-        cmdList_->SetComputeRootSignature(m4Pass1RootSig_.Get());
-        cmdList_->SetPipelineState(m4Pass1Pso_.Get());
-        cmdList_->SetComputeRootConstantBufferView(0, cbfAlloc.GpuAddress());
-        cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc.GpuAddress());
+        if (perLodWl[L].empty()) continue;
+        if (!firstPass1) uavBarrierDepth();
+        firstPass1 = false;
+        const LwGpu& g = lwGpu_[L];
+        cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc[L].GpuAddress());
         cmdList_->SetComputeRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
         cmdList_->SetComputeRootShaderResourceView(3, g.blockPosSb->GetGPUVirtualAddress());
-        cmdList_->SetComputeRootShaderResourceView(4, wlAlloc.GpuAddress());
-        cmdList_->SetComputeRootDescriptorTable(5, gpu(0)); // u0 = depthUav
-        UINT groups = (cumul + 63) / 64;
+        cmdList_->SetComputeRootShaderResourceView(4, wlAlloc[L].GpuAddress());
+        UINT groups = (perLodTotal[L] + 63) / 64;
         cmdList_->Dispatch(groups, 1, 1);
     }
 
-    // UAV barrier: pass1 depth -> pass2 reads as SRV. Also need state transition.
+    // Transition depth UAV → SRV for pass2 input.
     {
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1147,20 +1328,26 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cmdList_->ResourceBarrier(1, &b);
     }
 
-    // ---- Pass2 — color ----
+    // ---- Pass2 across LODs ----
+    cmdList_->SetComputeRootSignature(m4Pass2RootSig_.Get());
+    cmdList_->SetPipelineState(m4Pass2Pso_.Get());
+    cmdList_->SetComputeRootConstantBufferView(0, cbfAlloc.GpuAddress());
+    cmdList_->SetComputeRootDescriptorTable(7, gpu(2)); // t5 = depthSrv
+    cmdList_->SetComputeRootDescriptorTable(8, gpu(1)); // u0 = colorUav
+    bool firstPass2 = true;
+    for (int L = 0; L < lw::kLodCount; ++L)
     {
-        cmdList_->SetComputeRootSignature(m4Pass2RootSig_.Get());
-        cmdList_->SetPipelineState(m4Pass2Pso_.Get());
-        cmdList_->SetComputeRootConstantBufferView(0, cbfAlloc.GpuAddress());
-        cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc.GpuAddress());
+        if (perLodWl[L].empty()) continue;
+        if (!firstPass2) uavBarrierColor();
+        firstPass2 = false;
+        const LwGpu& g = lwGpu_[L];
+        cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc[L].GpuAddress());
         cmdList_->SetComputeRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
         cmdList_->SetComputeRootShaderResourceView(3, g.paletteSb->GetGPUVirtualAddress());
         cmdList_->SetComputeRootShaderResourceView(4, g.blockPosSb->GetGPUVirtualAddress());
         cmdList_->SetComputeRootShaderResourceView(5, g.blockColSb->GetGPUVirtualAddress());
-        cmdList_->SetComputeRootShaderResourceView(6, wlAlloc.GpuAddress());
-        cmdList_->SetComputeRootDescriptorTable(7, gpu(2)); // t5 = depthSrv
-        cmdList_->SetComputeRootDescriptorTable(8, gpu(1)); // u0 = colorUav
-        UINT groups = (cumul + 63) / 64;
+        cmdList_->SetComputeRootShaderResourceView(6, wlAlloc[L].GpuAddress());
+        UINT groups = (perLodTotal[L] + 63) / 64;
         cmdList_->Dispatch(groups, 1, 1);
     }
 
