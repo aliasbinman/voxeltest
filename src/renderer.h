@@ -109,7 +109,7 @@ public:
     bool FinalizeLwUploads() { return true; } // combined-LOD path deferred to M4+
     void ClearLwWorld();
     bool HasLwWorld() const { return lwHasWorld_; }
-    void DrawLwScene(const Camera&, const DrawSceneParams&) {} // M4
+    void DrawLwScene(const Camera& cam, const DrawSceneParams& args);
 
     struct StreamPoolInfo
     {
@@ -189,6 +189,8 @@ private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
     bool CreateRenderTargets();
     bool CreateM2Demo();
+    bool CreateM4();
+    bool CreateVisTextures(uint32_t w, uint32_t h);
     bool UploadLwLod(const lw::World& w, int L);
     void WaitForGpu();
     void MoveToNextFrame();
@@ -253,6 +255,23 @@ private:
     LwGpu                             lwGpu_[lw::kLodCount];
     bool                              lwHasWorld_ = false;
     lw::World                         lwWorld_;
+
+    // M4 — PointCS_Block compute rasterizer (LOD0-only minimum viable).
+    // Vis textures (R32_UINT): atomic-min depth + ARGB color. Slots in
+    // m4TexHeap_:  0=depthUav  1=colorUav  2=depthSrv  3=colorSrv.
+    ComPtr<ID3D12Resource>            visDepthTex_;
+    ComPtr<ID3D12Resource>            visColorTex_;
+    ComPtr<ID3D12DescriptorHeap>      m4TexHeap_;        // shader-visible
+    ComPtr<ID3D12DescriptorHeap>      m4TexClearHeap_;   // non-shader-visible mirror (for ClearUAV)
+    UINT                              m4TexDescSize_ = 0;
+    ComPtr<ID3D12RootSignature>       m4Pass1RootSig_;
+    ComPtr<ID3D12RootSignature>       m4Pass2RootSig_;
+    ComPtr<ID3D12RootSignature>       m4ResolveRootSig_;
+    ComPtr<ID3D12PipelineState>       m4Pass1Pso_;
+    ComPtr<ID3D12PipelineState>       m4Pass2Pso_;
+    ComPtr<ID3D12PipelineState>       m4ResolvePso_;
+    uint32_t                          visTexW_ = 0;
+    uint32_t                          visTexH_ = 0;
 
     HWND     hwnd_ = nullptr;
     uint32_t width_ = 0;

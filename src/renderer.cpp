@@ -5,6 +5,7 @@
 // returning safe defaults — they will be ported incrementally in M3+.
 #define NOMINMAX
 #include "renderer.h"
+#include <hlsl++.h>
 
 #include <DescriptorHeap.h>
 #include <GraphicsMemory.h>
@@ -122,6 +123,9 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
         lwSrvDescSize_ = device_->GetDescriptorHandleIncrementSize(
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         lwSrvNextSlot_ = 0;
+
+        if (!CreateM4()) return false;
+        if (!CreateVisTextures(width_, height_)) return false;
     }
     catch (const std::exception& e)
     {
@@ -392,6 +396,7 @@ void Renderer::Resize(uint32_t w, uint32_t h)
     height_ = h;
     frameIndex_ = swap_->GetCurrentBackBufferIndex();
     CreateRenderTargets();
+    if (m4TexHeap_) CreateVisTextures(w, h);
 }
 
 void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
@@ -427,8 +432,8 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
     ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap_.Get() };
     cmdList_->SetDescriptorHeaps(1, heaps);
 
-    // M2 demo — IA-less triangle to validate DXC + rootsig + PSO path.
-    if (m2Pso_)
+    // M2 demo only when LW world isn't loaded — once we have voxels, draw those.
+    if (m2Pso_ && !lwHasWorld_)
     {
         cmdList_->SetGraphicsRootSignature(m2RootSig_.Get());
         cmdList_->SetPipelineState(m2Pso_.Get());
@@ -792,6 +797,415 @@ void Renderer::PrepLwWorld(const lw::World& w)
         lwWorld_.worldAabbMax[i] = w.worldAabbMax[i];
     }
     lwHasWorld_ = true;
+}
+
+// ===== M4 — PointCS_Block compute rasterizer ================================
+
+bool Renderer::CreateM4()
+{
+    // Tex heap (shader-visible, 4 slots) + clear heap (non-shader-visible mirror
+    // for ClearUnorderedAccessViewUint which needs both CPU + GPU handles).
+    D3D12_DESCRIPTOR_HEAP_DESC td{};
+    td.NumDescriptors = 4;
+    td.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    td.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ThrowIfFailed(device_->CreateDescriptorHeap(&td, IID_PPV_ARGS(&m4TexHeap_)),
+                  "m4 tex heap");
+    NameObject(m4TexHeap_.Get(), L"m4TexHeap");
+
+    D3D12_DESCRIPTOR_HEAP_DESC tdc = td;
+    tdc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    ThrowIfFailed(device_->CreateDescriptorHeap(&tdc, IID_PPV_ARGS(&m4TexClearHeap_)),
+                  "m4 tex clear heap");
+    m4TexDescSize_ = device_->GetDescriptorHandleIncrementSize(
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // ---- Root signatures ----
+    auto buildRootSig = [&](const D3D12_ROOT_SIGNATURE_DESC& rsd,
+                            ComPtr<ID3D12RootSignature>& out, const wchar_t* name)
+    {
+        ComPtr<ID3DBlob> sig, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                 &sig, &err);
+        if (FAILED(hr))
+        {
+            if (err) OutputDebugStringA((const char*)err->GetBufferPointer());
+            return false;
+        }
+        if (FAILED(device_->CreateRootSignature(0, sig->GetBufferPointer(),
+                                                sig->GetBufferSize(),
+                                                IID_PPV_ARGS(&out)))) return false;
+        NameObject(out.Get(), name);
+        return true;
+    };
+
+    // Pass1 root sig: 2 CBVs, 3 root SRVs, 1 UAV descriptor table.
+    {
+        D3D12_DESCRIPTOR_RANGE uavRange{};
+        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRange.NumDescriptors = 1;
+        uavRange.BaseShaderRegister = 0;
+        uavRange.OffsetInDescriptorsFromTableStart = 0;
+
+        D3D12_ROOT_PARAMETER p[6]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[0].Descriptor = { 0, 0 };  // b0
+        p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[1].Descriptor = { 1, 0 };  // b1
+        p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        p[2].Descriptor = { 0, 0 };  // t0 chunkInfo
+        p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        p[3].Descriptor = { 2, 0 };  // t2 blockPos
+        p[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        p[4].Descriptor = { 4, 0 };  // t4 workItems
+        p[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[5].DescriptorTable = { 1, &uavRange };
+        p[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 6;
+        rsd.pParameters = p;
+        if (!buildRootSig(rsd, m4Pass1RootSig_, L"m4Pass1RootSig")) return false;
+    }
+
+    // Pass2 root sig: 2 CBVs, 5 root SRVs, 2 descriptor tables.
+    {
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 5;  // t5
+        srvRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_DESCRIPTOR_RANGE uavRange{};
+        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRange.NumDescriptors = 1;
+        uavRange.BaseShaderRegister = 0;  // u0
+        uavRange.OffsetInDescriptorsFromTableStart = 0;
+
+        D3D12_ROOT_PARAMETER p[9]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0,0};
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {1,0};
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor = {0,0}; // chunkInfo
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[3].Descriptor = {1,0}; // palette
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[4].Descriptor = {2,0}; // blockPos
+        p[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[5].Descriptor = {3,0}; // blockCol
+        p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[6].Descriptor = {4,0}; // workItems
+        p[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[7].DescriptorTable = { 1, &srvRange };
+        p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[8].DescriptorTable = { 1, &uavRange };
+        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 9;
+        rsd.pParameters = p;
+        if (!buildRootSig(rsd, m4Pass2RootSig_, L"m4Pass2RootSig")) return false;
+    }
+
+    // Resolve root sig: 1 descriptor table (SRV t0..t1).
+    {
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 2;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_ROOT_PARAMETER p[1]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[0].DescriptorTable = { 1, &srvRange };
+        p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 1;
+        rsd.pParameters = p;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        if (!buildRootSig(rsd, m4ResolveRootSig_, L"m4ResolveRootSig")) return false;
+    }
+
+    // ---- Compute PSOs ----
+    auto buildComputePso = [&](ID3D12RootSignature* rs, IDxcBlob* cs,
+                               ComPtr<ID3D12PipelineState>& out, const wchar_t* name)
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs;
+        pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+        if (FAILED(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&out)))) return false;
+        NameObject(out.Get(), name);
+        return true;
+    };
+
+    ComPtr<IDxcBlob> cs1, cs2, vsR, psR;
+    std::string err;
+    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"csmain_pass1_depth", L"cs_6_0", {}, cs1, &err))
+    { OutputDebugStringA(("[m4] cs1 compile: " + err + "\n").c_str()); return false; }
+    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"csmain_pass2_color", L"cs_6_0", {}, cs2, &err))
+    { OutputDebugStringA(("[m4] cs2 compile: " + err + "\n").c_str()); return false; }
+    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"vsmain_resolve",    L"vs_6_0", {}, vsR, &err))
+    { OutputDebugStringA(("[m4] vsR compile: " + err + "\n").c_str()); return false; }
+    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"psmain_resolve",    L"ps_6_0", {}, psR, &err))
+    { OutputDebugStringA(("[m4] psR compile: " + err + "\n").c_str()); return false; }
+
+    if (!buildComputePso(m4Pass1RootSig_.Get(), cs1.Get(), m4Pass1Pso_, L"m4Pass1Pso")) return false;
+    if (!buildComputePso(m4Pass2RootSig_.Get(), cs2.Get(), m4Pass2Pso_, L"m4Pass2Pso")) return false;
+
+    // Resolve graphics PSO.
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = m4ResolveRootSig_.Get();
+        pd.VS = { vsR->GetBufferPointer(), vsR->GetBufferSize() };
+        pd.PS = { psR->GetBufferPointer(), psR->GetBufferSize() };
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.SampleMask = UINT_MAX;
+        pd.SampleDesc.Count = 1;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = BackBufferFormat();
+        pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        for (auto& rt : pd.BlendState.RenderTarget)
+            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.DepthStencilState.DepthEnable = FALSE;
+        pd.DepthStencilState.StencilEnable = FALSE;
+        if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m4ResolvePso_))))
+            return false;
+        NameObject(m4ResolvePso_.Get(), L"m4ResolvePso");
+    }
+    return true;
+}
+
+bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
+{
+    if (w == 0 || h == 0) return false;
+    WaitForGpu(); // textures may be in flight
+    visDepthTex_.Reset();
+    visColorTex_.Reset();
+
+    auto createTex = [&](ComPtr<ID3D12Resource>& out, const wchar_t* name)
+    {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w; rd.Height = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R32_UINT;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(device_->CreateCommittedResource(
+                       &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                       IID_PPV_ARGS(&out)))) return false;
+        NameObject(out.Get(), name);
+        return true;
+    };
+    if (!createTex(visDepthTex_, L"visDepthTex")) return false;
+    if (!createTex(visColorTex_, L"visColorTex")) return false;
+
+    // Write 4 descriptors into both heaps:
+    //   slot 0 = depthUav, 1 = colorUav, 2 = depthSrv, 3 = colorSrv
+    auto cpu = [&](ID3D12DescriptorHeap* h, UINT slot) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c = h->GetCPUDescriptorHandleForHeapStart();
+        c.ptr += SIZE_T(slot) * m4TexDescSize_;
+        return c;
+    };
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavD{};
+    uavD.Format = DXGI_FORMAT_R32_UINT;
+    uavD.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvD{};
+    srvD.Format = DXGI_FORMAT_R32_UINT;
+    srvD.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvD.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvD.Texture2D.MipLevels = 1;
+
+    for (auto* heap : { m4TexHeap_.Get(), m4TexClearHeap_.Get() })
+    {
+        device_->CreateUnorderedAccessView(visDepthTex_.Get(), nullptr, &uavD, cpu(heap, 0));
+        device_->CreateUnorderedAccessView(visColorTex_.Get(), nullptr, &uavD, cpu(heap, 1));
+        device_->CreateShaderResourceView (visDepthTex_.Get(), &srvD,       cpu(heap, 2));
+        device_->CreateShaderResourceView (visColorTex_.Get(), &srvD,       cpu(heap, 3));
+    }
+
+    visTexW_ = w;
+    visTexH_ = h;
+    return true;
+}
+
+void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
+{
+    if (!lwHasWorld_ || !m4Pass1Pso_ || !visDepthTex_) return;
+
+    // M4a — LOD0 only, no cull. All chunks contribute their full block range.
+    const int L = 0;
+    const LwGpu& g = lwGpu_[L];
+    const lw::LODWorld& lw = lwWorld_.lods[L];
+    if (g.slotCount == 0 || g.blockCount == 0) return;
+
+    // ---- Build worklist (host) ----
+    struct WI { uint32_t slot, baseGlobal, count, first; };
+    std::vector<WI> wl;
+    wl.reserve(g.slotCount);
+    uint32_t cumul = 0;
+    for (uint32_t i = 0; i < g.slotCount; ++i)
+    {
+        const lw::RuntimeChunk& rc = lw.chunks[i];
+        uint32_t count = rc.blockCount;
+        if (count == 0) continue;
+        wl.push_back({ rc.slotIdx, rc.blockBase, count, cumul });
+        cumul += count;
+    }
+    if (wl.empty()) return;
+
+    // ---- Upload-heap allocations via GraphicsMemory (frame-managed) ----
+    auto wlAlloc = graphicsMemory_->Allocate(wl.size() * sizeof(WI));
+    std::memcpy(wlAlloc.Memory(), wl.data(), wl.size() * sizeof(WI));
+
+    // CB layouts must match m4_lw.hlsl cbuffers exactly.
+    struct CBFrame
+    {
+        float viewProj[16];   // row-major
+        uint32_t mode;
+        uint32_t _pad[3];
+    };
+    struct CBLwCs
+    {
+        uint32_t vwSize[2];
+        uint32_t pointCount;
+        uint32_t numItems;
+        uint32_t lodIdx;
+        uint32_t _pad[3];
+    };
+
+    CBFrame cbf{};
+    {
+        // Build viewProj from camera. Row-major store (HLSL row_major).
+        hlslpp::float4x4 view = cam.view();
+        hlslpp::float4x4 proj = cam.proj((float)width_ / (float)std::max(1u, height_));
+        hlslpp::float4x4 vp   = hlslpp::mul(view, proj);
+        hlslpp::store(cbf.viewProj, vp);
+        cbf.mode = (uint32_t)args.mode;
+    }
+    CBLwCs cbcs{};
+    cbcs.vwSize[0] = visTexW_;
+    cbcs.vwSize[1] = visTexH_;
+    cbcs.pointCount = cumul;
+    cbcs.numItems = (uint32_t)wl.size();
+    cbcs.lodIdx = (uint32_t)L;
+
+    auto cbfAlloc  = graphicsMemory_->AllocateConstant(cbf);
+    auto cbcsAlloc = graphicsMemory_->AllocateConstant(cbcs);
+
+    // ---- Bind heap for descriptor tables (depth/color UAV+SRV) ----
+    ID3D12DescriptorHeap* heaps[] = { m4TexHeap_.Get() };
+    cmdList_->SetDescriptorHeaps(1, heaps);
+
+    // ---- Clear visDepth (UINT max = sky sentinel) + visColor (0) ----
+    // ClearUAV requires GPU handle (shader-visible heap) + CPU handle (non-vis).
+    auto gpu = [&](UINT slot) {
+        D3D12_GPU_DESCRIPTOR_HANDLE h = m4TexHeap_->GetGPUDescriptorHandleForHeapStart();
+        h.ptr += UINT64(slot) * m4TexDescSize_;
+        return h;
+    };
+    auto cpuClr = [&](UINT slot) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m4TexClearHeap_->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(slot) * m4TexDescSize_;
+        return h;
+    };
+    UINT clearMax[4] = { 0xFFFFFFFFu, 0, 0, 0 };
+    UINT clearZero[4] = { 0, 0, 0, 0 };
+    cmdList_->ClearUnorderedAccessViewUint(gpu(0), cpuClr(0), visDepthTex_.Get(),
+                                            clearMax, 0, nullptr);
+    cmdList_->ClearUnorderedAccessViewUint(gpu(1), cpuClr(1), visColorTex_.Get(),
+                                            clearZero, 0, nullptr);
+
+    // ---- Pass1 — depth ----
+    {
+        cmdList_->SetComputeRootSignature(m4Pass1RootSig_.Get());
+        cmdList_->SetPipelineState(m4Pass1Pso_.Get());
+        cmdList_->SetComputeRootConstantBufferView(0, cbfAlloc.GpuAddress());
+        cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc.GpuAddress());
+        cmdList_->SetComputeRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
+        cmdList_->SetComputeRootShaderResourceView(3, g.blockPosSb->GetGPUVirtualAddress());
+        cmdList_->SetComputeRootShaderResourceView(4, wlAlloc.GpuAddress());
+        cmdList_->SetComputeRootDescriptorTable(5, gpu(0)); // u0 = depthUav
+        UINT groups = (cumul + 63) / 64;
+        cmdList_->Dispatch(groups, 1, 1);
+    }
+
+    // UAV barrier: pass1 depth -> pass2 reads as SRV. Also need state transition.
+    {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = visDepthTex_.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList_->ResourceBarrier(1, &b);
+    }
+
+    // ---- Pass2 — color ----
+    {
+        cmdList_->SetComputeRootSignature(m4Pass2RootSig_.Get());
+        cmdList_->SetPipelineState(m4Pass2Pso_.Get());
+        cmdList_->SetComputeRootConstantBufferView(0, cbfAlloc.GpuAddress());
+        cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc.GpuAddress());
+        cmdList_->SetComputeRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
+        cmdList_->SetComputeRootShaderResourceView(3, g.paletteSb->GetGPUVirtualAddress());
+        cmdList_->SetComputeRootShaderResourceView(4, g.blockPosSb->GetGPUVirtualAddress());
+        cmdList_->SetComputeRootShaderResourceView(5, g.blockColSb->GetGPUVirtualAddress());
+        cmdList_->SetComputeRootShaderResourceView(6, wlAlloc.GpuAddress());
+        cmdList_->SetComputeRootDescriptorTable(7, gpu(2)); // t5 = depthSrv
+        cmdList_->SetComputeRootDescriptorTable(8, gpu(1)); // u0 = colorUav
+        UINT groups = (cumul + 63) / 64;
+        cmdList_->Dispatch(groups, 1, 1);
+    }
+
+    // Transition depth back to UAV (next frame's clear), color UAV -> SRV for resolve.
+    {
+        D3D12_RESOURCE_BARRIER b[2]{};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[0].Transition.pResource = visDepthTex_.Get();
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[1].Transition.pResource = visColorTex_.Get();
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList_->ResourceBarrier(2, b);
+    }
+
+    // ---- Resolve PS — fullscreen blit to backbuffer (already bound by BeginFrame) ----
+    cmdList_->SetGraphicsRootSignature(m4ResolveRootSig_.Get());
+    cmdList_->SetPipelineState(m4ResolvePso_.Get());
+    cmdList_->SetGraphicsRootDescriptorTable(0, gpu(2)); // t0=depthSrv, t1=colorSrv (contiguous)
+    cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmdList_->DrawInstanced(3, 1, 0, 0);
+
+    // Transition both back to UAV for next frame.
+    {
+        D3D12_RESOURCE_BARRIER b[2]{};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[0].Transition.pResource = visDepthTex_.Get();
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[1].Transition.pResource = visColorTex_.Get();
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList_->ResourceBarrier(2, b);
+    }
+
+    // Restore imgui heap so the upcoming imgui render binds against it.
+    ID3D12DescriptorHeap* imguiHeap[] = { imguiSrvHeap_.Get() };
+    cmdList_->SetDescriptorHeaps(1, imguiHeap);
 }
 
 Renderer::StreamLodInfo Renderer::GetStreamLodInfo(int L) const
