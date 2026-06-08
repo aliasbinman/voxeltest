@@ -433,7 +433,7 @@ int main(int argc, char** argv)
                 s.z = bz + (int32_t)dv.z;
                 uint32_t col = (dv.paletteIdx < srcPalette.size()) ? srcPalette[dv.paletteIdx] : 0xFF000000u;
                 s.color = col & 0x00FFFFFFu;
-                s.mask = 0x3F;
+                s.mask = dv.visMask & 0x3Fu;
                 for (int fi = 0; fi < 6; ++fi)
                     s.aoFace[fi] = 0xFF;
                 src.push_back(s);
@@ -1285,8 +1285,7 @@ int main(int argc, char** argv)
                 p.posY = (uint8_t)ly;
                 p.posZ = (uint8_t)lz;
                 p.palIdx = (uint8_t)palMap[v.color];
-                // visMask + aoPacked unused by PointCS_Block; leave zero.
-                p.visMask = 0;
+                p.visMask = v.visMask & 0x3Fu;
                 p.aoPacked[0] = 0;
                 p.aoPacked[1] = 0;
                 p.aoPacked[2] = 0;
@@ -1781,6 +1780,7 @@ int main(int argc, char** argv)
                 {
                     uint8_t mask = 0;
                     uint8_t pal[8] = {};
+                    uint8_t vmask[8] = {}; // per-voxel 6-bit visMask
                 };
                 // Per-cluster: map octetIdx -> OctetEnc.
                 std::vector<std::map<uint32_t, OctetEnc>> perCluster(lw::kClustersPerChunk);
@@ -1808,6 +1808,7 @@ int main(int argc, char** argv)
                     OctetEnc& oe = perCluster[clusterIdx][octetIdx];
                     oe.mask |= (uint8_t)(1u << vi);
                     oe.pal[vi] = p.palIdx;
+                    oe.vmask[vi] = p.visMask & 0x3Fu;
                 }
                 // Collect non-empty clusters and emit.
                 std::vector<uint32_t> nonEmpty;
@@ -1953,6 +1954,14 @@ int main(int argc, char** argv)
                                     push(&oe.pal[vi], 1);
                             }
                         }
+                        // kFlagVisMask payload: 1 byte per occupied voxel,
+                        // appended after palette bytes. Bits 0..5 are face
+                        // visibility (+X,-X,+Y,-Y,+Z,-Z).
+                        for (int vi = 0; vi < 8; ++vi)
+                        {
+                            if (oe.mask & (1u << vi))
+                                push(&oe.vmask[vi], 1);
+                        }
                     }
                 }
             }
@@ -1962,7 +1971,10 @@ int main(int argc, char** argv)
             uint32_t writeBytes;
             uint32_t flags = 0;
             if (g_storeBlocks)
+            {
                 flags |= lw::kFlagBlocks;
+                flags |= lw::kFlagVisMask; // always bake visMask byte per voxel
+            }
             const int rawSize = (int)blob.size();
             const int cap = LZ4_compressBound(rawSize);
             cblob.resize((size_t)cap);

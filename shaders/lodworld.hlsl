@@ -25,6 +25,7 @@ cbuffer CBLwFrame : register(b0)
     float    gColorizeClusters;
     float    gAmbient;        // sun multiplier in shared ApplyShadowLighting
     row_major float4x4 gSunViewProj;
+    row_major float4x4 gInvViewProj; // for OctetBillboard PS pixel-ray unproject
     uint     gMode;           // ShadingMode: 0=Lit 1=FlatColor 2=Normals 3=Ao 4=LodViz
     uint3    _padFrame;
 };
@@ -315,6 +316,7 @@ RWTexture2D<uint>         gLwVisUav      : register(u0);
 // PointCS_Block → splat path UAVs (used by csmain_lw_block_splat_worklist).
 // Bound at u1..u3 so they don't alias the u0 used by other pass1/pass2 shaders.
 RWTexture2D<float4> gLwSplatColorUav : register(u1); // RGBA8 albedo + alpha = EncodeSplatAlpha
+RWTexture2D<uint>   gLwSplatMaskUav  : register(u2); // R8_UINT 6-bit visMask per pixel
 RWTexture2D<float>  gLwSplatDepthUav : register(u3); // reverse-Z (0..1)
 // Split SoA blocks:
 //   gLwBlockPos at t3: 4B/block — pack0 = bx|by|bz|occ (low..high bytes)
@@ -329,8 +331,8 @@ Texture2D<uint> gLwDepthSrv : register(t5);
 //   x = slot, y = blockBaseGlobal, z = count, w = firstThread (cumulative).
 StructuredBuffer<uint4> gLwWorkItems : register(t6);
 
-// PointCS A/B per-voxel expanded points. Packed: x|y<<8|z<<16|palIdx<<24.
-StructuredBuffer<uint> gLwBlockPoints : register(t7);
+// Per-block visMask pool — 8 bytes per block (one 6-bit mask per voxel slot).
+StructuredBuffer<uint2> gLwBlockVis : register(t7);
 
 // ---- Cheap top-down AO map ----
 // R32_UINT atomic-max of voxel Y per (X, Z) texel. UV maps the scene X-Z AABB
@@ -584,25 +586,19 @@ void csmain_lw_block_splat_worklist(uint3 dt : SV_DispatchThreadID)
     LwChunkInfo ci = gLwChunkInfos[slot];
     uint  pack0 = gLwBlockPos[blockBase + (gid - firstThread)];
     uint2 cols  = gLwBlockCol[blockBase + (gid - firstThread)];
+    uint2 vms   = gLwBlockVis[blockBase + (gid - firstThread)];
 
     uint bx  = (pack0 >>  0) & 0xFFu;
     uint by  = (pack0 >>  8) & 0xFFu;
     uint bz  = (pack0 >> 16) & 0xFFu;
     uint occ = (pack0 >> 24) & 0xFFu;
 
-    // Synthetic mask: all 6 faces visible, all face AOs = 15 (fully lit).
-    // Splat dilate shader picks dominant face per neighbour. Without per-face
-    // data, treating every face as visible + max AO gives plausible shading.
-    const uint kSyntheticMaskBase =
-        0x3Fu                            // visMask bits 0..5
-        | (0xFu <<  6) | (0xFu << 10)    // face0,1 AO nibbles
-        | (0xFu << 14) | (0xFu << 18)    // face2,3
-        | (0xFu << 22) | (0xFu << 26);   // face4,5
-
     [unroll] for (uint i = 0; i < 8; ++i) {
         if (((occ >> i) & 1u) == 0u) continue;
         uint palIdx = (i < 4u) ? ((cols.x >> (i * 8u)) & 0xFFu)
                                 : ((cols.y >> ((i - 4u) * 8u)) & 0xFFu);
+        uint visMask = (i < 4u) ? ((vms.x >> (i * 8u)) & 0x3Fu)
+                                  : ((vms.y >> ((i - 4u) * 8u)) & 0x3Fu);
         uint lx = (i >> 0) & 1u;
         uint ly = (i >> 1) & 1u;
         uint lz = (i >> 2) & 1u;
@@ -654,99 +650,11 @@ void csmain_lw_block_splat_worklist(uint3 dt : SV_DispatchThreadID)
 
         gLwSplatColorUav[pix] = float4(r, g, b, alpha);
         gLwSplatDepthUav[pix] = saturate(ndc.z); // reverse-Z (near=1, far=0)
+        gLwSplatMaskUav[pix]  = visMask;
     }
 }
 
-// ============================================================
-// Hardware draw-points A/B: VS+PS rasterized point primitives.
-// VS fetches packed voxel from gLwBlockPoints (SV_VertexID + gLwDrawBase),
-// projects to clip space. PS writes flat colour with depth-tested 1-pixel point.
-// ============================================================
-struct VSOutBlockPt {
-    float4 svpos  : SV_Position;
-    nointerpolation uint3 vxyz : COLOR0;
-    nointerpolation uint  palIdx : COLOR1;
-    nointerpolation float3 world : COLOR2;
-};
 
-VSOutBlockPt vsmain_lw_blockpoint(uint vid : SV_VertexID)
-{
-    uint slot = gLwSlot;
-    LwChunkInfo ci = gLwChunkInfos[slot];
-    uint pack = gLwBlockPoints[gLwDrawBase + vid];
-
-    uint vx = pack & 0xFFu;
-    uint vy = (pack >>  8) & 0xFFu;
-    uint vz = (pack >> 16) & 0xFFu;
-    uint palIdx = (pack >> 24) & 0xFFu;
-
-    float3 local = float3((float)vx, (float)vy, (float)vz) + 0.5;
-    float3 world = ci.worldOrigin + local * ci.lodScale;
-
-    VSOutBlockPt o;
-    o.svpos = mul(float4(world, 1.0), gViewProj);
-    o.vxyz  = uint3(vx, vy, vz);
-    o.palIdx = palIdx;
-    o.world  = world;
-    return o;
-}
-
-float4 psmain_lw_blockpoint(VSOutBlockPt i) : SV_Target
-{
-    if (gMode == 4u) {
-        static const float3 kLodTints[5] = {
-            float3(1.00, 0.40, 0.40), float3(1.00, 0.80, 0.30),
-            float3(0.40, 1.00, 0.40), float3(0.40, 0.70, 1.00),
-            float3(0.90, 0.40, 1.00),
-        };
-        float3 tint = kLodTints[min(gLodIdx, 4u)];
-        uint cx = i.vxyz.x >> 5u;
-        uint cy = i.vxyz.y >> 5u;
-        uint cz = i.vxyz.z >> 5u;
-        uint parity = (cx + cy + cz) & 1u;
-        float check = (parity == 0u) ? 0.55 : 1.0;
-        return float4(saturate(tint * check), 1.0);
-    }
-    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
-    uint colPck = gLwPalette[ci.paletteBase + i.palIdx];
-    float3 col = float3((float)( colPck         & 0xFFu),
-                        (float)((colPck >>  8u) & 0xFFu),
-                        (float)((colPck >> 16u) & 0xFFu)) / 255.0;
-    col *= AoSample(i.world);
-    return float4(col, 1.0);
-}
-
-// ---- HW point draw → splat-format MRT (RGBA8 colour + R32 mask) so the
-// existing csSplat dilate path can consume the output. SV_Depth comes from the
-// vertex pos automatically (hardware writes to bound DSV).
-struct PSOutSplat {
-    float4 col  : SV_Target0;
-    uint   mask : SV_Target1;
-};
-PSOutSplat psmain_lw_blockpoint_splat(VSOutBlockPt i)
-{
-    LwChunkInfo ci = gLwChunkInfos[gLwSlot];
-    uint colPck = gLwPalette[ci.paletteBase + i.palIdx];
-    float3 rgb = float3((float)( colPck         & 0xFFu),
-                        (float)((colPck >>  8u) & 0xFFu),
-                        (float)((colPck >> 16u) & 0xFFu)) / 255.0;
-    // AO applied later in csSplat dilate (normal-aware lookup there).
-    // Splat alpha encoding (mirrors EncodeSplatAlpha): bit 7 marker, bits 6:4
-    // lodIdx (3 bits), bits 3:0 AO 4-bit (15 = max).
-    uint a8 = 0x80u | ((gLodIdx & 7u) << 4) | 0xFu;
-    float alpha = (float)a8 / 255.0;
-    // Synthetic mask: visMask=0x3F + all per-face AOs = 15 + parity in bit 30.
-    uint mask = 0x3FFFFFFFu;
-    uint cx = i.vxyz.x >> 5u;
-    uint cy = i.vxyz.y >> 5u;
-    uint cz = i.vxyz.z >> 5u;
-    uint parity = (cx + cy + cz) & 1u;
-    mask |= (parity << 30u);
-    PSOutSplat o;
-    o.col  = float4(rgb, alpha);
-    o.mask = mask;
-    return o;
-}
 
 // ============================================================
 // AO top-down build. One thread per block (worklist dispatch). For each
@@ -832,4 +740,208 @@ void csmain_ao_hbao_filter(uint3 dt : SV_DispatchThreadID)
     }
     float ao = aoSum / (float)kDirs;
     gAoOcclUav[baseT] = ao;
+}
+
+// ============================================================
+// OctetBillboards — per-octet billboard quad. VS projects 8 corners of the
+// octet's world AABB to NDC, computes screen-space bbox, emits 6 verts as
+// triangle list. PS does ray-vs-AABB on the 8 child voxels (gated by
+// occupancy), picks nearest hit, shades via ShadeWithLighting6Face.
+//
+// Inputs: same worklist as splat path (gLwWorkItems at t6). VS uses
+// SV_VertexID / 6 → block index in worklist, then unpacks BlockPos/Col/Vis.
+// Output: scene RT (linear HDR) + SV_Depth via SV_Depth from ray hit.
+// ============================================================
+struct VSOutOctet
+{
+    float4 svpos     : SV_Position;
+    nointerpolation float3 amin   : AMIN;   // octet world AABB min
+    nointerpolation float3 amax   : AMAX;   // world AABB max
+    nointerpolation uint   occ    : OCC;
+    nointerpolation uint2  cols   : COLS;
+    nointerpolation uint2  vms    : VMS;
+    nointerpolation float  lodScale   : LODSC;
+    nointerpolation uint   lodIdxV    : LODIDX;
+    nointerpolation uint   paletteBase: PALBASE;
+    nointerpolation uint3  baseVx     : BVX;
+};
+
+VSOutOctet vsmain_octet_billboard(uint vid : SV_VertexID)
+{
+    // 6 verts per quad (triangle list, two tris).
+    uint blockIdx  = vid / 6u;
+    uint cornerIdx = vid % 6u;
+
+    // Mapping cornerIdx → quad corner index (0..3): 0,1,2, 0,2,3.
+    // 0=(mnx,mny) 1=(mxx,mny) 2=(mxx,mxy) 3=(mnx,mxy).
+    static const uint kCornerMap[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+    uint corner = kCornerMap[cornerIdx];
+
+    // Locate the item this block lives in via binary search over firstThread.
+    uint lo = 0u, hi = gLwNumWorkItems;
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (gLwWorkItems[mid].w <= blockIdx) lo = mid;
+        else                                  hi = mid;
+    }
+    uint4 item = gLwWorkItems[lo];
+    uint slot        = item.x;
+    uint blockBase   = item.y;
+    uint count       = item.z;
+    uint firstThread = item.w;
+    bool pad = (blockIdx - firstThread >= count);
+
+    LwChunkInfo ci = gLwChunkInfos[slot];
+    uint  pack0 = gLwBlockPos[blockBase + (blockIdx - firstThread)];
+    uint2 cols  = gLwBlockCol[blockBase + (blockIdx - firstThread)];
+    uint2 vms   = gLwBlockVis[blockBase + (blockIdx - firstThread)];
+
+    uint bx  = (pack0 >>  0) & 0xFFu;
+    uint by  = (pack0 >>  8) & 0xFFu;
+    uint bz  = (pack0 >> 16) & 0xFFu;
+    uint occ = (pack0 >> 24) & 0xFFu;
+
+    // Octet AABB in world space: covers voxels [(bx*2,by*2,bz*2)..(bx*2+2,...)] * lodScale.
+    float3 amin = ci.worldOrigin + float3(bx*2u, by*2u, bz*2u) * ci.lodScale;
+    float3 amax = amin + (2.0 * ci.lodScale);
+
+    // Project 8 corners to NDC, take min/max of valid (clip.w>0) projections.
+    // Track max ndc.z (= nearest in reverse-Z) for the quad's depth so the
+    // depth test pre-rejects occluded octets. PS refines per-pixel via SV_Depth.
+    float mnx =  1e9, mny =  1e9;
+    float mxx = -1e9, mxy = -1e9;
+    float maxNdcZ = 0.0; // reverse-Z far baseline
+    bool anyInFront = false;
+    [unroll] for (uint ci2 = 0; ci2 < 8u; ++ci2) {
+        float3 w = float3(
+            (ci2 & 1u) ? amax.x : amin.x,
+            (ci2 & 2u) ? amax.y : amin.y,
+            (ci2 & 4u) ? amax.z : amin.z);
+        float4 c = mul(float4(w, 1.0), gViewProj);
+        if (c.w <= 0.001) continue;
+        anyInFront = true;
+        float3 ndc = c.xyz / c.w;
+        mnx = min(mnx, ndc.x); mxx = max(mxx, ndc.x);
+        mny = min(mny, ndc.y); mxy = max(mxy, ndc.y);
+        maxNdcZ = max(maxNdcZ, ndc.z);
+    }
+
+    // Clip to [-1,1] (cheaper than guard band).
+    mnx = max(mnx, -1.0); mxx = min(mxx, 1.0);
+    mny = max(mny, -1.0); mxy = min(mxy, 1.0);
+
+    float2 qpos;
+    [branch] if (pad || !anyInFront || mnx >= mxx || mny >= mxy) {
+        // Degenerate quad → all 4 corners collapse off-screen.
+        qpos = float2(-2, -2);
+    } else {
+        qpos = float2(
+            (corner == 0u || corner == 3u) ? mnx : mxx,
+            (corner == 0u || corner == 1u) ? mny : mxy);
+    }
+
+    VSOutOctet o;
+    // Z = nearest corner (max in reverse-Z) so depth test admits this quad
+    // wherever it could potentially hit. PS SV_Depth writes refined per-pixel.
+    o.svpos       = float4(qpos, saturate(maxNdcZ), 1.0);
+    o.amin        = amin;
+    o.amax        = amax;
+    o.occ         = occ;
+    o.cols        = cols;
+    o.vms         = vms;
+    o.lodScale    = ci.lodScale;
+    o.lodIdxV     = gLwLodIdx;
+    o.paletteBase = ci.paletteBase;
+    o.baseVx      = uint3(bx*2u, by*2u, bz*2u);
+    return o;
+}
+
+struct PSOutOctet
+{
+    float4 color : SV_Target;
+    float  depth : SV_Depth;
+};
+
+PSOutOctet psmain_octet_billboard(VSOutOctet i)
+{
+    PSOutOctet o;
+
+    // Build ray from camera through this pixel via gInvViewProj.
+    float2 sp  = i.svpos.xy;
+    float  invW = 1.0 / (float)gVwSize.x;
+    float  invH = 1.0 / (float)gVwSize.y;
+    float  u   = (sp.x + 0.5) * invW;
+    float  v   = (sp.y + 0.5) * invH;
+    float2 ndcP = float2(u * 2.0 - 1.0, 1.0 - v * 2.0);
+    // Reverse-Z: ndc.z=1 is near plane (finite world point). ndc.z=0 would
+    // unproject to the infinite-far plane and collapse all pixel rays.
+    float4 nearH = mul(float4(ndcP, 1.0, 1.0), gInvViewProj);
+    float3 nearW = nearH.xyz / nearH.w;
+    float3 rd    = normalize(nearW - gCamPos);
+    float3 invRd = 1.0 / rd;
+
+    float lodScale = i.lodScale;
+    float bestT = 1e9;
+    int   bestVi = -1;
+    float3 bestN = float3(0, 0, 1);
+
+    [unroll] for (uint vi = 0; vi < 8u; ++vi) {
+        if (((i.occ >> vi) & 1u) == 0u) continue;
+        uint lx = (vi >> 0) & 1u;
+        uint ly = (vi >> 1) & 1u;
+        uint lz = (vi >> 2) & 1u;
+        float3 vmin = i.amin + float3((float)lx, (float)ly, (float)lz) * lodScale;
+        float3 vmax = vmin + lodScale;
+        float3 t0   = (vmin - gCamPos) * invRd;
+        float3 t1   = (vmax - gCamPos) * invRd;
+        float3 tmn  = min(t0, t1);
+        float3 tmx  = max(t0, t1);
+        float tNear = max(max(tmn.x, tmn.y), tmn.z);
+        float tFar  = min(min(tmx.x, tmx.y), tmx.z);
+        if (tFar < 0.0 || tNear > tFar) continue;
+        float tHit = max(tNear, 0.0);
+        if (tHit < bestT) {
+            bestT = tHit;
+            bestVi = (int)vi;
+            // Face normal: axis with the largest tmn = entry plane.
+            if (tmn.x >= tmn.y && tmn.x >= tmn.z) bestN = float3(rd.x < 0 ? 1 : -1, 0, 0);
+            else if (tmn.y >= tmn.z)              bestN = float3(0, rd.y < 0 ? 1 : -1, 0);
+            else                                  bestN = float3(0, 0, rd.z < 0 ? 1 : -1);
+        }
+    }
+
+    if (bestVi < 0) {
+        // Pixel inside billboard rect but not over any voxel → discard.
+        discard;
+    }
+
+    float3 hit = gCamPos + rd * bestT;
+    float4 chit = mul(float4(hit, 1.0), gViewProj);
+    // DIAGNOSTIC: rasterized VS depth (nearest corner per octet, per-quad
+    // constant). Confirms sort path; per-pixel refinement next.
+    o.depth = i.svpos.z;
+
+    // Extract palette + visMask for the winning voxel.
+    uint palIdx = (bestVi < 4) ? ((i.cols.x >> (bestVi * 8u)) & 0xFFu)
+                                : ((i.cols.y >> ((bestVi - 4u) * 8u)) & 0xFFu);
+    uint visMask = (bestVi < 4) ? ((i.vms.x >> (bestVi * 8u)) & 0x3Fu)
+                                  : ((i.vms.y >> ((bestVi - 4u) * 8u)) & 0x3Fu);
+
+    uint colPck = gLwPalette[i.paletteBase + palIdx];
+    float3 albedo = float3(
+        (float)( colPck         & 0xFFu),
+        (float)((colPck >>  8u) & 0xFFu),
+        (float)((colPck >> 16u) & 0xFFu)) / 255.0;
+
+    uint vx = i.baseVx.x + (uint)((bestVi >> 0) & 1);
+    uint vy = i.baseVx.y + (uint)((bestVi >> 1) & 1);
+    uint vz = i.baseVx.z + (uint)((bestVi >> 2) & 1);
+    uint cx = vx >> 5u, cy = vy >> 5u, cz = vz >> 5u;
+    uint parity = (cx + cy + cz) & 1u;
+
+    float ao = 1.0;
+    float3 rgb = ShadeWithLighting6Face(albedo, hit, ao, visMask, i.lodIdxV, parity, (int)gMode);
+
+    o.color = float4(rgb, 1.0);
+    return o;
 }

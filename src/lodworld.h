@@ -88,9 +88,17 @@ struct BlockCol
 {
     uint8_t palIdx[8];
 };
+// Per-voxel 6-bit visibility mask (bits 0..5 = +X,-X,+Y,-Y,+Z,-Z). One byte
+// per voxel slot, mirrors BlockCol layout. Populated from kFlagVisMask payload
+// in octet stream (1 byte per occupied voxel).
+struct BlockVis
+{
+    uint8_t visMask[8];
+};
 #pragma pack(pop)
 static_assert(sizeof(BlockPos) == 4, "");
 static_assert(sizeof(BlockCol) == 8, "");
+static_assert(sizeof(BlockVis) == 8, "");
 
 // kFlag for chunk blob: compact per-chunk OCTET stream at end of blob.
 // Format (V3, file version 2):
@@ -206,6 +214,9 @@ inline constexpr uint32_t kFileMagic = 0x31574F4Cu; // "LOW1" little-endian
 inline constexpr uint32_t kFileVersion = 2u;
 
 inline constexpr uint32_t kFlagLz4 = 1u << 0;
+// kFlagVisMask: octet stream payload appends 1 byte (6-bit visMask) per
+// occupied voxel after the mode-specific palette bytes.
+inline constexpr uint32_t kFlagVisMask = 1u << 3;
                                                   // (empty cell adjacent to solid voxel in chunk grid)
 
 // =====================================================================
@@ -430,9 +441,11 @@ struct LODWorld
     std::vector<RuntimeChunk> chunks;
     CullArrays cull;
     // Parallel block pools for PointCS_Block. Empty if .lw lacks block stream.
-    // Same index into both. Split for bandwidth: pass 1 only needs BlockPos.
+    // Same index into all three. blockVisPool is empty unless kFlagVisMask was
+    // set on the chunk blob.
     std::vector<BlockPos> blockPosPool;
     std::vector<BlockCol> blockColPool;
+    std::vector<BlockVis> blockVisPool;
 };
 
 struct World

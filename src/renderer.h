@@ -23,13 +23,14 @@ enum class ShadingMode : int
 
 // Surviving render techs (LW path). Splat is the default; PolyAxis renders
 // real cube faces post-dilate. Others kept for reference / port targets.
-// Render technique selector. Only PointCS_Block is wired up today; other
-// entries kept for future resurrection (octet-driven polyaxis, etc).
+// Render technique selector. PointCS_Block + OctetBillboards are wired up.
+// PolyAxis / Splat reserved for future octet-driven revivals.
 enum class RenderTech : int
 {
-    PointCS_Block = 0, // CS worklist Pass1 depth + Pass2 colour (active path)
-    PolyAxis      = 1, // reserved — cube faces from octet stream (future)
-    Splat         = 2, // reserved — HW point splat (future)
+    PointCS_Block    = 0, // CS worklist Pass1 depth + Pass2 colour
+    OctetBillboards  = 1, // billboard quad per occupied octet, PS ray-AABB
+    PolyAxis         = 2, // reserved
+    Splat            = 3, // reserved
 };
 
 enum class PointLighting : int
@@ -121,7 +122,7 @@ public:
     };
     struct StreamLodInfo
     {
-        StreamPoolInfo pools[4] = {}; // chunkInfo, palette, blockPos, blockCol
+        StreamPoolInfo pools[5] = {}; // chunkInfo, palette, blockPos, blockCol, blockVis
     };
     StreamLodInfo GetStreamLodInfo(int L) const;
     // Call once after a batch of UploadLwLodOnly calls (a stream cycle's worth
@@ -276,6 +277,9 @@ private:
     ComPtr<ID3D11RenderTargetView> splatColorRtv_;
     ComPtr<ID3D11ShaderResourceView> splatColorSrv_;
     ComPtr<ID3D11UnorderedAccessView> splatColorUav_; // PointCS_Block → splat path
+    ComPtr<ID3D11Texture2D> splatMaskTex_; // R8_UINT 6-bit visMask per pixel
+    ComPtr<ID3D11ShaderResourceView> splatMaskSrv_;
+    ComPtr<ID3D11UnorderedAccessView> splatMaskUav_;
     ComPtr<ID3D11Texture2D> splatDepthTex_;
     ComPtr<ID3D11DepthStencilView> splatDsv_;
     ComPtr<ID3D11ShaderResourceView> splatDepthSrv_;
@@ -374,6 +378,8 @@ private:
         ComPtr<ID3D11ShaderResourceView> blockPosSrv;
         ComPtr<ID3D11Buffer> blockColSb; // BlockCol pool (8B/block: palIdx[8])
         ComPtr<ID3D11ShaderResourceView> blockColSrv;
+        ComPtr<ID3D11Buffer> blockVisSb; // BlockVis pool (8B/block: 6-bit visMask[8])
+        ComPtr<ID3D11ShaderResourceView> blockVisSrv;
         uint32_t slotCount = 0;
         uint32_t blockCount = 0;
         uint64_t bytes = 0;
@@ -428,6 +434,8 @@ private:
     ComPtr<ID3D11ComputeShader> csLwBlockDepthWorklist_; // pass1
     ComPtr<ID3D11ComputeShader> csLwBlockColorWorklist_; // pass2 → R16 RGB565
     ComPtr<ID3D11ComputeShader> csLwBlockSplatWorklist_; // pass2 → splat-format targets
+    ComPtr<ID3D11VertexShader>  vsLwOctetBillboard_;     // OctetBillboards: 6 verts per occupied block
+    ComPtr<ID3D11PixelShader>   psLwOctetBillboard_;     // PS: ray-vs-8 child AABB, shade inline
     // ---- Cheap top-down AO ----
     // R32_UINT 2048x2048 mapped over the scene X-Z AABB. Each occupied voxel
     // does InterlockedMax(worldY) at its (worldX, worldZ) UV → texture stores

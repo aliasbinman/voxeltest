@@ -127,8 +127,8 @@ struct AppState
     Renderer renderer;
     Camera camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech tech    = RenderTech::PointCS_Block; // close-ring tech
-    RenderTech techFar = RenderTech::PointCS_Block; // far-ring tech
+    RenderTech tech    = RenderTech::OctetBillboards; // close-ring tech
+    RenderTech techFar = RenderTech::PointCS_Block;   // far-ring tech
     bool closeEnabled = true;
     bool farEnabled   = true;
     float sunPitchDeg = 10.0f;
@@ -152,7 +152,7 @@ struct AppState
     float pointLodScale = 1.0f;
     bool splatFilter = true;
     bool splatDilate2Pass = false;
-    int splatRadius = 3; // CS dilation half-window in pixels
+    int splatRadius = 1; // CS dilation half-window in pixels
     int fogMode = 1;     // 0 = off, 1 = depth (drives effFogDensity gating)
     float fogDensity = 0.0004f;
     float fogColor[3] = {0.55f, 0.60f, 0.70f};
@@ -1041,9 +1041,10 @@ void FrameControlsWindow()
     // future octet-based revivals. Close/Far checkboxes gate each ring.
     struct TechEntry { const char* name; RenderTech val; };
     static const TechEntry kTechList[] = {
-        {"PointCS_Block", RenderTech::PointCS_Block},
-        {"PolyAxis",      RenderTech::PolyAxis},
-        {"Splat",         RenderTech::Splat},
+        {"PointCS_Block",   RenderTech::PointCS_Block},
+        {"OctetBillboards", RenderTech::OctetBillboards},
+        {"PolyAxis",        RenderTech::PolyAxis},
+        {"Splat",           RenderTech::Splat},
     };
     const int kTechCount = (int)(sizeof(kTechList) / sizeof(kTechList[0]));
     auto techIdxFrom = [&](RenderTech v) -> int {

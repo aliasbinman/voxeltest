@@ -111,6 +111,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         lw.chunks.clear();
         lw.blockPosPool.clear();
         lw.blockColPool.clear();
+        lw.blockVisPool.clear();
         const uint32_t cc = lh[L].chunkCount;
         if (cc == 0)
             continue;
@@ -382,6 +383,26 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                                 }
                             }
 
+                            // kFlagVisMask payload: 1 B per occupied voxel
+                            // appended after palette bytes. Bits 0..5 = face
+                            // visibility (+X,-X,+Y,-Y,+Z,-Z).
+                            uint8_t vmFull[8] = {};
+                            if (ce.flags & kFlagVisMask)
+                            {
+                                for (int vi = 0; vi < 8; ++vi)
+                                {
+                                    if (mask & (1u << vi))
+                                        vmFull[vi] = *p++ & 0x3Fu;
+                                }
+                            }
+                            else
+                            {
+                                // No baked mask → conservative all-visible so
+                                // shading still works on legacy blobs.
+                                for (int vi = 0; vi < 8; ++vi)
+                                    vmFull[vi] = 0x3Fu;
+                            }
+
                             uint32_t ox = curOctetIdx & 0xFu;
                             uint32_t oz = (curOctetIdx >> 4) & 0xFu;
                             uint32_t oy = (curOctetIdx >> 8) & 0xFu;
@@ -412,9 +433,10 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                             for (int vi = 0; vi < 8; ++vi)
                                 bc.palIdx[vi] = palFull[vi];
                             lw.blockColPool.push_back(bc);
-                            // blockPointPool fill removed (CS-only path doesn't need
-                            // per-voxel data — block-VS polyaxis route is dead until
-                            // resurrected on octet stream).
+                            BlockVis bv{};
+                            for (int vi = 0; vi < 8; ++vi)
+                                bv.visMask[vi] = vmFull[vi];
+                            lw.blockVisPool.push_back(bv);
                             ++rc.blockCount;
                             ++octetCount;
                             if (clusterEnd && implicitRemaining == 0)

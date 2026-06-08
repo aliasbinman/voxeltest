@@ -130,6 +130,45 @@ float3 ShadeWithLighting(float3 albedo, float3 N, float3 wpos, float ao,
     return ApplyFog(lit * tint, wpos); // tonemap deferred to final post
 }
 
+// Per-face accumulation gated by 6-bit visMask. Hidden faces (bit clear)
+// drop out so buried voxels don't over-light. Shares one shadow tap + fog.
+float3 ShadeWithLighting6Face(float3 albedo, float3 wpos, float ao,
+                              uint visMask,
+                              uint lodIdx, uint parity, int mode)
+{
+    if (mode == 1) return ApplyFog(albedo, wpos);
+    if (mode == 2) return ApplyFog(float3(0.5, 0.5, 0.5), wpos);
+    if (mode == 3) return ao.xxx;
+    if (mode == 4) {
+        float check = (parity == 0u) ? 0.55 : 1.00;
+        return ao * ClusterTint(2u + lodIdx) * check;
+    }
+    static const float3 kFaceN[6] = {
+        float3( 1, 0, 0), float3(-1, 0, 0),
+        float3( 0, 1, 0), float3( 0,-1, 0),
+        float3( 0, 0, 1), float3( 0, 0,-1),
+    };
+    float3 L = normalize(gLightDir);
+    float  shad = SampleShadow(wpos);
+    float3 ambSum = 0;
+    float  ndotlSum = 0;
+    uint visible = 0;
+    [unroll] for (uint f = 0u; f < 6u; ++f) {
+        if (((visMask >> f) & 1u) == 0u) continue;
+        ambSum   += SampleAmbientCubeTriplanar(kFaceN[f]);
+        ndotlSum += saturate(dot(kFaceN[f], L));
+        ++visible;
+    }
+    float invN = (visible > 0u) ? (1.0 / (float)visible) : 0.0;
+    float3 amb = ambSum * invN * ao;
+    float ndotl = ndotlSum * invN;
+    float3 sun = float3(1.10, 1.00, 0.85) * ndotl * shad * gSunIntensity;
+    float3 light = amb + gAmbient * sun;
+    float3 lit = albedo * light;
+    float3 tint = (gColorizeClusters > 0.5) ? ClusterTint(2u + lodIdx) : float3(1, 1, 1);
+    return ApplyFog(lit * tint, wpos);
+}
+
 // 3-face area-weighted variant. Shares shadow tap + fog.
 // Per-face only ambient cube fetch + ndotl. Weights must sum to 1.
 float3 ShadeWithLighting3Face(float3 albedo,
