@@ -10,7 +10,7 @@
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
-#include "imgui_impl_dx11.h"
+#include "imgui_impl_dx12.h"
 
 #include "microprofile.h"
 
@@ -1179,15 +1179,15 @@ void FrameControlsWindow()
 
             ImGui::Separator();
             ImGui::Text("Shadow map preview");
-            ID3D11ShaderResourceView* srv = g_app.shadowBlur
+            D3D12_GPU_DESCRIPTOR_HANDLE srv = g_app.shadowBlur
                                                 ? g_app.renderer.ShadowFilledSrv()
                                                 : g_app.renderer.ShadowSrv();
             const uint32_t smSize = g_app.renderer.ShadowMapSize();
-            if (srv && smSize > 0)
+            if (srv.ptr && smSize > 0)
             {
                 float avail = ImGui::GetContentRegionAvail().x;
                 float side = std::max(64.0f, std::min(avail, 512.0f));
-                ImGui::Image((ImTextureID)srv, ImVec2(side, side));
+                ImGui::Image((ImTextureID)srv.ptr, ImVec2(side, side));
                 ImGui::Text("source: %s  size: %u x %u",
                             g_app.shadowBlur ? "filled (blurred)" : "raw caster",
                             smSize, smSize);
@@ -1224,13 +1224,13 @@ void FrameControlsWindow()
             ImGui::ColorEdit3("Tint", g_app.godrayTint);
             ImGui::Separator();
             ImGui::TextUnformatted("Mark (pre-blur):");
-            if (auto* s = g_app.renderer.GodrayMarkSrv())
-                ImGui::Image((ImTextureID)s, ImVec2(192, 192));
+            { auto s = g_app.renderer.GodrayMarkSrv();
+              if (s.ptr) ImGui::Image((ImTextureID)s.ptr, ImVec2(192, 192)); }
             ImGui::SameLine();
             ImGui::BeginGroup();
             ImGui::TextUnformatted("Blurred (sampled):");
-            if (auto* s = g_app.renderer.GodraySrv())
-                ImGui::Image((ImTextureID)s, ImVec2(192, 192));
+            { auto s = g_app.renderer.GodraySrv();
+              if (s.ptr) ImGui::Image((ImTextureID)s.ptr, ImVec2(192, 192)); }
             ImGui::EndGroup();
             ImGui::EndTabItem();
         }
@@ -1346,7 +1346,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     MicroProfileSetForceEnable(true);
     MicroProfileSetEnableAllGroups(true);
     MicroProfileSetForceMetaCounters(true);
-    MicroProfileGpuInitD3D11(g_app.renderer.Device());
+    MicroProfileGpuInitD3D12(g_app.renderer.Device(), g_app.renderer.CommandQueue());
     MicroProfileWebServerStart();
 
     IMGUI_CHECKVERSION();
@@ -1355,7 +1355,24 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     (void)io;
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(g_app.renderer.Device(), g_app.renderer.Context());
+    {
+        ImGui_ImplDX12_InitInfo info{};
+        info.Device              = g_app.renderer.Device();
+        info.CommandQueue        = g_app.renderer.CommandQueue();
+        info.NumFramesInFlight   = (int)Renderer::kFrameCount;
+        info.RTVFormat           = g_app.renderer.BackBufferFormat();
+        info.DSVFormat           = DXGI_FORMAT_UNKNOWN;
+        info.SrvDescriptorHeap   = g_app.renderer.SrvHeapForImGui();
+        info.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo*,
+                                        D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
+                                        D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
+        { g_app.renderer.ImGuiSrvAlloc(outCpu, outGpu); };
+        info.SrvDescriptorFreeFn = [](ImGui_ImplDX12_InitInfo*,
+                                       D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                       D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+        { g_app.renderer.ImGuiSrvFree(cpu, gpu); };
+        ImGui_ImplDX12_Init(&info);
+    }
 
     // Enumerate available datasets + restore last-used selection.
     g_app.datasetPaths = DiscoverDatasets();
@@ -1717,7 +1734,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             }
         }
 
-        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         FrameMenuBar();
@@ -1844,7 +1861,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                 g_app.renderer.DrawLwScene(g_app.camera, ps);
             }
         }
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_app.renderer.CommandList());
         g_app.renderer.EndFrame(g_app.vsync);
 
         MicroProfileFlip();
@@ -1857,7 +1874,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     // tracer, GPU timers). On Windows the ETW unregister can take seconds.
     // Skip it — the OS reclaims sockets/threads at process exit.
 
-    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     // Stop loader thread.

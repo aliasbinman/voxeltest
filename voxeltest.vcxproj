@@ -42,13 +42,13 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;$(ProjectDir)third_party\hlslpp\include;$(ProjectDir)third_party\microprofile;$(ProjectDir)third_party\lz4;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;MICROPROFILE_ENABLED=1;MICROPROFILE_WEBSERVER=1;MICROPROFILE_GPU_TIMERS_D3D11=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;$(ProjectDir)third_party\hlslpp\include;$(ProjectDir)third_party\microprofile;$(ProjectDir)third_party\lz4;$(ProjectDir)third_party\DirectXTK12\Inc;$(ProjectDir)third_party\DirectXTK12\Src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;MICROPROFILE_ENABLED=1;MICROPROFILE_WEBSERVER=1;MICROPROFILE_GPU_TIMERS_D3D12=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level3</WarningLevel>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;dxcompiler.lib;dwmapi.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -85,7 +85,11 @@
     <ClCompile Include="third_party\imgui\imgui_widgets.cpp" />
     <ClCompile Include="third_party\imgui\imgui_demo.cpp" />
     <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp" />
-    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp" />
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx12.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\GraphicsMemory.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\LinearAllocator.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\DescriptorHeap.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\DirectXHelpers.cpp" />
     <ClCompile Include="third_party\microprofile\microprofile_impl.cpp" />
     <ClCompile Include="third_party\lz4\lz4.c">
       <CompileAs>CompileAsC</CompileAs>
