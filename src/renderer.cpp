@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -108,6 +110,18 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
             return false;
         }
         if (!CreateM2Demo()) return false;
+
+        // LW SRV heap — shader-visible, shared across all LODs.
+        D3D12_DESCRIPTOR_HEAP_DESC ld{};
+        ld.NumDescriptors = kLwSrvHeapSize;
+        ld.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        ld.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ThrowIfFailed(device_->CreateDescriptorHeap(&ld, IID_PPV_ARGS(&lwSrvHeap_)),
+                      "lw SRV heap");
+        NameObject(lwSrvHeap_.Get(), L"lwSrvHeap");
+        lwSrvDescSize_ = device_->GetDescriptorHandleIncrementSize(
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        lwSrvNextSlot_ = 0;
     }
     catch (const std::exception& e)
     {
@@ -479,6 +493,8 @@ void Renderer::Shutdown()
 {
     if (cmdQueue_ && fence_) WaitForGpu();
     if (fenceEvent_) { CloseHandle(fenceEvent_); fenceEvent_ = nullptr; }
+    ClearLwWorld();
+    lwSrvHeap_.Reset();
     graphicsMemory_.reset();
     cmdList_.Reset();
     for (auto& a : cmdAlloc_) a.Reset();
@@ -487,9 +503,318 @@ void Renderer::Shutdown()
     dsvHeap_.Reset();
     depthTex_.Reset();
     imguiSrvHeap_.Reset();
+    m2Pso_.Reset();
+    m2RootSig_.Reset();
     cmdQueue_.Reset();
     swap_.Reset();
     fence_.Reset();
     device_.Reset();
     factory_.Reset();
+}
+
+// ===== M3 — LW upload =======================================================
+namespace
+{
+    // Synchronous batched buffer uploader. One fence wait per Flush().
+    // Records CopyBufferRegion + transition to NON_PIXEL_SHADER_RESOURCE for
+    // each Upload() call into a private cmd list. Releases upload-heap scratch
+    // resources after Flush() (fence-waited).
+    class BufferUploader
+    {
+    public:
+        bool Init(ID3D12Device* dev, ID3D12CommandQueue* q)
+        {
+            device_ = dev; queue_ = q;
+            if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   IID_PPV_ARGS(&alloc_)))) return false;
+            if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              alloc_.Get(), nullptr,
+                                              IID_PPV_ARGS(&cmd_)))) return false;
+            // CreateCommandList opens the list in recording state. Close it so
+            // Begin()'s alloc->Reset() doesn't error out (alloc reset is illegal
+            // while any associated list is still recording).
+            if (FAILED(cmd_->Close())) return false;
+            if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) return false;
+            evt_ = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+            return evt_ != nullptr;
+        }
+
+        ~BufferUploader()
+        {
+            if (evt_) CloseHandle(evt_);
+        }
+
+        bool Begin()
+        {
+            recording_ = true;
+            scratch_.clear();
+            if (FAILED(alloc_->Reset())) return false;
+            if (FAILED(cmd_->Reset(alloc_.Get(), nullptr))) return false;
+            return true;
+        }
+
+        bool Upload(const void* data, size_t bytes,
+                    Microsoft::WRL::ComPtr<ID3D12Resource>& outDefault)
+        {
+            if (!recording_ || bytes == 0) return false;
+
+            // Default-heap committed resource (final home).
+            D3D12_HEAP_PROPERTIES hpDef{}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = bytes;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device_->CreateCommittedResource(
+                          &hpDef, D3D12_HEAP_FLAG_NONE, &rd,
+                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                          IID_PPV_ARGS(&outDefault)))) return false;
+
+            // Upload-heap committed resource (scratch).
+            D3D12_HEAP_PROPERTIES hpUp{}; hpUp.Type = D3D12_HEAP_TYPE_UPLOAD;
+            Microsoft::WRL::ComPtr<ID3D12Resource> up;
+            if (FAILED(device_->CreateCommittedResource(
+                          &hpUp, D3D12_HEAP_FLAG_NONE, &rd,
+                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                          IID_PPV_ARGS(&up)))) return false;
+
+            // Map + memcpy.
+            void* mapped = nullptr;
+            D3D12_RANGE noRead{0, 0};
+            if (FAILED(up->Map(0, &noRead, &mapped))) return false;
+            std::memcpy(mapped, data, bytes);
+            up->Unmap(0, nullptr);
+
+            // Record copy + transition.
+            cmd_->CopyBufferRegion(outDefault.Get(), 0, up.Get(), 0, bytes);
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = outDefault.Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                     | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmd_->ResourceBarrier(1, &b);
+
+            scratch_.push_back(std::move(up));
+            return true;
+        }
+
+        bool Flush()
+        {
+            if (!recording_) return true;
+            recording_ = false;
+            if (FAILED(cmd_->Close())) return false;
+            ID3D12CommandList* lists[] = { cmd_.Get() };
+            queue_->ExecuteCommandLists(1, lists);
+            const UINT64 v = ++fenceVal_;
+            if (FAILED(queue_->Signal(fence_.Get(), v))) return false;
+            if (fence_->GetCompletedValue() < v)
+            {
+                if (FAILED(fence_->SetEventOnCompletion(v, evt_))) return false;
+                WaitForSingleObjectEx(evt_, INFINITE, FALSE);
+            }
+            scratch_.clear(); // upload heap resources safe to release now
+            return true;
+        }
+
+    private:
+        ID3D12Device* device_ = nullptr;
+        ID3D12CommandQueue* queue_ = nullptr;
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc_;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_;
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
+        UINT64 fenceVal_ = 0;
+        HANDLE evt_ = nullptr;
+        bool recording_ = false;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratch_;
+    };
+}
+
+void Renderer::ClearLwWorld()
+{
+    for (int L = 0; L < lw::kLodCount; ++L)
+        lwGpu_[L] = LwGpu{};
+    // Bump-allocator reset: M3 doesn't free per-LOD slots, so a full ClearLwWorld
+    // reclaims all of them at once. Sufficient for one-world-at-a-time workflow.
+    lwSrvNextSlot_ = 0;
+    lwHasWorld_ = false;
+}
+
+// Allocates a single SRV slot in lwSrvHeap_; returns slot index and writes the
+// SRV. Caller provides the structured-buffer view desc.
+static uint32_t CreateStructuredBufferSrv(ID3D12Device* dev,
+                                          ID3D12DescriptorHeap* heap,
+                                          UINT descSize,
+                                          UINT& nextSlot,
+                                          ID3D12Resource* buf,
+                                          UINT numElements,
+                                          UINT stride)
+{
+    if (!buf || numElements == 0) return UINT32_MAX;
+    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+    d.Format = DXGI_FORMAT_UNKNOWN;
+    d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Buffer.NumElements = numElements;
+    d.Buffer.StructureByteStride = stride;
+    const uint32_t slot = nextSlot++;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += SIZE_T(slot) * descSize;
+    dev->CreateShaderResourceView(buf, &d, h);
+    return slot;
+}
+
+bool Renderer::UploadLwLod(const lw::World& w, int L)
+{
+    if (!device_) return false;
+    if (L < 0 || L >= lw::kLodCount) return false;
+    const lw::LODWorld& src = w.lods[L];
+    LwGpu& g = lwGpu_[L];
+    g = LwGpu{};
+    const uint32_t slotCount = (uint32_t)src.chunks.size();
+    if (slotCount == 0) return true;
+    if (slotCount > lw::kMaxResidentChunksPerLod)
+    {
+        std::fprintf(stderr, "[lw] LOD %d has %u chunks > max %u\n",
+                     L, slotCount, lw::kMaxResidentChunksPerLod);
+        return false;
+    }
+
+    BufferUploader up;
+    if (!up.Init(device_.Get(), cmdQueue_.Get())) return false;
+    if (!up.Begin()) return false;
+
+    // ---- ChunkInfo: one entry per slot ----
+    std::vector<lw::GpuChunkInfo> infos(slotCount);
+    for (uint32_t i = 0; i < slotCount; ++i)
+    {
+        const lw::RuntimeChunk& rc = src.chunks[i];
+        lw::GpuChunkInfo& gi = infos[i];
+        gi.worldOriginX = (float)rc.worldOriginX;
+        gi.worldOriginY = (float)rc.worldOriginY;
+        gi.worldOriginZ = (float)rc.worldOriginZ;
+        gi.lodScale = (float)src.lodScale;
+        gi._unused0 = 0;
+        gi.paletteBase = i * lw::kPaletteSize;
+        gi._pad[0] = gi._pad[1] = 0;
+    }
+    if (!up.Upload(infos.data(), infos.size() * sizeof(lw::GpuChunkInfo),
+                   g.chunkInfoSb)) return false;
+
+    // ---- Palette atlas: slotCount × kPaletteSize uint32 ----
+    std::vector<uint32_t> atlas((size_t)slotCount * lw::kPaletteSize, 0u);
+    for (uint32_t i = 0; i < slotCount; ++i)
+    {
+        const lw::RuntimeChunk& rc = src.chunks[i];
+        const uint32_t n = std::min(rc.paletteCount, (uint32_t)lw::kPaletteSize);
+        std::memcpy(atlas.data() + (size_t)i * lw::kPaletteSize,
+                    rc.palette, n * sizeof(uint32_t));
+    }
+    if (!up.Upload(atlas.data(), atlas.size() * sizeof(uint32_t),
+                   g.paletteSb)) return false;
+
+    // ---- BlockPos / BlockCol / BlockVis ----
+    const uint64_t posBytes = (uint64_t)src.blockPosPool.size() * sizeof(lw::BlockPos);
+    const uint64_t colBytes = (uint64_t)src.blockColPool.size() * sizeof(lw::BlockCol);
+    const uint64_t visBytes = (uint64_t)src.blockVisPool.size() * sizeof(lw::BlockVis);
+    if (posBytes > 0 && !up.Upload(src.blockPosPool.data(), posBytes, g.blockPosSb))
+        return false;
+    if (colBytes > 0 && !up.Upload(src.blockColPool.data(), colBytes, g.blockColSb))
+        return false;
+    if (visBytes > 0 && !up.Upload(src.blockVisPool.data(), visBytes, g.blockVisSb))
+        return false;
+
+    if (!up.Flush()) return false;
+
+    // Build SRVs on lwSrvHeap_.
+    auto* dev = device_.Get();
+    auto* heap = lwSrvHeap_.Get();
+    g.chunkInfoSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
+        g.chunkInfoSb.Get(), (UINT)infos.size(), (UINT)sizeof(lw::GpuChunkInfo));
+    g.paletteSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
+        g.paletteSb.Get(), (UINT)atlas.size(), (UINT)sizeof(uint32_t));
+    if (posBytes)
+        g.blockPosSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
+            g.blockPosSb.Get(), (UINT)src.blockPosPool.size(), (UINT)sizeof(lw::BlockPos));
+    if (colBytes)
+        g.blockColSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
+            g.blockColSb.Get(), (UINT)src.blockColPool.size(), (UINT)sizeof(lw::BlockCol));
+    if (visBytes)
+        g.blockVisSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
+            g.blockVisSb.Get(), (UINT)src.blockVisPool.size(), (UINT)sizeof(lw::BlockVis));
+
+    g.slotCount = slotCount;
+    g.blockCount = (uint32_t)src.blockPosPool.size();
+    g.bytes = infos.size() * sizeof(lw::GpuChunkInfo)
+            + atlas.size() * sizeof(uint32_t)
+            + posBytes + colBytes + visBytes;
+    std::printf("[lw] LOD %d uploaded: %u slots, %u blocks, %.2f MB GPU\n",
+                L, g.slotCount, g.blockCount, g.bytes / (1024.0 * 1024.0));
+    lwHasWorld_ = true;
+    return true;
+}
+
+bool Renderer::UploadLwWorld(const lw::World& w)
+{
+    if (!device_) return false;
+    ClearLwWorld();
+    lwWorld_ = w;
+    for (int L = 0; L < lw::kLodCount; ++L)
+    {
+        if (!UploadLwLod(w, L)) return false;
+        lwWorld_.lods[L].blockPosPool.clear();
+        lwWorld_.lods[L].blockPosPool.shrink_to_fit();
+        lwWorld_.lods[L].blockColPool.clear();
+        lwWorld_.lods[L].blockColPool.shrink_to_fit();
+        lwWorld_.lods[L].blockVisPool.clear();
+        lwWorld_.lods[L].blockVisPool.shrink_to_fit();
+    }
+    return true;
+}
+
+bool Renderer::UploadLwLodOnly(const lw::World& w, int L)
+{
+    if (L < 0 || L >= lw::kLodCount) return false;
+    lwWorld_.lods[L] = w.lods[L];
+    return UploadLwLod(w, L);
+}
+
+void Renderer::PrepLwWorld(const lw::World& w)
+{
+    ClearLwWorld();
+    for (int i = 0; i < 3; ++i)
+    {
+        lwWorld_.worldAabbMin[i] = w.worldAabbMin[i];
+        lwWorld_.worldAabbMax[i] = w.worldAabbMax[i];
+    }
+    lwHasWorld_ = true;
+}
+
+Renderer::StreamLodInfo Renderer::GetStreamLodInfo(int L) const
+{
+    StreamLodInfo info{};
+    if (L < 0 || L >= lw::kLodCount) return info;
+    const LwGpu& g = lwGpu_[L];
+    auto fill = [](StreamPoolInfo& p, const char* name,
+                   ID3D12Resource* buf, uint32_t stride)
+    {
+        p.name = name;
+        p.stride = stride;
+        if (buf)
+        {
+            D3D12_RESOURCE_DESC rd = buf->GetDesc();
+            p.bytes = rd.Width;
+            p.numElements = stride ? (uint32_t)(rd.Width / stride) : 0;
+        }
+    };
+    fill(info.pools[0], "chunkInfoSb", g.chunkInfoSb.Get(), (uint32_t)sizeof(lw::GpuChunkInfo));
+    fill(info.pools[1], "paletteSb",   g.paletteSb.Get(),   (uint32_t)sizeof(uint32_t));
+    fill(info.pools[2], "blockPosSb",  g.blockPosSb.Get(),  (uint32_t)sizeof(lw::BlockPos));
+    fill(info.pools[3], "blockColSb",  g.blockColSb.Get(),  (uint32_t)sizeof(lw::BlockCol));
+    fill(info.pools[4], "blockVisSb",  g.blockVisSb.Get(),  (uint32_t)sizeof(lw::BlockVis));
+    return info;
 }

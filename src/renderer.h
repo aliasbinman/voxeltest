@@ -102,14 +102,14 @@ public:
 
     static std::vector<std::string> EnumerateAdapters();
 
-    // ---- LW upload path (M3 — currently stubs) ----
-    bool UploadLwWorld(const lw::World&) { return false; }
-    void PrepLwWorld(const lw::World&) {}
-    bool UploadLwLodOnly(const lw::World&, int) { return false; }
-    bool FinalizeLwUploads() { return false; }
-    void ClearLwWorld() {}
-    bool HasLwWorld() const { return false; }
-    void DrawLwScene(const Camera&, const DrawSceneParams&) {}
+    // ---- LW upload path ----
+    bool UploadLwWorld(const lw::World& w);
+    void PrepLwWorld(const lw::World& w);
+    bool UploadLwLodOnly(const lw::World& w, int L);
+    bool FinalizeLwUploads() { return true; } // combined-LOD path deferred to M4+
+    void ClearLwWorld();
+    bool HasLwWorld() const { return lwHasWorld_; }
+    void DrawLwScene(const Camera&, const DrawSceneParams&) {} // M4
 
     struct StreamPoolInfo
     {
@@ -119,12 +119,19 @@ public:
         uint32_t stride = 0;
     };
     struct StreamLodInfo { StreamPoolInfo pools[5] = {}; };
-    StreamLodInfo GetStreamLodInfo(int) const { return {}; }
+    StreamLodInfo GetStreamLodInfo(int L) const;
 
-    uint32_t LwSlotCount(int) const { return 0; }
+    uint32_t LwSlotCount(int L) const
+    { return (L >= 0 && L < lw::kLodCount) ? lwGpu_[L].slotCount : 0; }
     uint32_t LwPointCount(int) const { return 0; }
-    uint64_t LwBytes(int) const { return 0; }
-    uint64_t LwTotalBytes() const { return 0; }
+    uint64_t LwBytes(int L) const
+    { return (L >= 0 && L < lw::kLodCount) ? lwGpu_[L].bytes : 0; }
+    uint64_t LwTotalBytes() const
+    {
+        uint64_t t = 0;
+        for (int L = 0; L < lw::kLodCount; ++L) t += lwGpu_[L].bytes;
+        return t;
+    }
 
     // ---- Frame ----
     void Resize(uint32_t w, uint32_t h);
@@ -182,8 +189,27 @@ private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
     bool CreateRenderTargets();
     bool CreateM2Demo();
+    bool UploadLwLod(const lw::World& w, int L);
     void WaitForGpu();
     void MoveToNextFrame();
+
+    struct LwGpu
+    {
+        ComPtr<ID3D12Resource> chunkInfoSb;
+        ComPtr<ID3D12Resource> paletteSb;
+        ComPtr<ID3D12Resource> blockPosSb;
+        ComPtr<ID3D12Resource> blockColSb;
+        ComPtr<ID3D12Resource> blockVisSb;
+        // Shader-visible SRV descriptor indices into lwSrvHeap_ (UINT32_MAX = none).
+        uint32_t chunkInfoSrv = UINT32_MAX;
+        uint32_t paletteSrv   = UINT32_MAX;
+        uint32_t blockPosSrv  = UINT32_MAX;
+        uint32_t blockColSrv  = UINT32_MAX;
+        uint32_t blockVisSrv  = UINT32_MAX;
+        uint32_t slotCount    = 0;
+        uint32_t blockCount   = 0;
+        uint64_t bytes        = 0;
+    };
 
     ComPtr<ID3D12Device>             device_;
     ComPtr<IDXGIFactory6>            factory_;
@@ -216,6 +242,17 @@ private:
     ShaderCompiler                   shaderc_;
     ComPtr<ID3D12RootSignature>      m2RootSig_;
     ComPtr<ID3D12PipelineState>      m2Pso_;
+
+    // M3 — LW upload. Per-LOD GPU buffers + a shared shader-visible SRV heap
+    // (sized for all LODs' structured buffers, with headroom for M4 combined +
+    // worklist + visDepth/Color UAVs).
+    static constexpr UINT             kLwSrvHeapSize = 512;
+    ComPtr<ID3D12DescriptorHeap>      lwSrvHeap_;
+    UINT                              lwSrvDescSize_ = 0;
+    UINT                              lwSrvNextSlot_ = 0;
+    LwGpu                             lwGpu_[lw::kLodCount];
+    bool                              lwHasWorld_ = false;
+    lw::World                         lwWorld_;
 
     HWND     hwnd_ = nullptr;
     uint32_t width_ = 0;
