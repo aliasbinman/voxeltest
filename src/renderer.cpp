@@ -101,6 +101,13 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
         imguiSrvNextSlot_ = 0;
 
         graphicsMemory_ = std::make_unique<DirectX::GraphicsMemory>(device_.Get());
+
+        if (!shaderc_.Init())
+        {
+            OutputDebugStringA("ShaderCompiler::Init failed\n");
+            return false;
+        }
+        if (!CreateM2Demo()) return false;
     }
     catch (const std::exception& e)
     {
@@ -266,6 +273,75 @@ bool Renderer::CreateRenderTargets()
     return true;
 }
 
+bool Renderer::CreateM2Demo()
+{
+    // Empty root signature — shader uses only SV_VertexID + immediate consts.
+    {
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ComPtr<ID3DBlob> sig, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                 &sig, &err);
+        if (FAILED(hr))
+        {
+            if (err) OutputDebugStringA((const char*)err->GetBufferPointer());
+            return false;
+        }
+        ThrowIfFailed(device_->CreateRootSignature(0, sig->GetBufferPointer(),
+                                                   sig->GetBufferSize(),
+                                                   IID_PPV_ARGS(&m2RootSig_)),
+                      "m2 rootsig");
+        NameObject(m2RootSig_.Get(), L"m2RootSig");
+    }
+
+    // Compile vs + ps from shaders/m2_demo.hlsl.
+    ComPtr<IDxcBlob> vs, ps;
+    std::string err;
+    if (!shaderc_.Compile(L"shaders/m2_demo.hlsl", L"vsmain", L"vs_6_0", {}, vs, &err))
+    {
+        OutputDebugStringA(("M2 vs compile failed: " + err + "\n").c_str());
+        return false;
+    }
+    if (!shaderc_.Compile(L"shaders/m2_demo.hlsl", L"psmain", L"ps_6_0", {}, ps, &err))
+    {
+        OutputDebugStringA(("M2 ps compile failed: " + err + "\n").c_str());
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = m2RootSig_.Get();
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleMask = UINT_MAX;
+    pd.SampleDesc.Count = 1;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = BackBufferFormat();
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+
+    // Rasterizer — default solid, back-cull, but we want no cull for a simple
+    // demo so winding doesn't matter.
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.FrontCounterClockwise = FALSE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+
+    // Blend — opaque, no blend.
+    for (auto& rt : pd.BlendState.RenderTarget)
+    {
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+
+    // Depth — write+test off (drawing before depth-using passes anyway).
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.StencilEnable = FALSE;
+
+    ThrowIfFailed(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m2Pso_)),
+                  "m2 PSO");
+    NameObject(m2Pso_.Get(), L"m2Pso");
+    return true;
+}
+
 void Renderer::ImGuiSrvAlloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
                              D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
 {
@@ -336,6 +412,15 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
 
     ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap_.Get() };
     cmdList_->SetDescriptorHeaps(1, heaps);
+
+    // M2 demo — IA-less triangle to validate DXC + rootsig + PSO path.
+    if (m2Pso_)
+    {
+        cmdList_->SetGraphicsRootSignature(m2RootSig_.Get());
+        cmdList_->SetPipelineState(m2Pso_.Get());
+        cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmdList_->DrawInstanced(3, 1, 0, 0);
+    }
 }
 
 void Renderer::EndFrame(bool vsync)

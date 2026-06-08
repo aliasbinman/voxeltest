@@ -37,6 +37,11 @@
     <IntDir>$(SolutionDir)build\$(Configuration)\obj\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxcompiler.dll" "$(OutDir)" &gt;NUL
+xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDir)" &gt;NUL</Command>
+      <Message>Copy DXC runtime DLLs</Message>
+    </PostBuildEvent>
     <ClCompile>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <SDLCheck>true</SDLCheck>
@@ -78,6 +83,7 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\renderer.cpp" />
+    <ClCompile Include="src\shader.cpp" />
     <ClCompile Include="src\lw_loader.cpp" />
     <ClCompile Include="third_party\imgui\imgui.cpp" />
     <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
@@ -101,6 +107,7 @@
     <ClInclude Include="src\renderer.h" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="shaders\m2_demo.hlsl" />
     <None Include="shaders\voxel.hlsl" />
     <None Include="shaders\lodworld.hlsl" />
     <None Include="shaders\postfx.hlsl" />

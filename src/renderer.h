@@ -1,6 +1,7 @@
 #pragma once
 #include "camera.h"
 #include "lodworld.h"
+#include "shader.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -180,6 +181,7 @@ public:
 private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
     bool CreateRenderTargets();
+    bool CreateM2Demo();
     void WaitForGpu();
     void MoveToNextFrame();
 
@@ -209,6 +211,11 @@ private:
     HANDLE                           fenceEvent_ = nullptr;
 
     std::unique_ptr<DirectX::GraphicsMemory> graphicsMemory_;
+
+    // M2 — validation demo (DXC compile + rootsig + PSO + IA-less triangle).
+    ShaderCompiler                   shaderc_;
+    ComPtr<ID3D12RootSignature>      m2RootSig_;
+    ComPtr<ID3D12PipelineState>      m2Pso_;
 
     HWND     hwnd_ = nullptr;
     uint32_t width_ = 0;
