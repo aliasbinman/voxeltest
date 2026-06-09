@@ -306,6 +306,7 @@ private:
     ComPtr<ID3D12Resource>            taaSceneTex_;      // resolve output (R11G11B10F)
     ComPtr<ID3D12Resource>            godrayTex_[3];     // [0]=mark, [1,2]=blur ping-pong (64x64 R16F)
     uint32_t                          godrayCurrIdx_ = 0;
+    bool                              godrayHistCleared_ = false;
     // m4TexHeap slot layout (14 entries):
     //   0=visDepthUav   1=visColorUav   2=visDepthSrv   3=visColorSrv
     //   4=taaHistSrv[0] 5=taaHistSrv[1]

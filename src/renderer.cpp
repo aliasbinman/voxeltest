@@ -1144,8 +1144,8 @@ bool Renderer::RecompileShaders()
     if (!buildGfx(vsR.Get(),   psR.Get(),  DXGI_FORMAT_R11G11B10_FLOAT, false, m4ResolveRootSig_.Get(), prs))   return false;
     if (!buildGfx(vsTaa.Get(), psTaa.Get(),DXGI_FORMAT_R11G11B10_FLOAT, false, m4TaaRootSig_.Get(),     ptaa))  return false;
     if (!buildGfx(vsTaa.Get(), psPost.Get(),BackBufferFormat(),         true,  m4PostRootSig_.Get(),    ppost)) return false;
-    if (!buildGfx(vsTaa.Get(), psGrMark.Get(),DXGI_FORMAT_R16_FLOAT,    false, m4GodrayMarkRootSig_.Get(), pgm)) return false;
-    if (!buildGfx(vsTaa.Get(), psGrBlur.Get(),DXGI_FORMAT_R16_FLOAT,    false, m4GodrayBlurRootSig_.Get(), pgb)) return false;
+    if (!buildGfx(vsTaa.Get(), psGrMark.Get(),DXGI_FORMAT_R8_UNORM,    false, m4GodrayMarkRootSig_.Get(), pgm)) return false;
+    if (!buildGfx(vsTaa.Get(), psGrBlur.Get(),DXGI_FORMAT_R8_UNORM,    false, m4GodrayBlurRootSig_.Get(), pgb)) return false;
 
     m4Pass1Pso_       = p1;
     m4Pass2Pso_       = p2;
@@ -1524,9 +1524,9 @@ bool Renderer::CreateM4()
         if (!buildRootSig(rsd, m4GodrayBlurRootSig_, L"m4GodrayBlurRootSig")) return false;
     }
 
-    if (!buildFsTri(vsTaa.Get(), psGrMark.Get(), DXGI_FORMAT_R16_FLOAT, false,
+    if (!buildFsTri(vsTaa.Get(), psGrMark.Get(), DXGI_FORMAT_R8_UNORM, false,
                     m4GodrayMarkRootSig_.Get(), m4GodrayMarkPso_, L"m4GodrayMarkPso")) return false;
-    if (!buildFsTri(vsTaa.Get(), psGrBlur.Get(), DXGI_FORMAT_R16_FLOAT, false,
+    if (!buildFsTri(vsTaa.Get(), psGrBlur.Get(), DXGI_FORMAT_R8_UNORM, false,
                     m4GodrayBlurRootSig_.Get(), m4GodrayBlurPso_, L"m4GodrayBlurPso")) return false;
 
     // RTV heap: 0,1=taaHist 2=taaScene 3=godrayMark 4,5=godrayBlur[1,2].
@@ -1636,10 +1636,10 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rd.Width = 64; rd.Height = 64;
         rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R16_FLOAT;
+        rd.Format = DXGI_FORMAT_R8_UNORM;
         rd.SampleDesc.Count = 1;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        D3D12_CLEAR_VALUE cv{}; cv.Format = DXGI_FORMAT_R16_FLOAT;
+        D3D12_CLEAR_VALUE cv{}; cv.Format = DXGI_FORMAT_R8_UNORM;
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
@@ -1693,7 +1693,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         device_->CreateShaderResourceView (visColor2Tex_.Get(),  &srvUint,         cpu(heap, 9));
         device_->CreateShaderResourceView (taaSceneTex_.Get(),   &srvRgba,         cpu(heap, 10));
         D3D12_SHADER_RESOURCE_VIEW_DESC srvR16{};
-        srvR16.Format = DXGI_FORMAT_R16_FLOAT;
+        srvR16.Format = DXGI_FORMAT_R8_UNORM;
         srvR16.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srvR16.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srvR16.Texture2D.MipLevels = 1;
@@ -1712,7 +1712,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         device_->CreateRenderTargetView(taaHistTex_[1].Get(), &rtvD, h); h.ptr += taaRtvDescSize_;
         device_->CreateRenderTargetView(taaSceneTex_.Get(),   &rtvD, h); h.ptr += taaRtvDescSize_;
         D3D12_RENDER_TARGET_VIEW_DESC rtvGr{};
-        rtvGr.Format = DXGI_FORMAT_R16_FLOAT;
+        rtvGr.Format = DXGI_FORMAT_R8_UNORM;
         rtvGr.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         device_->CreateRenderTargetView(godrayTex_[0].Get(), &rtvGr, h); h.ptr += taaRtvDescSize_;
         device_->CreateRenderTargetView(godrayTex_[1].Get(), &rtvGr, h); h.ptr += taaRtvDescSize_;
@@ -1728,7 +1728,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
     }
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC srvR16{};
-        srvR16.Format = DXGI_FORMAT_R16_FLOAT;
+        srvR16.Format = DXGI_FORMAT_R8_UNORM;
         srvR16.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srvR16.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srvR16.Texture2D.MipLevels = 1;
@@ -1738,6 +1738,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
 
     taaHistValid_[0] = false;
     taaHistValid_[1] = false;
+    godrayHistCleared_ = false;
     taaFrame_ = 0;
     visTexW_ = w;
     visTexH_ = h;
@@ -2268,6 +2269,49 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cbg.godrayStrength = std::max(args.godrayStrength, 0.0f);
     }
     auto cbgAlloc = graphicsMemory_->AllocateConstant(cbg);
+
+    // ---- One-shot history clear: blur ping-pong + taaHist start uninitialized
+    // (PSR state with garbage), so without this the first frame leaks junk into
+    // the EMA chain that never converges out.
+    if (!godrayHistCleared_)
+    {
+        D3D12_RESOURCE_BARRIER tb[5]{};
+        for (int i = 0; i < 3; ++i) {
+            tb[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            tb[i].Transition.pResource   = godrayTex_[i].Get();
+            tb[i].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            tb[i].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            tb[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        for (int i = 0; i < 2; ++i) {
+            tb[3 + i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            tb[3 + i].Transition.pResource   = taaHistTex_[i].Get();
+            tb[3 + i].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            tb[3 + i].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            tb[3 + i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmdList_->ResourceBarrier(5, tb);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv0 = taaRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        // RTV layout: 0,1=taaHist 2=taaScene 3,4,5=godray[0..2].
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvH0 = rtv0;                                   // taaHist[0]
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvH1 = rtv0; rtvH1.ptr += taaRtvDescSize_;     // taaHist[1]
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvG0 = rtv0; rtvG0.ptr += SIZE_T(3) * taaRtvDescSize_;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvG1 = rtv0; rtvG1.ptr += SIZE_T(4) * taaRtvDescSize_;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvG2 = rtv0; rtvG2.ptr += SIZE_T(5) * taaRtvDescSize_;
+        cmdList_->ClearRenderTargetView(rtvH0, zero, 0, nullptr);
+        cmdList_->ClearRenderTargetView(rtvH1, zero, 0, nullptr);
+        cmdList_->ClearRenderTargetView(rtvG0, zero, 0, nullptr);
+        cmdList_->ClearRenderTargetView(rtvG1, zero, 0, nullptr);
+        cmdList_->ClearRenderTargetView(rtvG2, zero, 0, nullptr);
+
+        for (int i = 0; i < 5; ++i)
+            std::swap(tb[i].Transition.StateBefore, tb[i].Transition.StateAfter);
+        cmdList_->ResourceBarrier(5, tb);
+
+        godrayHistCleared_ = true;
+    }
 
     // ---- Godray Mark + Blur (only when strength > 0) ----
     const uint32_t grCurr = godrayCurrIdx_;
