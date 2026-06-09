@@ -1,0 +1,825 @@
+// mca2vox.cpp — convert a Minecraft 1.18+ Java world (Anvil .mca region
+// files) into a single .vox (VXL3). Whole world is scanned; only blocks
+// listed in the hardcoded palette are emitted. VisMask is computed
+// against in-section neighbours only (section boundary faces always
+// visible — slight overdraw, no correctness loss). AO is left zero.
+//
+// Usage:
+//   mca2vox.exe <world_dir> <out.vox>
+//   mca2vox.exe "C:\dev\VoxelAssets\Sulfuria - 4000(1.21.5)" assets\sulfuria.vox
+
+#define _CRT_SECURE_NO_WARNINGS
+#include "asset_version.h"
+#include "miniz.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <filesystem>
+#include <algorithm>
+#include <cmath>
+#include <cassert>
+
+namespace fs = std::filesystem;
+
+// ---------- .vox writer types ----------
+#pragma pack(push, 1)
+struct DiskVoxel
+{
+    uint8_t  x, y, z;
+    uint8_t  visMask;
+    uint16_t paletteIdx;
+    uint8_t  aoPacked[3];
+};
+struct ChunkMeta
+{
+    uint16_t cx, cy, cz, _pad;
+    uint32_t voxelCount;
+    uint32_t voxelOffset;
+};
+#pragma pack(pop)
+static_assert(sizeof(DiskVoxel) == 9, "");
+static_assert(sizeof(ChunkMeta) == 16, "");
+
+// ---------- hardcoded block palette ----------
+struct BlockEntry { const char* name; uint32_t rgb; };
+static const BlockEntry kBlocks[] = {
+    {"stone",                0x808080},
+    {"granite",              0x9C6651},
+    {"polished_granite",     0xA77562},
+    {"diorite",              0xCDCDC4},
+    {"polished_diorite",     0xDADAD3},
+    {"andesite",             0x868686},
+    {"polished_andesite",    0x919191},
+    {"deepslate",            0x4C4C4C},
+    {"cobbled_deepslate",    0x5A5A5A},
+    {"polished_deepslate",   0x595959},
+    {"tuff",                 0x6D6E66},
+    {"calcite",              0xE0E0DC},
+    {"cobblestone",          0x707070},
+    {"mossy_cobblestone",    0x657350},
+    {"dirt",                 0x866043},
+    {"coarse_dirt",          0x76502A},
+    {"rooted_dirt",          0x8D6243},
+    {"podzol",               0x5C3F1B},
+    {"grass_block",          0x507A32},
+    {"farmland",             0x5C3D1F},
+    {"dirt_path",            0x9A7F3F},
+    {"sand",                 0xDED4AD},
+    {"red_sand",             0xA85024},
+    {"gravel",               0x837F7E},
+    {"clay",                 0xA0A7B3},
+    {"water",                0x3F76E4},
+    {"lava",                 0xCF5F19},
+    {"ice",                  0x9FCFFB},
+    {"packed_ice",           0x8FB7FB},
+    {"blue_ice",             0x77A8F9},
+    {"snow_block",           0xF9FAFA},
+    {"snow",                 0xF9FAFA},
+    {"powder_snow",          0xEEF1F5},
+    {"oak_log",              0x6E572B},
+    {"oak_wood",             0x6E572B},
+    {"stripped_oak_log",     0xB58D55},
+    {"oak_planks",           0xB18A55},
+    {"oak_leaves",           0x3F7E2F},
+    {"spruce_log",           0x4B331E},
+    {"stripped_spruce_log",  0x866B41},
+    {"spruce_planks",        0x735232},
+    {"spruce_leaves",        0x2F4F2A},
+    {"birch_log",            0xD7D3C2},
+    {"stripped_birch_log",   0xC9B47B},
+    {"birch_planks",         0xC2A572},
+    {"birch_leaves",         0x6A9A48},
+    {"jungle_log",           0x6B5333},
+    {"stripped_jungle_log",  0xB18154},
+    {"jungle_planks",        0xAB825E},
+    {"jungle_leaves",        0x3D8A19},
+    {"acacia_log",           0x97574A},
+    {"acacia_planks",        0xAB5D33},
+    {"acacia_leaves",        0x6E7F35},
+    {"dark_oak_log",         0x3B2C18},
+    {"dark_oak_planks",      0x432B12},
+    {"dark_oak_leaves",      0x2C4720},
+    {"cherry_log",           0xC58F8B},
+    {"cherry_planks",        0xE2B9B1},
+    {"cherry_leaves",        0xEAB1D3},
+    {"mangrove_log",         0x5B342E},
+    {"mangrove_planks",      0x753D2D},
+    {"mangrove_leaves",      0x71B231},
+    {"netherrack",           0x6B2825},
+    {"crimson_nylium",       0x88291E},
+    {"warped_nylium",        0x2A6E5E},
+    {"soul_sand",            0x564135},
+    {"soul_soil",            0x4D3A2E},
+    {"basalt",               0x4B4949},
+    {"smooth_basalt",        0x4B4949},
+    {"blackstone",           0x2B2530},
+    {"polished_blackstone",  0x342E37},
+    {"end_stone",            0xDADBA8},
+    {"obsidian",             0x14102A},
+    {"crying_obsidian",      0x251A38},
+    {"glowstone",            0xFFB13C},
+    {"sea_lantern",          0xBED3CB},
+    {"shroomlight",          0xE48A2E},
+    {"glass",                0xA7D3F0},
+    {"coal_ore",             0x474747},
+    {"deepslate_coal_ore",   0x3D3D3D},
+    {"iron_ore",             0xA17D60},
+    {"deepslate_iron_ore",   0x7D6852},
+    {"copper_ore",           0xB87333},
+    {"deepslate_copper_ore", 0x8B5A2B},
+    {"gold_ore",             0xFCEE4B},
+    {"deepslate_gold_ore",   0xB6A732},
+    {"diamond_ore",          0x5DECF5},
+    {"deepslate_diamond_ore",0x4FB2BF},
+    {"redstone_ore",         0xA52A2A},
+    {"deepslate_redstone_ore",0x842323},
+    {"lapis_ore",            0x21497B},
+    {"deepslate_lapis_ore",  0x1B3A60},
+    {"emerald_ore",          0x17DD62},
+    {"deepslate_emerald_ore",0x12A24A},
+    {"ancient_debris",       0x5A2E22},
+    {"raw_iron_block",       0xA7846A},
+    {"raw_copper_block",     0xA45F38},
+    {"raw_gold_block",       0xDBB534},
+    {"iron_block",           0xDADADA},
+    {"gold_block",           0xFCEE4B},
+    {"diamond_block",        0x5DECF5},
+    {"emerald_block",        0x17DD62},
+    {"lapis_block",          0x21497B},
+    {"redstone_block",       0xAB1300},
+    {"netherite_block",      0x39363B},
+    {"moss_block",           0x596F2C},
+    {"moss_carpet",          0x596F2C},
+    {"azalea",               0x547435},
+    {"flowering_azalea",     0x856A8F},
+    {"azalea_leaves",        0x547435},
+    {"flowering_azalea_leaves",0x855E91},
+    {"mud",                  0x3A2E26},
+    {"packed_mud",           0x7D5C40},
+    {"mud_bricks",           0x866647},
+    {"sandstone",            0xDBCEA4},
+    {"smooth_sandstone",     0xDBCEA4},
+    {"cut_sandstone",        0xD9CB9F},
+    {"chiseled_sandstone",   0xDBCEA4},
+    {"red_sandstone",        0xA84B1F},
+    {"smooth_red_sandstone", 0xA84B1F},
+    {"terracotta",           0x985E43},
+    {"white_terracotta",     0xD1B1A1},
+    {"orange_terracotta",    0xA15426},
+    {"magenta_terracotta",   0x95576C},
+    {"light_blue_terracotta",0x706C8A},
+    {"yellow_terracotta",    0xB98423},
+    {"lime_terracotta",      0x677535},
+    {"pink_terracotta",      0xA24E4E},
+    {"gray_terracotta",      0x392923},
+    {"light_gray_terracotta",0x876B62},
+    {"cyan_terracotta",      0x575B5B},
+    {"purple_terracotta",    0x764656},
+    {"blue_terracotta",      0x4A3B5B},
+    {"brown_terracotta",     0x4D3324},
+    {"green_terracotta",     0x4C532A},
+    {"red_terracotta",       0x8E3C2E},
+    {"black_terracotta",     0x251710},
+    {"bricks",               0x96503A},
+    {"stone_bricks",         0x7A7A7A},
+    {"mossy_stone_bricks",   0x6F7A5E},
+    {"cracked_stone_bricks", 0x6F6F6F},
+    {"chiseled_stone_bricks",0x787878},
+    {"nether_bricks",        0x2D161A},
+    {"red_nether_bricks",    0x470F0D},
+    {"end_stone_bricks",     0xDADBA8},
+    {"prismarine",           0x69A498},
+    {"prismarine_bricks",    0x5FA298},
+    {"dark_prismarine",      0x355C4A},
+    {"white_wool",           0xE9ECEC},
+    {"orange_wool",          0xF07613},
+    {"magenta_wool",         0xBD44B3},
+    {"light_blue_wool",      0x3AAFD9},
+    {"yellow_wool",          0xF8C627},
+    {"lime_wool",            0x70B919},
+    {"pink_wool",            0xED8DAC},
+    {"gray_wool",            0x3E4447},
+    {"light_gray_wool",      0x8E8E86},
+    {"cyan_wool",            0x158991},
+    {"purple_wool",          0x792AAC},
+    {"blue_wool",            0x35399D},
+    {"brown_wool",           0x724728},
+    {"green_wool",           0x546D1B},
+    {"red_wool",             0xA12722},
+    {"black_wool",           0x141519},
+    {"oak_fence",            0xB18A55},
+    {"oak_stairs",           0xB18A55},
+    {"oak_slab",             0xB18A55},
+    {"stone_stairs",         0x808080},
+    {"stone_slab",           0x808080},
+    {"cobblestone_stairs",   0x707070},
+    {"cobblestone_slab",     0x707070},
+    {"glass_pane",           0xA7D3F0},
+    {"bamboo",               0x819C40},
+    {"bamboo_block",         0x819C40},
+    {"hay_block",            0xA9881A},
+    {"melon",                0xAFAB17},
+    {"pumpkin",              0xBC6915},
+    {"carved_pumpkin",       0xBC6915},
+    {"jack_o_lantern",       0xC97A22},
+    {"cactus",               0x576A2E},
+    {"sugar_cane",           0xAAD477},
+    {"tall_grass",           0x91BD59},
+    {"large_fern",           0x5E7C2E},
+};
+static const int kBlockCount = (int)(sizeof(kBlocks) / sizeof(kBlocks[0]));
+
+// ---------- big-endian readers ----------
+struct R
+{
+    const uint8_t* p;
+    const uint8_t* end;
+    bool ok = true;
+    bool need(size_t n) { if (p + n > end) { ok = false; return false; } return true; }
+    uint8_t  u8()  { if (!need(1)) return 0; return *p++; }
+    int8_t   i8()  { return (int8_t)u8(); }
+    uint16_t u16() { if (!need(2)) return 0; uint16_t v = ((uint16_t)p[0] << 8) | p[1]; p += 2; return v; }
+    int16_t  i16() { return (int16_t)u16(); }
+    uint32_t u32() { if (!need(4)) return 0; uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; p += 4; return v; }
+    int32_t  i32() { return (int32_t)u32(); }
+    uint64_t u64() { if (!need(8)) return 0; uint64_t v = 0; for (int i = 0; i < 8; ++i) v = (v << 8) | p[i]; p += 8; return v; }
+    int64_t  i64() { return (int64_t)u64(); }
+    std::string str() {
+        uint16_t n = u16();
+        if (!need(n)) return {};
+        std::string s((const char*)p, n);
+        p += n;
+        return s;
+    }
+    void skip(size_t n) { if (need(n)) p += n; }
+};
+
+enum {
+    T_END = 0, T_BYTE = 1, T_SHORT = 2, T_INT = 3, T_LONG = 4,
+    T_FLOAT = 5, T_DOUBLE = 6, T_BYTEARR = 7, T_STRING = 8,
+    T_LIST = 9, T_COMPOUND = 10, T_INTARR = 11, T_LONGARR = 12
+};
+
+// Forward decls
+static void SkipPayload(R& r, uint8_t type);
+static void SkipCompound(R& r);
+static void SkipList(R& r);
+
+static void SkipPayload(R& r, uint8_t type)
+{
+    switch (type) {
+    case T_BYTE:    r.skip(1); break;
+    case T_SHORT:   r.skip(2); break;
+    case T_INT:     r.skip(4); break;
+    case T_LONG:    r.skip(8); break;
+    case T_FLOAT:   r.skip(4); break;
+    case T_DOUBLE:  r.skip(8); break;
+    case T_BYTEARR: { int32_t n = r.i32(); r.skip((size_t)std::max(0, n)); break; }
+    case T_STRING:  { (void)r.str(); break; }
+    case T_LIST:    SkipList(r); break;
+    case T_COMPOUND: SkipCompound(r); break;
+    case T_INTARR:  { int32_t n = r.i32(); r.skip((size_t)std::max(0, n) * 4); break; }
+    case T_LONGARR: { int32_t n = r.i32(); r.skip((size_t)std::max(0, n) * 8); break; }
+    default: r.ok = false; break;
+    }
+}
+
+static void SkipList(R& r)
+{
+    uint8_t t = r.u8();
+    int32_t n = r.i32();
+    for (int32_t i = 0; i < n && r.ok; ++i) SkipPayload(r, t);
+}
+
+static void SkipCompound(R& r)
+{
+    while (r.ok) {
+        uint8_t t = r.u8();
+        if (t == T_END) return;
+        (void)r.str();
+        SkipPayload(r, t);
+    }
+}
+
+// ---------- per-section block extractor ----------
+struct SectionData
+{
+    int8_t y = 0;
+    std::vector<uint16_t> indices; // 4096 entries, palette index into local palette
+    std::vector<std::string> palette;
+};
+
+// Decode block_states data LongArray into 4096 indices.
+// 1.16+ packing: bits = max(4, ceil(log2(palLen))). Indices packed low-bit
+// first; no spanning across longs.
+static void DecodeBlockStates(const std::vector<uint64_t>& longs, int palLen,
+                              std::vector<uint16_t>& out)
+{
+    out.assign(4096, 0);
+    if (palLen <= 1) return;                       // single-block section
+    int bits = 4;
+    while ((1 << bits) < palLen) ++bits;
+    int perLong = 64 / bits;
+    uint64_t mask = (bits == 64) ? ~0ull : ((1ull << bits) - 1ull);
+    int total = 4096;
+    if ((int)longs.size() * perLong < total) {
+        // malformed
+        return;
+    }
+    int li = 0, slot = 0;
+    for (int i = 0; i < total; ++i) {
+        uint64_t v = (longs[li] >> (slot * bits)) & mask;
+        out[i] = (uint16_t)v;
+        if (++slot == perLong) { slot = 0; ++li; }
+    }
+}
+
+// Parse one chunk's NBT payload. Extract sections into `outSecs`.
+// Returns false on parse error.
+static bool ParseChunkNbt(const uint8_t* nbt, size_t nbtLen,
+                          std::vector<SectionData>& outSecs)
+{
+    R r{ nbt, nbt + nbtLen };
+    // Root is named TAG_Compound
+    uint8_t rootT = r.u8();
+    if (rootT != T_COMPOUND) return false;
+    (void)r.str(); // root name (usually "")
+
+    // Walk root compound; find "sections" list.
+    while (r.ok) {
+        uint8_t t = r.u8();
+        if (t == T_END) break;
+        std::string name = r.str();
+        if (t == T_LIST && name == "sections") {
+            uint8_t lt = r.u8();
+            int32_t n = r.i32();
+            if (lt != T_COMPOUND) { for (int i = 0; i < n && r.ok; ++i) SkipPayload(r, lt); continue; }
+            for (int i = 0; i < n && r.ok; ++i) {
+                SectionData sd;
+                bool haveY = false, haveBs = false;
+                // section compound
+                while (r.ok) {
+                    uint8_t tt = r.u8();
+                    if (tt == T_END) break;
+                    std::string sn = r.str();
+                    if (tt == T_BYTE && sn == "Y") { sd.y = r.i8(); haveY = true; }
+                    else if (tt == T_COMPOUND && sn == "block_states") {
+                        // inside block_states: palette (list of compound), data (LongArray)
+                        std::vector<uint64_t> dataLongs;
+                        int palLen = 0;
+                        while (r.ok) {
+                            uint8_t bt = r.u8();
+                            if (bt == T_END) break;
+                            std::string bn = r.str();
+                            if (bt == T_LIST && bn == "palette") {
+                                uint8_t plt = r.u8();
+                                int32_t pn = r.i32();
+                                if (plt != T_COMPOUND) {
+                                    for (int j = 0; j < pn && r.ok; ++j) SkipPayload(r, plt);
+                                } else {
+                                    palLen = pn;
+                                    sd.palette.reserve(pn);
+                                    for (int j = 0; j < pn && r.ok; ++j) {
+                                        // palette entry compound: { Name: string, Properties: compound? }
+                                        std::string blockName;
+                                        while (r.ok) {
+                                            uint8_t pt = r.u8();
+                                            if (pt == T_END) break;
+                                            std::string pName = r.str();
+                                            if (pt == T_STRING && pName == "Name") blockName = r.str();
+                                            else SkipPayload(r, pt);
+                                        }
+                                        sd.palette.push_back(blockName);
+                                    }
+                                }
+                            } else if (bt == T_LONGARR && bn == "data") {
+                                int32_t dn = r.i32();
+                                dataLongs.resize((size_t)std::max(0, dn));
+                                for (int32_t j = 0; j < dn && r.ok; ++j) dataLongs[j] = r.u64();
+                            } else {
+                                SkipPayload(r, bt);
+                            }
+                        }
+                        DecodeBlockStates(dataLongs, palLen, sd.indices);
+                        haveBs = true;
+                    } else {
+                        SkipPayload(r, tt);
+                    }
+                }
+                if (haveY && haveBs && !sd.palette.empty())
+                    outSecs.push_back(std::move(sd));
+            }
+        } else {
+            SkipPayload(r, t);
+        }
+    }
+    return r.ok;
+}
+
+// ---------- block name → output palette index ----------
+struct GlobalPal
+{
+    std::unordered_map<std::string, int16_t> nameToIdx;
+    std::vector<uint32_t> rgb;            // 0xRRGGBB
+    int16_t Get(const std::string& fullName)
+    {
+        // strip "minecraft:" prefix
+        const char* s = fullName.c_str();
+        if (!strncmp(s, "minecraft:", 10)) s += 10;
+        auto it = nameToIdx.find(s);
+        if (it != nameToIdx.end()) return it->second;
+        // search hardcoded table
+        for (int i = 0; i < kBlockCount; ++i) {
+            if (!strcmp(kBlocks[i].name, s)) {
+                int16_t idx = (int16_t)rgb.size();
+                rgb.push_back(kBlocks[i].rgb);
+                nameToIdx.emplace(s, idx);
+                return idx;
+            }
+        }
+        nameToIdx.emplace(s, (int16_t)-1);   // unknown → skip
+        return -1;
+    }
+};
+
+// ---------- region scan ----------
+static bool DecompressZlib(const uint8_t* in, size_t inLen,
+                           std::vector<uint8_t>& out)
+{
+    // Start with 4× estimate; grow on overflow.
+    out.resize(std::max<size_t>(64 * 1024, inLen * 8));
+    while (true) {
+        mz_ulong outLen = (mz_ulong)out.size();
+        int rc = mz_uncompress(out.data(), &outLen, in, (mz_ulong)inLen);
+        if (rc == MZ_OK) { out.resize(outLen); return true; }
+        if (rc == MZ_BUF_ERROR) { out.resize(out.size() * 2); continue; }
+        return false;
+    }
+}
+
+struct OutChunk
+{
+    std::vector<DiskVoxel> voxels;
+};
+
+// Per-mc-column dense solidity bitset for full Y range [byMin..byMax).
+// Sized 16 (lx) × 16 (lz) × Ycount bits.
+struct ColSolid
+{
+    std::vector<uint64_t> bits;
+};
+
+// Iterate all parseable chunks in all regions. cb(mcCX, mcCZ, sections).
+template <class Cb>
+static void ForEachChunk(const std::vector<struct RegionFile_>& regs, Cb cb);
+
+struct RegionFile_ { fs::path path; int rx, rz; };
+
+template <class Cb>
+static void ForEachChunk(const std::vector<RegionFile_>& regs, Cb cb)
+{
+    std::vector<uint8_t> regBytes, nbtBuf;
+    for (size_t ri = 0; ri < regs.size(); ++ri) {
+        auto& reg = regs[ri];
+        FILE* f = fopen(reg.path.string().c_str(), "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        size_t sz = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        regBytes.resize(sz);
+        if (fread(regBytes.data(), 1, sz, f) != sz) { fclose(f); continue; }
+        fclose(f);
+        if (sz < 8192) continue;
+
+        for (int idx = 0; idx < 1024; ++idx) {
+            const uint8_t* loc = &regBytes[idx * 4];
+            uint32_t off = ((uint32_t)loc[0] << 16) | ((uint32_t)loc[1] << 8) | loc[2];
+            uint32_t scnt = loc[3];
+            if (off == 0 || scnt == 0) continue;
+            size_t fileOff = (size_t)off * 4096;
+            if (fileOff + 5 > sz) continue;
+            const uint8_t* hdr = &regBytes[fileOff];
+            uint32_t clen = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16)
+                          | ((uint32_t)hdr[2] << 8)  | hdr[3];
+            uint8_t cType = hdr[4];
+            if (clen == 0 || clen > sz - fileOff - 4) continue;
+            const uint8_t* payload = hdr + 5;
+            size_t payloadLen = clen - 1;
+
+            const uint8_t* nbtPtr = nullptr;
+            size_t nbtLen = 0;
+            if (cType == 2) {
+                if (!DecompressZlib(payload, payloadLen, nbtBuf)) continue;
+                nbtPtr = nbtBuf.data();
+                nbtLen = nbtBuf.size();
+            } else if (cType == 3) {
+                nbtPtr = payload;
+                nbtLen = payloadLen;
+            } else {
+                continue;
+            }
+
+            std::vector<SectionData> secs;
+            if (!ParseChunkNbt(nbtPtr, nbtLen, secs)) continue;
+
+            int cxInReg = idx & 31;
+            int czInReg = idx >> 5;
+            int mcCX = reg.rx * 32 + cxInReg;
+            int mcCZ = reg.rz * 32 + czInReg;
+            cb(mcCX, mcCZ, secs, ri);
+        }
+    }
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 3) {
+        fprintf(stderr, "usage: mca2vox <world_dir> <out.vox>\n");
+        return 1;
+    }
+    const char* worldPath = argv[1];
+    const char* outPath = argv[2];
+    const int   D = 64;                       // chunkDim of output
+
+    fs::path regionDir = fs::path(worldPath) / "region";
+    if (!fs::is_directory(regionDir)) {
+        fprintf(stderr, "no region/ subdir under %s\n", worldPath);
+        return 1;
+    }
+
+    // First sweep: list region files + their (rx,rz).
+    std::vector<RegionFile_> regions;
+    for (auto& de : fs::directory_iterator(regionDir)) {
+        if (!de.is_regular_file()) continue;
+        std::string name = de.path().filename().string();
+        int rx, rz;
+        if (sscanf(name.c_str(), "r.%d.%d.mca", &rx, &rz) == 2) {
+            regions.push_back({ de.path(), rx, rz });
+        }
+    }
+    if (regions.empty()) {
+        fprintf(stderr, "no r.X.Z.mca files in %s\n", regionDir.string().c_str());
+        return 1;
+    }
+    printf("[mca2vox] world=%s regions=%zu\n", worldPath, regions.size());
+
+    // World AABB in block coords.
+    int32_t bxMin = INT32_MAX, bxMax = INT32_MIN;
+    int32_t bzMin = INT32_MAX, bzMax = INT32_MIN;
+    for (auto& r : regions) {
+        int32_t x0 = r.rx * 512, z0 = r.rz * 512;
+        bxMin = std::min(bxMin, x0);
+        bzMin = std::min(bzMin, z0);
+        bxMax = std::max(bxMax, x0 + 512);
+        bzMax = std::max(bzMax, z0 + 512);
+    }
+    const int32_t byMin = -64;
+    const int32_t byMax = 320;
+
+    // Output chunk grid dims (round-up).
+    auto Ceil = [](int32_t v, int32_t d) { return (v + d - 1) / d; };
+    int32_t gridX = Ceil(bxMax - bxMin, D);
+    int32_t gridY = Ceil(byMax - byMin, D);
+    int32_t gridZ = Ceil(bzMax - bzMin, D);
+    printf("[mca2vox] bounds x[%d..%d] y[%d..%d] z[%d..%d] grid=%dx%dx%d\n",
+           bxMin, bxMax, byMin, byMax, bzMin, bzMax, gridX, gridY, gridZ);
+    if (gridX > 0xFFFF || gridY > 0xFFFF || gridZ > 0xFFFF) {
+        fprintf(stderr, "grid too large for uint16 ChunkMeta\n");
+        return 1;
+    }
+
+    auto ChunkKey = [&](int32_t cx, int32_t cy, int32_t cz) -> uint64_t {
+        return ((uint64_t)(uint32_t)cx)
+             | ((uint64_t)(uint32_t)cy << 20)
+             | ((uint64_t)(uint32_t)cz << 40);
+    };
+    std::unordered_map<uint64_t, OutChunk> outChunks;
+
+    GlobalPal pal;
+
+    // ----- Pass 1: build global per-mc-column solidity bitset. -----
+    const int yCount = byMax - byMin;           // e.g. 384
+    const int bitsPerCol = 16 * 16 * yCount;
+    const int u64PerCol = (bitsPerCol + 63) / 64;
+    auto ColIdx = [&](int lx, int ly, int lz) { return (ly * 16 + lz) * 16 + lx; };
+
+    std::unordered_map<uint64_t, ColSolid> globalSolid;
+    auto McKey = [](int cx, int cz) -> uint64_t {
+        return ((uint64_t)(uint32_t)cx) | ((uint64_t)(uint32_t)cz << 32);
+    };
+
+    size_t pass1Chunks = 0;
+    ForEachChunk(regions, [&](int mcCX, int mcCZ, std::vector<SectionData>& secs, size_t ri) {
+        ColSolid* col = nullptr;
+        for (auto& sd : secs) {
+            int32_t baseY = (int32_t)sd.y * 16;
+            if (baseY < byMin || baseY + 16 > byMax) {
+                // partial overlap handled per-voxel below
+            }
+            // Map palette names to keep/skip.
+            std::vector<int16_t> localToGlobal(sd.palette.size());
+            bool anyKept = false;
+            for (size_t pi = 0; pi < sd.palette.size(); ++pi) {
+                localToGlobal[pi] = pal.Get(sd.palette[pi]);
+                if (localToGlobal[pi] >= 0) anyKept = true;
+            }
+            if (!anyKept) continue;
+
+            for (int y = 0; y < 16; ++y) {
+                int32_t wy = baseY + y;
+                if (wy < byMin || wy >= byMax) continue;
+                int ly = wy - byMin;
+                for (int z = 0; z < 16; ++z)
+                for (int x = 0; x < 16; ++x) {
+                    int li = (y * 16 + z) * 16 + x;
+                    int pi = sd.indices[li];
+                    if (pi < 0 || pi >= (int)localToGlobal.size()) continue;
+                    if (localToGlobal[pi] < 0) continue;
+                    if (!col) {
+                        col = &globalSolid[McKey(mcCX, mcCZ)];
+                        col->bits.assign(u64PerCol, 0);
+                    }
+                    int ci = ColIdx(x, ly, z);
+                    col->bits[ci >> 6] |= (uint64_t)1 << (ci & 63);
+                }
+            }
+        }
+        ++pass1Chunks;
+        if ((ri & 7) == 0 && (pass1Chunks & 1023) == 0) {
+            printf("[pass1] regions ~%zu/%zu  chunks=%zu  cols=%zu  pal=%zu\n",
+                   ri + 1, regions.size(), pass1Chunks, globalSolid.size(), pal.rgb.size());
+        }
+    });
+    printf("[pass1] done  chunks=%zu  solid-cols=%zu  pal=%zu  colMem~%.1f MB\n",
+           pass1Chunks, globalSolid.size(), pal.rgb.size(),
+           (double)globalSolid.size() * u64PerCol * 8.0 / (1024 * 1024));
+
+    // ----- Pass 2: re-scan, emit voxels with global-neighbour visMask, cull vm==0. -----
+    auto SolidAt = [&](int mcCX, int mcCZ, int lx, int ly, int lz) -> bool {
+        if (ly < 0 || ly >= yCount) return false;
+        // wrap lx/lz across mc-chunk boundaries
+        int dx = 0, dz = 0;
+        if (lx < 0)      { dx = -1; lx += 16; }
+        else if (lx >= 16) { dx = +1; lx -= 16; }
+        if (lz < 0)      { dz = -1; lz += 16; }
+        else if (lz >= 16) { dz = +1; lz -= 16; }
+        auto it = globalSolid.find(McKey(mcCX + dx, mcCZ + dz));
+        if (it == globalSolid.end()) return false;
+        int ci = ColIdx(lx, ly, lz);
+        return (it->second.bits[ci >> 6] >> (ci & 63)) & 1ull;
+    };
+
+    size_t totalVoxels = 0;
+    size_t pass2Chunks = 0;
+    ForEachChunk(regions, [&](int mcCX, int mcCZ, std::vector<SectionData>& secs, size_t ri) {
+        int32_t chunkBaseX = mcCX * 16;
+        int32_t chunkBaseZ = mcCZ * 16;
+        for (auto& sd : secs) {
+            int32_t baseY = (int32_t)sd.y * 16;
+            if (baseY + 16 <= byMin || baseY >= byMax) continue;
+
+            std::vector<int16_t> localToGlobal(sd.palette.size());
+            bool anyKept = false;
+            for (size_t pi = 0; pi < sd.palette.size(); ++pi) {
+                localToGlobal[pi] = pal.Get(sd.palette[pi]);
+                if (localToGlobal[pi] >= 0) anyKept = true;
+            }
+            if (!anyKept) continue;
+
+            for (int y = 0; y < 16; ++y) {
+                int32_t wy = baseY + y;
+                if (wy < byMin || wy >= byMax) continue;
+                int ly = wy - byMin;
+                for (int z = 0; z < 16; ++z)
+                for (int x = 0; x < 16; ++x) {
+                    int li = (y * 16 + z) * 16 + x;
+                    int pi = sd.indices[li];
+                    if (pi < 0 || pi >= (int)localToGlobal.size()) continue;
+                    int16_t g = localToGlobal[pi];
+                    if (g < 0) continue;
+
+                    // Cross-section / cross-chunk neighbour lookup via globalSolid.
+                    uint8_t vm = 0;
+                    if (!SolidAt(mcCX, mcCZ, x + 1, ly, z)) vm |= 1u << 0;
+                    if (!SolidAt(mcCX, mcCZ, x - 1, ly, z)) vm |= 1u << 1;
+                    if (!SolidAt(mcCX, mcCZ, x, ly + 1, z)) vm |= 1u << 2;
+                    // -Y bit always 0 per format spec
+                    if (!SolidAt(mcCX, mcCZ, x, ly, z + 1)) vm |= 1u << 4;
+                    if (!SolidAt(mcCX, mcCZ, x, ly, z - 1)) vm |= 1u << 5;
+                    if (vm == 0) continue;          // fully occluded → cull
+
+                    int32_t wx = chunkBaseX + x - bxMin;
+                    int32_t wyo = wy - byMin;
+                    int32_t wz = chunkBaseZ + z - bzMin;
+                    int32_t cx = wx / D, lx = wx % D;
+                    int32_t cy = wyo / D, lyc = wyo % D;
+                    int32_t cz = wz / D, lz = wz % D;
+
+                    DiskVoxel dv{};
+                    dv.x = (uint8_t)lx;
+                    dv.y = (uint8_t)lyc;
+                    dv.z = (uint8_t)lz;
+                    dv.visMask = vm;
+                    dv.paletteIdx = (uint16_t)g;
+                    OutChunk& oc = outChunks[ChunkKey(cx, cy, cz)];
+                    oc.voxels.push_back(dv);
+                    ++totalVoxels;
+                }
+            }
+        }
+        ++pass2Chunks;
+        if ((ri & 7) == 0 && (pass2Chunks & 1023) == 0) {
+            printf("[pass2] regions ~%zu/%zu  chunks=%zu  voxels=%zu\n",
+                   ri + 1, regions.size(), pass2Chunks, totalVoxels);
+        }
+    });
+    printf("[pass2] done  chunks=%zu  voxels=%zu\n", pass2Chunks, totalVoxels);
+
+    if (outChunks.empty()) {
+        fprintf(stderr, "no voxels emitted (palette empty?)\n");
+        return 1;
+    }
+
+    // Build sequential output: deterministic chunk order by (cy,cz,cx).
+    struct ChunkRec { int32_t cx, cy, cz; OutChunk* oc; };
+    std::vector<ChunkRec> chunks;
+    chunks.reserve(outChunks.size());
+    for (auto& kv : outChunks) {
+        uint64_t k = kv.first;
+        int32_t cx = (int32_t)(k & 0xFFFFFull);
+        int32_t cy = (int32_t)((k >> 20) & 0xFFFFFull);
+        int32_t cz = (int32_t)((k >> 40) & 0xFFFFFull);
+        chunks.push_back({ cx, cy, cz, &kv.second });
+    }
+    std::sort(chunks.begin(), chunks.end(),
+              [](const ChunkRec& a, const ChunkRec& b) {
+                  if (a.cy != b.cy) return a.cy < b.cy;
+                  if (a.cz != b.cz) return a.cz < b.cz;
+                  return a.cx < b.cx;
+              });
+
+    // Write .vox.
+    FILE* fo = fopen(outPath, "wb");
+    if (!fo) { fprintf(stderr, "open %s for write failed\n", outPath); return 1; }
+
+    char magic[4] = { 'V', 'X', 'L', '3' };
+    fwrite(magic, 1, 4, fo);
+    uint32_t version = kAssetVersion;
+    fwrite(&version, 4, 1, fo);
+    uint32_t cd = (uint32_t)D;
+    fwrite(&cd, 4, 1, fo);
+    uint32_t cc = (uint32_t)chunks.size();
+    fwrite(&cc, 4, 1, fo);
+    uint32_t tv = (uint32_t)totalVoxels;
+    fwrite(&tv, 4, 1, fo);
+    int32_t origin[3] = { bxMin, byMin, bzMin };
+    fwrite(origin, 4, 3, fo);
+    float sunDir[3] = { -0.4f, -1.0f, -0.3f };
+    {
+        float L = std::sqrt(sunDir[0] * sunDir[0] + sunDir[1] * sunDir[1] + sunDir[2] * sunDir[2]);
+        sunDir[0] /= L; sunDir[1] /= L; sunDir[2] /= L;
+    }
+    fwrite(sunDir, 4, 3, fo);
+    uint32_t palCount = (uint32_t)pal.rgb.size();
+    fwrite(&palCount, 4, 1, fo);
+    for (uint32_t rgb : pal.rgb) {
+        uint8_t r = (uint8_t)((rgb >> 16) & 0xFF);
+        uint8_t g = (uint8_t)((rgb >> 8) & 0xFF);
+        uint8_t b = (uint8_t)(rgb & 0xFF);
+        uint32_t rgba = ((uint32_t)0xFFu << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
+        fwrite(&rgba, 4, 1, fo);
+    }
+
+    // Chunk metas (need offsets pre-compute).
+    uint32_t off = 0;
+    std::vector<uint32_t> offs(chunks.size());
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        offs[i] = off;
+        off += (uint32_t)chunks[i].oc->voxels.size();
+    }
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        ChunkMeta m{};
+        m.cx = (uint16_t)chunks[i].cx;
+        m.cy = (uint16_t)chunks[i].cy;
+        m.cz = (uint16_t)chunks[i].cz;
+        m._pad = 0;
+        m.voxelCount = (uint32_t)chunks[i].oc->voxels.size();
+        m.voxelOffset = offs[i];
+        fwrite(&m, sizeof(m), 1, fo);
+    }
+    // Voxel payload.
+    for (auto& c : chunks) {
+        if (!c.oc->voxels.empty())
+            fwrite(c.oc->voxels.data(), sizeof(DiskVoxel), c.oc->voxels.size(), fo);
+    }
+    fclose(fo);
+
+    printf("[mca2vox] wrote %s  chunks=%zu  voxels=%zu  palette=%zu\n",
+           outPath, chunks.size(), totalVoxels, pal.rgb.size());
+    return 0;
+}

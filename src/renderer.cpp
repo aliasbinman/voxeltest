@@ -2104,9 +2104,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         for (int L = 0; L < lw::kLodCount; ++L)
         {
             if (perLodWl[L].empty()) continue;
+            const LwGpu& g = lwGpu_[L];
+            if (!g.chunkInfoSb || !g.blockPosSb) continue;   // LOD upload still pending
             if (!firstPass1) uavBarrierDepth();
             firstPass1 = false;
-            const LwGpu& g = lwGpu_[L];
             cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc[L].GpuAddress());
             cmdList_->SetComputeRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
             cmdList_->SetComputeRootShaderResourceView(3, g.blockPosSb->GetGPUVirtualAddress());
@@ -2139,9 +2140,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         for (int L = 0; L < lw::kLodCount; ++L)
         {
             if (perLodWl[L].empty()) continue;
+            const LwGpu& g = lwGpu_[L];
+            if (!g.chunkInfoSb || !g.paletteSb || !g.blockPosSb || !g.blockColSb) continue;
             if (!firstPass2) uavBarrierColor();
             firstPass2 = false;
-            const LwGpu& g = lwGpu_[L];
             cmdList_->SetComputeRootConstantBufferView(1, cbcsAlloc[L].GpuAddress());
             cmdList_->SetComputeRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
             cmdList_->SetComputeRootShaderResourceView(3, g.paletteSb->GetGPUVirtualAddress());
