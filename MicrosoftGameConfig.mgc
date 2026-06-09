@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Game configVersion="0">
+  <Identity Name="8A2B6C9E-4DF1-4E1B-9C2A-1F3E5A6B7C8D"
+            Publisher="CN=voxeltest"
+            Version="1.0.0.0"/>
+  <ExecutableList>
+    <Executable Name="voxeltest_xbox.exe" Id="Game"/>
+  </ExecutableList>
+  <ShellVisuals DefaultDisplayName="voxeltest"
+                PublisherDisplayName="voxeltest"
+                StoreLogo="Assets\StoreLogo.png"
+                Square150x150Logo="Assets\Logo.png"
+                Square44x44Logo="Assets\SmallLogo.png"
+                Square480x480Logo="Assets\LargeLogo.png"
+                Description="voxeltest Scarlett"
+                ForegroundText="light"
+                BackgroundColor="#1a1a2e"
+                SplashScreenImage="Assets\SplashScreen.png"/>
+</Game>

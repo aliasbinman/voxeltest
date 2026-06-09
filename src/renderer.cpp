@@ -944,7 +944,7 @@ bool Renderer::RecompileShaders()
 {
     // Recompile each entry. Build new PSOs into temp ComPtrs. Only swap in if
     // EVERY compile succeeded — partial reload is worse than none.
-    ComPtr<IDxcBlob> cs1, cs2, csDilate, vsR, psR, vsTaa, psTaa, psPost;
+    ComPtr<IDxcBlob> cs1, cs2, csDilate, vsR, psR, vsTaa, psTaa, psPost, psGrMark, psGrBlur;
     std::string err;
     auto comp = [&](const wchar_t* path, const wchar_t* entry, const wchar_t* profile,
                     ComPtr<IDxcBlob>& out, const char* tag) -> bool
@@ -964,6 +964,8 @@ bool Renderer::RecompileShaders()
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"vsmain_taa",         L"vs_6_0", vsTaa, "vsTaa")) return false;
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_taa",         L"ps_6_0", psTaa, "psTaa")) return false;
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_post",        L"ps_6_0", psPost,"psPost")) return false;
+    if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_godray_mark", L"ps_6_0", psGrMark, "psGrMark")) return false;
+    if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_godray_blur", L"ps_6_0", psGrBlur, "psGrBlur")) return false;
 
     // Wait for GPU idle before swapping PSOs — old PSOs may still be in flight.
     WaitForGpu();
@@ -999,20 +1001,24 @@ bool Renderer::RecompileShaders()
         return SUCCEEDED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&outNew)));
     };
 
-    ComPtr<ID3D12PipelineState> p1, p2, pd, prs, ptaa, ppost;
+    ComPtr<ID3D12PipelineState> p1, p2, pd, prs, ptaa, ppost, pgm, pgb;
     if (!buildCs(m4Pass1RootSig_.Get(),  cs1.Get(),      p1))   return false;
     if (!buildCs(m4Pass2RootSig_.Get(),  cs2.Get(),      p2))   return false;
     if (!buildCs(m4DilateRootSig_.Get(), csDilate.Get(), pd))   return false;
-    if (!buildGfx(vsR.Get(),   psR.Get(),  DXGI_FORMAT_R11G11B10_FLOAT, false, m4ResolveRootSig_.Get(), prs))   return false;
-    if (!buildGfx(vsTaa.Get(), psTaa.Get(),DXGI_FORMAT_R11G11B10_FLOAT, false, m4TaaRootSig_.Get(),     ptaa))  return false;
+    if (!buildGfx(vsR.Get(),   psR.Get(),  DXGI_FORMAT_R16G16B16A16_FLOAT, false, m4ResolveRootSig_.Get(), prs))   return false;
+    if (!buildGfx(vsTaa.Get(), psTaa.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT, false, m4TaaRootSig_.Get(),     ptaa))  return false;
     if (!buildGfx(vsTaa.Get(), psPost.Get(),BackBufferFormat(),         true,  m4PostRootSig_.Get(),    ppost)) return false;
+    if (!buildGfx(vsTaa.Get(), psGrMark.Get(),DXGI_FORMAT_R16_FLOAT,    false, m4GodrayMarkRootSig_.Get(), pgm)) return false;
+    if (!buildGfx(vsTaa.Get(), psGrBlur.Get(),DXGI_FORMAT_R16_FLOAT,    false, m4GodrayBlurRootSig_.Get(), pgb)) return false;
 
-    m4Pass1Pso_   = p1;
-    m4Pass2Pso_   = p2;
-    m4DilatePso_  = pd;
-    m4ResolvePso_ = prs;
-    m4TaaPso_     = ptaa;
-    m4PostPso_    = ppost;
+    m4Pass1Pso_       = p1;
+    m4Pass2Pso_       = p2;
+    m4DilatePso_      = pd;
+    m4ResolvePso_     = prs;
+    m4TaaPso_         = ptaa;
+    m4PostPso_        = ppost;
+    m4GodrayMarkPso_  = pgm;
+    m4GodrayBlurPso_  = pgb;
     return true;
 }
 
@@ -1021,7 +1027,7 @@ bool Renderer::RecompileShaders()
 bool Renderer::CreateM4()
 {
     D3D12_DESCRIPTOR_HEAP_DESC td{};
-    td.NumDescriptors = 13;
+    td.NumDescriptors = 14;
     td.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     td.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(device_->CreateDescriptorHeap(&td, IID_PPV_ARGS(&m4TexHeap_)),
@@ -1265,7 +1271,7 @@ bool Renderer::CreateM4()
         return true;
     };
 
-    ComPtr<IDxcBlob> cs1, cs2, csDilate, vsR, psR, vsTaa, psTaa, psPost;
+    ComPtr<IDxcBlob> cs1, cs2, csDilate, vsR, psR, vsTaa, psTaa, psPost, psGrMark, psGrBlur;
     std::string err;
     if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"csmain_pass1_depth", L"cs_6_0", {}, cs1, &err))
     { OutputDebugStringA(("[m4] cs1 compile: " + err + "\n").c_str()); return false; }
@@ -1283,6 +1289,10 @@ bool Renderer::CreateM4()
     { OutputDebugStringA(("[m4] psTaa compile: " + err + "\n").c_str()); return false; }
     if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"psmain_post", L"ps_6_0", {}, psPost, &err))
     { OutputDebugStringA(("[m4] psPost compile: " + err + "\n").c_str()); return false; }
+    if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"psmain_godray_mark", L"ps_6_0", {}, psGrMark, &err))
+    { OutputDebugStringA(("[m4] psGrMark compile: " + err + "\n").c_str()); return false; }
+    if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"psmain_godray_blur", L"ps_6_0", {}, psGrBlur, &err))
+    { OutputDebugStringA(("[m4] psGrBlur compile: " + err + "\n").c_str()); return false; }
 
     if (!buildComputePso(m4Pass1RootSig_.Get(), cs1.Get(), m4Pass1Pso_, L"m4Pass1Pso")) return false;
     if (!buildComputePso(m4Pass2RootSig_.Get(), cs2.Get(), m4Pass2Pso_, L"m4Pass2Pso")) return false;
@@ -1314,16 +1324,70 @@ bool Renderer::CreateM4()
         NameObject(out.Get(), name);
         return true;
     };
-    if (!buildFsTri(vsR.Get(), psR.Get(),    DXGI_FORMAT_R11G11B10_FLOAT, false,
+    if (!buildFsTri(vsR.Get(), psR.Get(),    DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                     m4ResolveRootSig_.Get(), m4ResolvePso_, L"m4ResolvePso")) return false;
-    if (!buildFsTri(vsTaa.Get(), psTaa.Get(), DXGI_FORMAT_R11G11B10_FLOAT, false,
+    if (!buildFsTri(vsTaa.Get(), psTaa.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                     m4TaaRootSig_.Get(), m4TaaPso_, L"m4TaaPso")) return false;
     if (!buildFsTri(vsTaa.Get(), psPost.Get(), BackBufferFormat(),         true,
                     m4PostRootSig_.Get(), m4PostPso_, L"m4PostPso")) return false;
 
-    // RTV heap: slots 0,1=taaHist[0,1] 2=taaScene.
+    // Godray Mark root sig: CBV b0 (frame for gScreenSize), CBV b3 (godray),
+    // table SRV t6 (gPostDepth = visDepth2), static linear sampler s0.
+    {
+        D3D12_DESCRIPTOR_RANGE depthRange{};
+        depthRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        depthRange.NumDescriptors = 1;
+        depthRange.BaseShaderRegister = 6;
+        D3D12_ROOT_PARAMETER p[3]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0,0};
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {3,0};
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[2].DescriptorTable = {1, &depthRange};
+        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 3;
+        rsd.pParameters = p;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &ssLinear;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        if (!buildRootSig(rsd, m4GodrayMarkRootSig_, L"m4GodrayMarkRootSig")) return false;
+    }
+
+    // Godray Blur root sig: CBV b3 (godray), table SRV t9 (mark), table SRV t10 (prev blur),
+    // static linear sampler s0 (mapped to gTaaSamp in shader).
+    {
+        D3D12_DESCRIPTOR_RANGE markRange{};
+        markRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        markRange.NumDescriptors = 1;
+        markRange.BaseShaderRegister = 9;
+        D3D12_DESCRIPTOR_RANGE histRange{};
+        histRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        histRange.NumDescriptors = 1;
+        histRange.BaseShaderRegister = 10;
+        D3D12_ROOT_PARAMETER p[3]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {3,0};
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable = {1, &markRange};
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[2].DescriptorTable = {1, &histRange};
+        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 3;
+        rsd.pParameters = p;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &ssLinear;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        if (!buildRootSig(rsd, m4GodrayBlurRootSig_, L"m4GodrayBlurRootSig")) return false;
+    }
+
+    if (!buildFsTri(vsTaa.Get(), psGrMark.Get(), DXGI_FORMAT_R16_FLOAT, false,
+                    m4GodrayMarkRootSig_.Get(), m4GodrayMarkPso_, L"m4GodrayMarkPso")) return false;
+    if (!buildFsTri(vsTaa.Get(), psGrBlur.Get(), DXGI_FORMAT_R16_FLOAT, false,
+                    m4GodrayBlurRootSig_.Get(), m4GodrayBlurPso_, L"m4GodrayBlurPso")) return false;
+
+    // RTV heap: 0,1=taaHist 2=taaScene 3=godrayMark 4,5=godrayBlur[1,2].
     D3D12_DESCRIPTOR_HEAP_DESC rh{};
-    rh.NumDescriptors = 3;
+    rh.NumDescriptors = 6;
     rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     ThrowIfFailed(device_->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&taaRtvHeap_)),
                   "taa RTV heap");
@@ -1342,7 +1406,9 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
     taaHistTex_[0].Reset();
     taaHistTex_[1].Reset();
     taaSceneTex_.Reset();
-    godrayDummyTex_.Reset();
+    godrayTex_[0].Reset();
+    godrayTex_[1].Reset();
+    godrayTex_[2].Reset();
 
     auto createUintTex = [&](ComPtr<ID3D12Resource>& out, const wchar_t* name)
     {
@@ -1370,11 +1436,11 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rd.Width = w; rd.Height = h;
         rd.DepthOrArraySize = 1;
         rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         rd.SampleDesc.Count = 1;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         D3D12_CLEAR_VALUE cv{};
-        cv.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        cv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
@@ -1408,30 +1474,34 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rd.Width = w; rd.Height = h;
         rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         rd.SampleDesc.Count = 1;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        D3D12_CLEAR_VALUE cv{}; cv.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        D3D12_CLEAR_VALUE cv{}; cv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
                        IID_PPV_ARGS(&taaSceneTex_)))) return false;
         NameObject(taaSceneTex_.Get(), L"taaSceneTex");
     }
-    // Dummy 1×1 R32F = bind target for godray SRVs (gGodrayStrength=0 skip path).
+    // Godray textures: 64x64 R16F. [0]=mark, [1,2]=blur ping-pong.
+    for (int g = 0; g < 3; ++g)
     {
         D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd{};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = 1; rd.Height = 1;
+        rd.Width = 64; rd.Height = 64;
         rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R32_FLOAT;
+        rd.Format = DXGI_FORMAT_R16_FLOAT;
         rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv{}; cv.Format = DXGI_FORMAT_R16_FLOAT;
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
-                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                       IID_PPV_ARGS(&godrayDummyTex_)))) return false;
-        NameObject(godrayDummyTex_.Get(), L"godrayDummyTex");
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+                       IID_PPV_ARGS(&godrayTex_[g])))) return false;
+        wchar_t nm[32]; std::swprintf(nm, 32, L"godrayTex[%d]", g);
+        NameObject(godrayTex_[g].Get(), nm);
     }
     if (!createRtTex (taaHistTex_[0], L"taaHist0")) return false;
     if (!createRtTex (taaHistTex_[1], L"taaHist1")) return false;
@@ -1451,7 +1521,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
     srvUint.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvUint.Texture2D.MipLevels = 1;
     D3D12_SHADER_RESOURCE_VIEW_DESC srvRgba{};
-    srvRgba.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    srvRgba.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     srvRgba.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvRgba.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvRgba.Texture2D.MipLevels = 1;
@@ -1478,21 +1548,48 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         device_->CreateShaderResourceView (visDepth2Tex_.Get(),  &srvFloat,        cpu(heap, 8));
         device_->CreateShaderResourceView (visColor2Tex_.Get(),  &srvUint,         cpu(heap, 9));
         device_->CreateShaderResourceView (taaSceneTex_.Get(),   &srvRgba,         cpu(heap, 10));
-        device_->CreateShaderResourceView (godrayDummyTex_.Get(),&srvFloat,        cpu(heap, 11));
-        device_->CreateShaderResourceView (godrayDummyTex_.Get(),&srvFloat,        cpu(heap, 12));
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvR16{};
+        srvR16.Format = DXGI_FORMAT_R16_FLOAT;
+        srvR16.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvR16.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvR16.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView (godrayTex_[0].Get(),  &srvR16,          cpu(heap, 11));
+        device_->CreateShaderResourceView (godrayTex_[1].Get(),  &srvR16,          cpu(heap, 12));
+        device_->CreateShaderResourceView (godrayTex_[2].Get(),  &srvR16,          cpu(heap, 13));
     }
 
-    // TAA RTVs (slot 0=hist0, 1=hist1, 2=taaScene).
+    // RTVs into taaRtvHeap_: 0,1=taaHist 2=taaScene 3,4,5=godray[0..2].
     {
         D3D12_RENDER_TARGET_VIEW_DESC rtvD{};
-        rtvD.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        rtvD.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         rtvD.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         D3D12_CPU_DESCRIPTOR_HANDLE h = taaRtvHeap_->GetCPUDescriptorHandleForHeapStart();
-        device_->CreateRenderTargetView(taaHistTex_[0].Get(), &rtvD, h);
-        h.ptr += taaRtvDescSize_;
-        device_->CreateRenderTargetView(taaHistTex_[1].Get(), &rtvD, h);
-        h.ptr += taaRtvDescSize_;
-        device_->CreateRenderTargetView(taaSceneTex_.Get(),   &rtvD, h);
+        device_->CreateRenderTargetView(taaHistTex_[0].Get(), &rtvD, h); h.ptr += taaRtvDescSize_;
+        device_->CreateRenderTargetView(taaHistTex_[1].Get(), &rtvD, h); h.ptr += taaRtvDescSize_;
+        device_->CreateRenderTargetView(taaSceneTex_.Get(),   &rtvD, h); h.ptr += taaRtvDescSize_;
+        D3D12_RENDER_TARGET_VIEW_DESC rtvGr{};
+        rtvGr.Format = DXGI_FORMAT_R16_FLOAT;
+        rtvGr.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        device_->CreateRenderTargetView(godrayTex_[0].Get(), &rtvGr, h); h.ptr += taaRtvDescSize_;
+        device_->CreateRenderTargetView(godrayTex_[1].Get(), &rtvGr, h); h.ptr += taaRtvDescSize_;
+        device_->CreateRenderTargetView(godrayTex_[2].Get(), &rtvGr, h);
+    }
+
+    // Imgui debug previews — reserve 2 slots in imguiSrvHeap_ for godray
+    // mark + blur. Write R16F SRVs there so ImGui::Image can sample them.
+    if (imguiGodrayMarkGpu_.ptr == 0)
+    {
+        ImGuiSrvAlloc(&imguiGodrayMarkCpu_, &imguiGodrayMarkGpu_);
+        ImGuiSrvAlloc(&imguiGodrayBlurCpu_, &imguiGodrayBlurGpu_);
+    }
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvR16{};
+        srvR16.Format = DXGI_FORMAT_R16_FLOAT;
+        srvR16.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvR16.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvR16.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(godrayTex_[0].Get(), &srvR16, imguiGodrayMarkCpu_);
+        device_->CreateShaderResourceView(godrayTex_[1].Get(), &srvR16, imguiGodrayBlurCpu_);
     }
 
     taaHistValid_[0] = false;
@@ -1563,8 +1660,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     struct DrawItem { uint32_t slot, blockFirst, blockCount; };
     std::vector<DrawItem> drawList[lw::kLodCount];
 
-    std::function<void(int, uint32_t, int)> visitCluster =
-        [&](int L, uint32_t chunkSlot, int clSlot)
+    // Recursive lambda via Y-combinator pattern — avoids std::function's
+    // type-erased indirect call (was ~0.4ms CPU per frame on busy LOD0).
+    auto visitCluster = [&](auto& self, int L, uint32_t chunkSlot, int clSlot) -> void
     {
         const lw::LODWorld& lwL = lwWorld_.lods[L];
         if (chunkSlot >= lwL.chunks.size()) return;
@@ -1615,7 +1713,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                     int childCz = 2*lcz + dz;
                     int childSlot = childCz * (lw::kClustersX * lw::kClustersY)
                                   + childCy * lw::kClustersX + childCx;
-                    visitCluster(L-1, childChunkId, childSlot);
+                    self(self, L-1, childChunkId, childSlot);
                 }
     };
 
@@ -1631,7 +1729,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         for (int c = 0; c < lw::kClustersPerChunk; ++c)
         {
             if (rc.clusters[c].numPoints == 0) continue;
-            visitCluster(topL, i, c);
+            visitCluster(visitCluster, topL, i, c);
         }
     }
 
@@ -1806,7 +1904,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         // Per-LOD splat: coarser LOD voxels render at fewer screen pixels
         // (well, more), but our LOD selection already trades screen-pixels-per-
         // voxel for LOD index. So one global radius is fine for M4c.
-        cbcs.splatRadius = std::max(0, args.splatRadius - 1); // CSTiles 1 = no splat
+        cbcs.splatRadius = std::max(0, args.splatRadius);
         cbcsAlloc[L] = graphicsMemory_->AllocateConstant(cbcs);
         wlAlloc[L]   = graphicsMemory_->Allocate(perLodWl[L].size() * sizeof(WI));
         std::memcpy(wlAlloc[L].Memory(), perLodWl[L].data(), perLodWl[L].size() * sizeof(WI));
@@ -1967,10 +2065,130 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     const uint32_t currIdx = taaCurrIdx_;
     const uint32_t prevIdx = currIdx ^ 1;
 
-    // Dummy cbGodray (gGodrayStrength=0 → skip path in psmain_post).
-    struct CBGodray { float a[12]; }; // 48 bytes zero
+    // cbGodray — CSTiles layout. Filled from camera + sun direction.
+    struct CBGodray {
+        float sunScreenNdc[2];
+        float sunOnScreen;
+        float godrayEmaAlpha;
+        float godrayHalfScreenUV[2];
+        float sunFacing;
+        float _padG1;
+        float sunScreenUV[2];
+        float godrayStridePx;
+        float _padG2;
+        float godrayTint[3];
+        float godrayStrength;
+    };
     CBGodray cbg{};
+    {
+        hlslpp::float3 fwdH = cam.forward();
+        float fwd[3]; hlslpp::store(fwd, fwdH);
+        float sxN = cbf.lightDir[0], syN = cbf.lightDir[1], szN = cbf.lightDir[2];
+        cbg.sunFacing = fwd[0]*sxN + fwd[1]*syN + fwd[2]*szN;
+        // Project sun direction (treated as direction at infinity) to NDC by
+        // building world = camPos + sunDir * far, applying viewProj.
+        float sunW[3] = { camP[0] + sxN * 10000.0f,
+                          camP[1] + syN * 10000.0f,
+                          camP[2] + szN * 10000.0f };
+        const float* vp = cbf.viewProj;
+        float clip[4];
+        for (int j = 0; j < 4; ++j)
+            clip[j] = sunW[0]*vp[0*4+j] + sunW[1]*vp[1*4+j] + sunW[2]*vp[2*4+j] + vp[3*4+j];
+        bool inFront = (clip[3] > 0.0f) && (cbg.sunFacing > 0.0f);
+        float ndcX = 0, ndcY = 0;
+        if (inFront) {
+            ndcX = clip[0] / clip[3];
+            ndcY = clip[1] / clip[3];
+        }
+        cbg.sunScreenNdc[0] = ndcX;
+        cbg.sunScreenNdc[1] = ndcY;
+        bool onScreen = inFront && (ndcX >= -1 && ndcX <= 1 && ndcY >= -1 && ndcY <= 1);
+        cbg.sunOnScreen = onScreen ? 1.0f : 0.0f;
+        cbg.sunScreenUV[0] = ndcX * 0.5f + 0.5f;
+        cbg.sunScreenUV[1] = 0.5f - ndcY * 0.5f;
+        // Half-extent of godray local space in screen UV. Sized to cover
+        // args.godrayAngleDeg of arc around sun, matching CSTiles formula.
+        const float kDeg2Rad = 3.14159265358979f / 180.0f;
+        float halfPx = (float)height_ * 0.5f
+                     * tanf(args.godrayAngleDeg * 0.5f * kDeg2Rad)
+                     / tanf(cam.fovDeg * 0.5f * kDeg2Rad);
+        cbg.godrayHalfScreenUV[0] = halfPx / (float)std::max(1u, width_);
+        cbg.godrayHalfScreenUV[1] = halfPx / (float)std::max(1u, height_);
+        cbg.godrayEmaAlpha = std::clamp(args.godrayEmaAlpha, 0.02f, 1.0f);
+        cbg.godrayStridePx = 0.0f; // separable path unused
+        cbg.godrayTint[0]  = args.godrayTint[0];
+        cbg.godrayTint[1]  = args.godrayTint[1];
+        cbg.godrayTint[2]  = args.godrayTint[2];
+        cbg.godrayStrength = std::max(args.godrayStrength, 0.0f);
+    }
     auto cbgAlloc = graphicsMemory_->AllocateConstant(cbg);
+
+    // ---- Godray Mark + Blur (only when strength > 0) ----
+    const uint32_t grCurr = godrayCurrIdx_;
+    const uint32_t grPrev = grCurr ^ 1;
+    if (args.godrayStrength > 0.0f)
+    {
+        MICROPROFILE_SCOPEGPUI("LW/GodrayMark+Blur", 0xffd0a060);
+
+        D3D12_VIEWPORT vp64{ 0, 0, 64.0f, 64.0f, 0.0f, 1.0f };
+        D3D12_RECT     sc64{ 0, 0, 64, 64 };
+        cmdList_->RSSetViewports(1, &vp64);
+        cmdList_->RSSetScissorRects(1, &sc64);
+
+        // Mark: write godrayTex[0]. Reads visDepth2 (gPostDepth at t6).
+        {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = godrayTex_[0].Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmdList_->ResourceBarrier(1, &b);
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = taaRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+            rtv.ptr += SIZE_T(3) * taaRtvDescSize_;
+            cmdList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            cmdList_->SetGraphicsRootSignature(m4GodrayMarkRootSig_.Get());
+            cmdList_->SetPipelineState(m4GodrayMarkPso_.Get());
+            cmdList_->SetGraphicsRootConstantBufferView(0, cbfAlloc.GpuAddress());
+            cmdList_->SetGraphicsRootConstantBufferView(1, cbgAlloc.GpuAddress());
+            cmdList_->SetGraphicsRootDescriptorTable(2, gpu(8)); // t6 = visDepth2 SRV
+            cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmdList_->DrawInstanced(3, 1, 0, 0);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            cmdList_->ResourceBarrier(1, &b);
+        }
+
+        // Blur: write godrayTex[1+grCurr] from mark (godrayTex[0]) + prev blur.
+        {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = godrayTex_[1 + grCurr].Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmdList_->ResourceBarrier(1, &b);
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = taaRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+            rtv.ptr += SIZE_T(4 + grCurr) * taaRtvDescSize_;
+            cmdList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            cmdList_->SetGraphicsRootSignature(m4GodrayBlurRootSig_.Get());
+            cmdList_->SetPipelineState(m4GodrayBlurPso_.Get());
+            cmdList_->SetGraphicsRootConstantBufferView(0, cbgAlloc.GpuAddress());
+            cmdList_->SetGraphicsRootDescriptorTable(1, gpu(11));           // t9 = godrayTex[0] mark
+            cmdList_->SetGraphicsRootDescriptorTable(2, gpu(12 + grPrev));  // t10 = prev blur
+            cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmdList_->DrawInstanced(3, 1, 0, 0);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            cmdList_->ResourceBarrier(1, &b);
+        }
+
+        // Restore full-res viewport for resolve/taa/post.
+        D3D12_VIEWPORT vpFull{ 0, 0, (float)width_, (float)height_, 0.0f, 1.0f };
+        D3D12_RECT     scFull{ 0, 0, (LONG)width_, (LONG)height_ };
+        cmdList_->RSSetViewports(1, &vpFull);
+        cmdList_->RSSetScissorRects(1, &scFull);
+    }
 
     // ---- Resolve → taaScene RTV ----
     {
@@ -2041,8 +2259,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cmdList_->SetGraphicsRootConstantBufferView(1, cbgAlloc.GpuAddress()); // cbGodray zeroed
         cmdList_->SetGraphicsRootDescriptorTable(2, gpu(8));           // t6 = postDepth = taaDepth
         cmdList_->SetGraphicsRootDescriptorTable(3, gpu(4 + currIdx)); // t7 = postIn = taaHist[curr]
-        cmdList_->SetGraphicsRootDescriptorTable(4, gpu(11));          // t9 = godray dummy
-        cmdList_->SetGraphicsRootDescriptorTable(5, gpu(12));          // t10 = godray dummy
+        cmdList_->SetGraphicsRootDescriptorTable(4, gpu(12 + grCurr)); // t9 = current frame's blurred godray
+        cmdList_->SetGraphicsRootDescriptorTable(5, gpu(11));          // t10 = mark (unused at post; needs valid bind)
         cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmdList_->DrawInstanced(3, 1, 0, 0);
     }
@@ -2050,6 +2268,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     taaHistValid_[currIdx] = true;
     taaCurrIdx_ = prevIdx;
     ++taaFrame_;
+    godrayCurrIdx_ ^= 1;
     // Stash this frame's VP for next frame's reprojection.
     hlslpp::store(taaPrevVP_, vp);
 

@@ -294,6 +294,33 @@ float3 PixelWorldDir(float2 pixCenter, float2 invScreen)
     return normalize(gCamRight * v.x + gCamUp * v.y + gCamForward * v.z);
 }
 
+// ApplyFog — verbatim port from CSTiles shading.hlsli.
+float3 ApplyFog(float3 color, float3 wpos)
+{
+    float3 d = wpos - gCamPos;
+    float dist = length(d);
+    float optical = gFogDensity * dist;
+    float3 rd = (dist > 1e-4) ? d / dist : float3(0,0,1);
+    if (gHeightFogDensity > 0.0 && dist > 1e-4) {
+        float b  = gHeightFogFalloff;
+        float c  = gHeightFogDensity;
+        float ey = exp(-(gCamPos.y - gHeightFogStart) * b);
+        float t;
+        if (abs(rd.y) > 1e-4)
+            t = c * ey * (1.0 - exp(-dist * rd.y * b)) / rd.y;
+        else
+            t = c * ey * dist;
+        optical += max(t, 0.0);
+    }
+    if (optical <= 0.0)
+        return color;
+    float3 sunDir  = normalize(gLightDir);
+    float  sunAmt  = pow(saturate(dot(rd, sunDir)), 8.0);
+    float3 sunTint = float3(1.10, 0.85, 0.55);
+    float3 fogCol  = lerp(gFogColor, sunTint, sunAmt);
+    return lerp(fogCol, color, exp(-optical));
+}
+
 // Ambient cube — warm/cool per axis face. Sampled triplanar from the surface
 // normal so each cube face picks up a different indirect tint instead of one
 // flat scalar.
@@ -382,17 +409,24 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
         float vy = ndcY * gTanHalfFovY * viewZ;
         float3 worldN = ro + gCamRight * vx + gCamUp * vy + gCamForward * viewZ;
 
+        // Derive LOD from depth so AABB matches actual voxel size. CPU LOD
+        // selection uses focalPx*(2^L)/dist >= 1/lodScale; reverse:
+        //   2^L ≈ viewZ * thresh / focalPx
+        // For thresh=1 (default lodScale=1): L ≈ log2(viewZ / focalPx).
+        float focalPx = gScreenSize.y * 0.5 / gTanHalfFovY;
+        float Lf = log2(max(viewZ / focalPx, 1.0));
+        int lodIdx = (int)clamp(floor(Lf), 0.0, 4.0);
+        float S = (float)(1u << lodIdx);
+
         // Track nearest-depth fallback for triplanar splat lighting.
         if (viewZ < fbBestD) {
             fbBestD  = viewZ;
             fbPck    = c;
-            float S0 = 1.0;
-            float3 vmin0 = floor(worldN / S0) * S0;
-            fbCenter = vmin0 + S0 * 0.5;
+            float3 vmin0 = floor(worldN / S) * S;
+            fbCenter = vmin0 + S * 0.5;
             haveFb = true;
         }
 
-        float S = 1.0;
         float3 vmin = floor(worldN / S) * S;
         float3 vmax = vmin + S;
         float3 t0v = (vmin - ro) * invRd;
@@ -409,9 +443,9 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
         else if (tNear == tmn.y) face = (rd.y > 0.0) ? 3u : 2u;
         else                     face = (rd.z > 0.0) ? 5u : 4u;
 
-        uint maskN = (c >> 24) & 0x3Fu;
-        if (((maskN >> face) & 1u) == 0u) continue;
-
+        // visMask face rejection disabled — until pass2 encodes lodIdx, the
+        // shader-derived LOD can put the AABB on a sub-cell of the real voxel,
+        // making ray-entry face unreliable vs the voxel's true visMask.
         if (tHit < bestT) {
             bestT    = tHit;
             bestPck  = c;
@@ -420,12 +454,14 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
         }
     }}
 
-    if (!haveHit && !haveFb) {
+    if (!haveHit) {
+        // No ray-AABB hit at this pixel → sky. Write 0 color AND 0 depth so
+        // TAA / post both treat this pixel as sky (no reprojection from fake
+        // depth that would bleed neighbor color into history).
         gDilateColorOut[pix] = 0;
-        gDilateDepthOut[pix] = 0.0; // 0 → psmain_taa treats as sky
+        gDilateDepthOut[pix] = 0.0;
         return;
     }
-    if (!haveHit) { bestPck = fbPck; }
 
     // Depth in CSTiles form: d = gNearZ / viewZ. psmain_taa reads as
     // Texture2D<float> and recovers viewZ = gNearZ / d.
@@ -524,6 +560,11 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
         float3 amb    = AmbientCube(Nshade) * gAmbient;
         float3 light  = amb + NdotL * sunCol;
         lit = albedo * light;
+        // Fog applied in world space — distance + height-based attenuation
+        // matching CSTiles ApplyFog. Hit pixels use ray-AABB hit position;
+        // fallback pixels use fbCenter (close enough — neighbor's voxel).
+        float3 wposShade = haveHit ? (ro + rd * bestT) : fbCenter;
+        lit = ApplyFog(lit, wposShade);
     }
 
     uint rR = (uint)clamp(lit.r * 255.0, 0.0, 255.0);

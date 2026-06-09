@@ -163,8 +163,8 @@ public:
     // SRV getters return null GPU handles in M1 (stub); ImGui::Image gated on .ptr != 0.
     D3D12_GPU_DESCRIPTOR_HANDLE ShadowSrv() const       { return {}; }
     D3D12_GPU_DESCRIPTOR_HANDLE ShadowFilledSrv() const { return {}; }
-    D3D12_GPU_DESCRIPTOR_HANDLE GodraySrv() const       { return {}; }
-    D3D12_GPU_DESCRIPTOR_HANDLE GodrayMarkSrv() const   { return {}; }
+    D3D12_GPU_DESCRIPTOR_HANDLE GodraySrv() const       { return imguiGodrayBlurGpu_; }
+    D3D12_GPU_DESCRIPTOR_HANDLE GodrayMarkSrv() const   { return imguiGodrayMarkGpu_; }
     uint32_t ShadowMapSize() const { return 0; }
 
     // ---- Stats (all stubs in M1) ----
@@ -237,6 +237,10 @@ private:
     ComPtr<ID3D12DescriptorHeap>     imguiSrvHeap_;
     UINT                             imguiSrvDescSize_ = 0;
     UINT                             imguiSrvNextSlot_ = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE      imguiGodrayMarkCpu_ = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE      imguiGodrayMarkGpu_ = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE      imguiGodrayBlurCpu_ = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE      imguiGodrayBlurGpu_ = {};
 
     // Fence + per-frame sync.
     ComPtr<ID3D12Fence>              fence_;
@@ -269,13 +273,14 @@ private:
     ComPtr<ID3D12Resource>            visColor2Tex_;     // dilated color (R32_UINT)
     ComPtr<ID3D12Resource>            visDepth2Tex_;     // dilated depth (R32_FLOAT, gNearZ/viewZ form)
     ComPtr<ID3D12Resource>            taaSceneTex_;      // resolve output (R11G11B10F)
-    ComPtr<ID3D12Resource>            godrayDummyTex_;   // 1x1 R32F black, bound at t9/t10
-    // m4TexHeap slot layout (13 entries):
+    ComPtr<ID3D12Resource>            godrayTex_[3];     // [0]=mark, [1,2]=blur ping-pong (64x64 R16F)
+    uint32_t                          godrayCurrIdx_ = 0;
+    // m4TexHeap slot layout (14 entries):
     //   0=visDepthUav   1=visColorUav   2=visDepthSrv   3=visColorSrv
     //   4=taaHistSrv[0] 5=taaHistSrv[1]
     //   6=visColor2Uav  7=visDepth2Uav
     //   8=visDepth2Srv  9=visColor2Srv
-    //   10=taaSceneSrv  11=godrayDummySrv  12=godrayDummySrv (alias t10)
+    //   10=taaSceneSrv  11=godrayMark0Srv  12=godrayBlur1Srv  13=godrayBlur2Srv
     ComPtr<ID3D12DescriptorHeap>      m4TexHeap_;
     ComPtr<ID3D12DescriptorHeap>      m4TexClearHeap_;
     UINT                              m4TexDescSize_ = 0;
@@ -285,17 +290,21 @@ private:
     ComPtr<ID3D12RootSignature>       m4ResolveRootSig_;
     ComPtr<ID3D12RootSignature>       m4TaaRootSig_;
     ComPtr<ID3D12RootSignature>       m4PostRootSig_;
+    ComPtr<ID3D12RootSignature>       m4GodrayMarkRootSig_;
+    ComPtr<ID3D12RootSignature>       m4GodrayBlurRootSig_;
     ComPtr<ID3D12PipelineState>       m4Pass1Pso_;
     ComPtr<ID3D12PipelineState>       m4Pass2Pso_;
     ComPtr<ID3D12PipelineState>       m4DilatePso_;
     ComPtr<ID3D12PipelineState>       m4ResolvePso_;
     ComPtr<ID3D12PipelineState>       m4TaaPso_;
     ComPtr<ID3D12PipelineState>       m4PostPso_;
+    ComPtr<ID3D12PipelineState>       m4GodrayMarkPso_;
+    ComPtr<ID3D12PipelineState>       m4GodrayBlurPso_;
 
     // TAA — ping-pong history RGBA8 RTs. Resolve writes to taaHist[curr]
     // sampling taaHist[prev]; blit then samples taaHist[curr] to backbuffer.
     ComPtr<ID3D12Resource>            taaHistTex_[2];
-    ComPtr<ID3D12DescriptorHeap>      taaRtvHeap_; // slots 0,1=taaHist[0,1] RTV, 2=taaScene RTV
+    ComPtr<ID3D12DescriptorHeap>      taaRtvHeap_; // 0,1=taaHist[0,1] 2=taaScene 3=godray[0] 4=godray[1] 5=godray[2]
     UINT                              taaRtvDescSize_ = 0;
     uint32_t                          taaCurrIdx_ = 0;
     uint32_t                          taaFrame_   = 0; // resets to 0 on world change / resize

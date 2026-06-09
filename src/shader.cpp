@@ -40,9 +40,13 @@ bool ShaderCompiler::Compile(const std::wstring& path,
     args.push_back(path);
     args.push_back(L"-E"); args.push_back(entry);
     args.push_back(L"-T"); args.push_back(profile);
+    args.push_back(L"-HV"); args.push_back(L"2021");
+#ifdef _DEBUG
     args.push_back(L"-Zi");
     args.push_back(L"-Qembed_debug");
-    args.push_back(L"-HV"); args.push_back(L"2021");
+#else
+    args.push_back(L"-O3");
+#endif
 
     // Resolve includes relative to the shader's directory.
     std::filesystem::path p(path);
