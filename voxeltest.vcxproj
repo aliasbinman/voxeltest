@@ -1,13 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
       <Configuration>Debug</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Profile|x64">
+      <Configuration>Profile</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
     <ProjectConfiguration Include="Release|x64">
       <Configuration>Release</Configuration>
       <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|Gaming.Xbox.Scarlett.x64">
+      <Configuration>Debug</Configuration>
+      <Platform>Gaming.Xbox.Scarlett.x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Profile|Gaming.Xbox.Scarlett.x64">
+      <Configuration>Profile</Configuration>
+      <Platform>Gaming.Xbox.Scarlett.x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Gaming.Xbox.Scarlett.x64">
+      <Configuration>Release</Configuration>
+      <Platform>Gaming.Xbox.Scarlett.x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
@@ -16,12 +32,26 @@
     <RootNamespace>voxeltest</RootNamespace>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <TargetRuntime>Native</TargetRuntime>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+    <GDKCrossPlatform>true</GDKCrossPlatform>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <!-- =================== Per-config Configuration property groups =================== -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Profile|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
@@ -31,12 +61,75 @@
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Gaming.Xbox.Scarlett.x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <EmbedManifest>false</EmbedManifest>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Profile|Gaming.Xbox.Scarlett.x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+    <EmbedManifest>false</EmbedManifest>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Gaming.Xbox.Scarlett.x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+    <EmbedManifest>false</EmbedManifest>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <GDKCrossPlatformPath Condition="'$(GDKCrossPlatformPath)'==''">$(GameDKCoreLatest)</GDKCrossPlatformPath>
+    <GDKCrossPlatformPath Condition="'$(GDKCrossPlatformPath)'==''">$(GameDKXboxLatest)</GDKCrossPlatformPath>
+  </PropertyGroup>
+
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
-  <PropertyGroup>
+  <ImportGroup Label="ExtensionSettings"/>
+  <ImportGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))" Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+
+  <!-- =================== Output dirs =================== -->
+  <PropertyGroup Condition="'$(Platform)'=='x64'">
     <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)build\$(Configuration)\obj\</IntDir>
   </PropertyGroup>
-  <ItemDefinitionGroup>
+  <PropertyGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <OutDir>$(SolutionDir)build_xbox\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build_xbox\$(Configuration)\obj\</IntDir>
+  </PropertyGroup>
+
+  <!-- =================== Xbox include/lib paths =================== -->
+  <PropertyGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <ReferencePath>$(Console_SdkLibPath);$(Console_SdkWindowsMetadataPath)</ReferencePath>
+    <LibraryPath>$(Console_SdkLibPath)</LibraryPath>
+    <LibraryWPath>$(Console_SdkLibPath);$(Console_SdkWindowsMetadataPath)</LibraryWPath>
+    <IncludePath>$(Console_SdkIncludeRoot)</IncludePath>
+    <ExecutablePath>$(Console_SdkRoot)bin;$(Console_SdkToolPath);$(ExecutablePath)</ExecutablePath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Gaming.Xbox.Scarlett.x64'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Profile|Gaming.Xbox.Scarlett.x64'">
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Gaming.Xbox.Scarlett.x64'">
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+
+  <!-- =================== PC ItemDefinitionGroup =================== -->
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64'">
     <PostBuildEvent>
       <Command>xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxcompiler.dll" "$(OutDir)" &gt;NUL
 xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDir)" &gt;NUL</Command>
@@ -66,6 +159,20 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Profile|x64'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;PROFILE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
@@ -80,11 +187,80 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
       <OptimizeReferences>true</OptimizeReferences>
     </Link>
   </ItemDefinitionGroup>
+
+  <!-- =================== Xbox ItemDefinitionGroup =================== -->
+  <ItemDefinitionGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)third_party\imgui;$(ProjectDir)third_party\imgui\backends;$(ProjectDir)third_party\hlslpp\include;$(ProjectDir)third_party\microprofile;$(ProjectDir)third_party\lz4;$(ProjectDir)third_party\DirectXTK12\Inc;$(ProjectDir)third_party\DirectXTK12\Src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;MICROPROFILE_ENABLED=0;_GAMING_XBOX_SCARLETT;VOXELTEST_XBOX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+      <DisableSpecificWarnings>5204</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(Console_Libs);%(XboxExtensionsDependencies);%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <CopyFileToFolders>
+      <DestinationFolders>$(OutDir)Assets</DestinationFolders>
+    </CopyFileToFolders>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Gaming.Xbox.Scarlett.x64'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Profile|Gaming.Xbox.Scarlett.x64'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;PROFILE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Gaming.Xbox.Scarlett.x64'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- =================== Sources: shared =================== -->
   <ItemGroup>
-    <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\renderer.cpp" />
     <ClCompile Include="src\shader.cpp" />
     <ClCompile Include="src\lw_loader.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\GraphicsMemory.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\LinearAllocator.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\DescriptorHeap.cpp" />
+    <ClCompile Include="third_party\DirectXTK12\Src\DirectXHelpers.cpp" />
+    <ClCompile Include="third_party\lz4\lz4.c">
+      <CompileAs>CompileAsC</CompileAs>
+    </ClCompile>
+  </ItemGroup>
+
+  <!-- =================== Sources: PC only =================== -->
+  <ItemGroup Condition="'$(Platform)'=='x64'">
+    <ClCompile Include="src\main.cpp" />
     <ClCompile Include="third_party\imgui\imgui.cpp" />
     <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
     <ClCompile Include="third_party\imgui\imgui_tables.cpp" />
@@ -92,20 +268,23 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
     <ClCompile Include="third_party\imgui\imgui_demo.cpp" />
     <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="third_party\imgui\backends\imgui_impl_dx12.cpp" />
-    <ClCompile Include="third_party\DirectXTK12\Src\GraphicsMemory.cpp" />
-    <ClCompile Include="third_party\DirectXTK12\Src\LinearAllocator.cpp" />
-    <ClCompile Include="third_party\DirectXTK12\Src\DescriptorHeap.cpp" />
-    <ClCompile Include="third_party\DirectXTK12\Src\DirectXHelpers.cpp" />
     <ClCompile Include="third_party\microprofile\microprofile_impl.cpp" />
-    <ClCompile Include="third_party\lz4\lz4.c">
-      <CompileAs>CompileAsC</CompileAs>
-    </ClCompile>
   </ItemGroup>
+
+  <!-- =================== Sources: Xbox only =================== -->
+  <ItemGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <ClCompile Include="src\main_xbox.cpp" />
+  </ItemGroup>
+
+  <!-- =================== Headers =================== -->
   <ItemGroup>
     <ClInclude Include="src\camera.h" />
     <ClInclude Include="src\lodworld.h" />
     <ClInclude Include="src\renderer.h" />
+    <ClInclude Include="src\shader.h" />
   </ItemGroup>
+
+  <!-- =================== Shader source files (display only) =================== -->
   <ItemGroup>
     <None Include="shaders\m2_demo.hlsl" />
     <None Include="shaders\m4_lw.hlsl" />
@@ -116,5 +295,97 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
     <None Include="shaders\shading.hlsli" />
     <None Include="voxeltest.txt" />
   </ItemGroup>
+
+  <!-- =================== Xbox-only deploy items =================== -->
+  <ItemGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <CopyFileToFolders Include="xbox_assets\Logo.png" />
+    <CopyFileToFolders Include="xbox_assets\SmallLogo.png" />
+    <CopyFileToFolders Include="xbox_assets\LargeLogo.png" />
+    <CopyFileToFolders Include="xbox_assets\StoreLogo.png" />
+    <CopyFileToFolders Include="xbox_assets\SplashScreen.png" />
+    <CopyFileToFolders Include="assets\kingslanding25.lw">
+      <DestinationFolders>$(OutDir)</DestinationFolders>
+    </CopyFileToFolders>
+    <MGCCompile Include="MicrosoftGameConfig.mgc" />
+  </ItemGroup>
+
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets"/>
+
+  <!-- =================== Xbox shader compile: HLSL -> .cso via host SDK DXC =================== -->
+  <ItemGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <ShaderEntry Include="m2_demo.hlsl_vsmain">
+      <Source>shaders\m2_demo.hlsl</Source>
+      <Entry>vsmain</Entry>
+      <Profile>vs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m2_demo.hlsl_psmain">
+      <Source>shaders\m2_demo.hlsl</Source>
+      <Entry>psmain</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_lw.hlsl_csmain_pass1_depth">
+      <Source>shaders\m4_lw.hlsl</Source>
+      <Entry>csmain_pass1_depth</Entry>
+      <Profile>cs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_lw.hlsl_csmain_pass2_color">
+      <Source>shaders\m4_lw.hlsl</Source>
+      <Entry>csmain_pass2_color</Entry>
+      <Profile>cs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_lw.hlsl_csmain_dilate">
+      <Source>shaders\m4_lw.hlsl</Source>
+      <Entry>csmain_dilate</Entry>
+      <Profile>cs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_lw.hlsl_vsmain_resolve">
+      <Source>shaders\m4_lw.hlsl</Source>
+      <Entry>vsmain_resolve</Entry>
+      <Profile>vs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_lw.hlsl_psmain_resolve">
+      <Source>shaders\m4_lw.hlsl</Source>
+      <Entry>psmain_resolve</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_taa_post.hlsl_vsmain_taa">
+      <Source>shaders\m4_taa_post.hlsl</Source>
+      <Entry>vsmain_taa</Entry>
+      <Profile>vs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_taa_post.hlsl_psmain_taa">
+      <Source>shaders\m4_taa_post.hlsl</Source>
+      <Entry>psmain_taa</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_taa_post.hlsl_psmain_post">
+      <Source>shaders\m4_taa_post.hlsl</Source>
+      <Entry>psmain_post</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_taa_post.hlsl_psmain_godray_mark">
+      <Source>shaders\m4_taa_post.hlsl</Source>
+      <Entry>psmain_godray_mark</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_taa_post.hlsl_psmain_godray_blur">
+      <Source>shaders\m4_taa_post.hlsl</Source>
+      <Entry>psmain_godray_blur</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+  </ItemGroup>
+  <Target Name="CompileShadersToCso" BeforeTargets="ClCompile"
+          Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <MakeDir Directories="$(OutDir)shaders" />
+    <Exec Command="&quot;$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe&quot; -E %(ShaderEntry.Entry) -T %(ShaderEntry.Profile) -HV 2021 -O3 -I &quot;$(ProjectDir)shaders&quot; -Fo &quot;$(OutDir)shaders\%(ShaderEntry.Identity).cso&quot; &quot;$(ProjectDir)%(ShaderEntry.Source)&quot;" />
+  </Target>
+
+  <Target Name="EnsureGDKX" BeforeTargets="_CheckForInvalidConfigurationAndPlatform"
+          Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
+    <PropertyGroup>
+      <ErrorText>This project requires the Microsoft GDK with Xbox Extensions to be installed. Missing platform: {0}.</ErrorText>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(VCTargetsPath)\Platforms\$(Platform)\Platform.props')" Text="$([System.String]::Format('$(ErrorText)', '$(Platform)'))" />
+  </Target>
 </Project>

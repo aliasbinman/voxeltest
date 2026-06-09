@@ -241,8 +241,11 @@ float4 psmain_post(VTaaOut i) : SV_Target
     int W = (int)gScreenSize.x;
     int H = (int)gScreenSize.y;
     float4 inC = gPostIn.Load(int3(pix, 0));
+    // Sky test from depth, not alpha — RT is R11G11B10F (no alpha channel).
+    // Dilate writes depth=0 for pixels with no voxel hit.
+    float postD = gPostDepth.Load(int3(pix, 0));
     float3 c;
-    if (inC.a < 0.5) {
+    if (postD <= 0.0) {
         float3 rd = PostPixelWorldDir(pix, W, H);
         c = SkyColor(rd) ;
     } else {

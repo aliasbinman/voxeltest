@@ -23,9 +23,7 @@
 
 #include "camera.h"
 #include "lodworld.h"
-#if !defined(VOXELTEST_XBOX)
-  #include "shader.h"
-#endif
+#include "shader.h"
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -103,7 +101,7 @@ struct DrawSceneParams
     bool cheapAO = false;
     float aoStrength = 0.5f;
     float aoFadeUnits = 64.0f;
-    int   aoPushTexels = 0;
+    float aoPushTexels = 1.0f;
 };
 
 // Phase-1 (DX12 port) skeleton.
@@ -283,9 +281,7 @@ private:
     std::unique_ptr<DirectX::GraphicsMemory> graphicsMemory_;
 
     // M2 — validation demo (DXC compile + rootsig + PSO + IA-less triangle).
-#if !defined(VOXELTEST_XBOX)
     ShaderCompiler                   shaderc_;
-#endif
     ComPtr<ID3D12RootSignature>      m2RootSig_;
     ComPtr<ID3D12PipelineState>      m2Pso_;
 

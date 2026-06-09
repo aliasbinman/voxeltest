@@ -3,7 +3,9 @@
 // per-frame clear + present. ImGui font descriptor heap exposed.
 // All voxel rendering / LW upload paths live in renderer.h as inline stubs
 // returning safe defaults — they will be ported incrementally in M3+.
-#define NOMINMAX
+#ifndef NOMINMAX
+  #define NOMINMAX
+#endif
 #include "renderer.h"
 #if !defined(VOXELTEST_XBOX)
 #include "microprofile.h"
@@ -152,7 +154,6 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         imguiSrvNextSlot_ = 0;
 
-#if !defined(VOXELTEST_XBOX)
         graphicsMemory_ = std::make_unique<DirectX::GraphicsMemory>(device_.Get());
         if (!shaderc_.Init())
         {
@@ -175,7 +176,6 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
 
         if (!CreateM4()) return false;
         if (!CreateVisTextures(width_, height_)) return false;
-#endif // !VOXELTEST_XBOX
     }
     catch (const std::exception& e)
     {
@@ -193,7 +193,15 @@ bool Renderer::CreateDeviceAndSwap(HWND, int)
     D3D12XBOX_CREATE_DEVICE_PARAMETERS params = {};
     params.Version = D3D12_SDK_VERSION;
 #if defined(_DEBUG)
-    params.ProcessDebugFlags = D3D12_PROCESS_DEBUG_FLAG_DEBUG_LAYER_ENABLED;
+    // Debug: validation + PIX hookable.
+    params.ProcessDebugFlags = D3D12_PROCESS_DEBUG_FLAG_DEBUG_LAYER_ENABLED
+                             | D3D12XBOX_PROCESS_DEBUG_FLAG_INSTRUMENTED;
+#elif defined(PROFILE)
+    // Profile: PIX-capturable retail runtime, no validation.
+    params.ProcessDebugFlags = D3D12XBOX_PROCESS_DEBUG_FLAG_INSTRUMENTED;
+#else
+    // Release: pure retail runtime, no PIX, no validation.
+    params.ProcessDebugFlags = (D3D12XBOX_PROCESS_DEBUG_FLAGS)0;
 #endif
     params.GraphicsCommandQueueRingSizeBytes = D3D12XBOX_DEFAULT_SIZE_BYTES;
     params.GraphicsScratchMemorySizeBytes    = D3D12XBOX_DEFAULT_SIZE_BYTES;
@@ -378,7 +386,6 @@ bool Renderer::CreateRenderTargets()
         }
     }
 
-#if !defined(VOXELTEST_XBOX)
     {
         D3D12_DESCRIPTOR_HEAP_DESC d{};
         d.NumDescriptors = 1;
@@ -414,11 +421,9 @@ bool Renderer::CreateRenderTargets()
         device_->CreateDepthStencilView(depthTex_.Get(), &dvd,
                                         dsvHeap_->GetCPUDescriptorHandleForHeapStart());
     }
-#endif
     return true;
 }
 
-#if !defined(VOXELTEST_XBOX)
 bool Renderer::CreateM2Demo()
 {
     // Empty root signature — shader uses only SV_VertexID + immediate consts.
@@ -440,19 +445,21 @@ bool Renderer::CreateM2Demo()
         NameObject(m2RootSig_.Get(), L"m2RootSig");
     }
 
-    // Compile vs + ps from shaders/m2_demo.hlsl.
+    // Load vs + ps from shaders/m2_demo.hlsl. PC compiles at runtime via DXC;
+    // Xbox loads prebuilt .cso from disk (no DXC at runtime).
     ComPtr<IDxcBlob> vs, ps;
     std::string err;
+#if defined(VOXELTEST_XBOX)
+    if (!shaderc_.LoadCso(L"shaders/m2_demo.hlsl_vsmain.cso", vs, &err))
+    { OutputDebugStringA(("M2 vs load failed: " + err + "\n").c_str()); return false; }
+    if (!shaderc_.LoadCso(L"shaders/m2_demo.hlsl_psmain.cso", ps, &err))
+    { OutputDebugStringA(("M2 ps load failed: " + err + "\n").c_str()); return false; }
+#else
     if (!shaderc_.Compile(L"shaders/m2_demo.hlsl", L"vsmain", L"vs_6_0", {}, vs, &err))
-    {
-        OutputDebugStringA(("M2 vs compile failed: " + err + "\n").c_str());
-        return false;
-    }
+    { OutputDebugStringA(("M2 vs compile failed: " + err + "\n").c_str()); return false; }
     if (!shaderc_.Compile(L"shaders/m2_demo.hlsl", L"psmain", L"ps_6_0", {}, ps, &err))
-    {
-        OutputDebugStringA(("M2 ps compile failed: " + err + "\n").c_str());
-        return false;
-    }
+    { OutputDebugStringA(("M2 ps compile failed: " + err + "\n").c_str()); return false; }
+#endif
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = m2RootSig_.Get();
@@ -487,7 +494,6 @@ bool Renderer::CreateM2Demo()
     NameObject(m2Pso_.Get(), L"m2Pso");
     return true;
 }
-#endif // !VOXELTEST_XBOX
 
 void Renderer::ImGuiSrvAlloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
                              D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
@@ -603,21 +609,14 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += SIZE_T(frameIndex_) * rtvDescSize_;
-#if defined(VOXELTEST_XBOX)
-    cmdList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv = {}; (void)dsv;
-#else
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
     cmdList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-#endif
 
     {
         MICROPROFILE_SCOPEGPUI("BeginFrame/Clear", 0xff60a0c0);
         if (!skipClear)
             cmdList_->ClearRenderTargetView(rtv, clear, 0, nullptr);
-#if !defined(VOXELTEST_XBOX)
         cmdList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-#endif
     }
 
     D3D12_VIEWPORT vp{ 0, 0, (float)width_, (float)height_, 0.0f, 1.0f };
@@ -1142,8 +1141,8 @@ bool Renderer::RecompileShaders()
     if (!buildCs(m4Pass1RootSig_.Get(),  cs1.Get(),      p1))   return false;
     if (!buildCs(m4Pass2RootSig_.Get(),  cs2.Get(),      p2))   return false;
     if (!buildCs(m4DilateRootSig_.Get(), csDilate.Get(), pd))   return false;
-    if (!buildGfx(vsR.Get(),   psR.Get(),  DXGI_FORMAT_R16G16B16A16_FLOAT, false, m4ResolveRootSig_.Get(), prs))   return false;
-    if (!buildGfx(vsTaa.Get(), psTaa.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT, false, m4TaaRootSig_.Get(),     ptaa))  return false;
+    if (!buildGfx(vsR.Get(),   psR.Get(),  DXGI_FORMAT_R11G11B10_FLOAT, false, m4ResolveRootSig_.Get(), prs))   return false;
+    if (!buildGfx(vsTaa.Get(), psTaa.Get(),DXGI_FORMAT_R11G11B10_FLOAT, false, m4TaaRootSig_.Get(),     ptaa))  return false;
     if (!buildGfx(vsTaa.Get(), psPost.Get(),BackBufferFormat(),         true,  m4PostRootSig_.Get(),    ppost)) return false;
     if (!buildGfx(vsTaa.Get(), psGrMark.Get(),DXGI_FORMAT_R16_FLOAT,    false, m4GodrayMarkRootSig_.Get(), pgm)) return false;
     if (!buildGfx(vsTaa.Get(), psGrBlur.Get(),DXGI_FORMAT_R16_FLOAT,    false, m4GodrayBlurRootSig_.Get(), pgb)) return false;
@@ -1158,6 +1157,8 @@ bool Renderer::RecompileShaders()
     m4GodrayBlurPso_  = pgb;
     return true;
 }
+
+#endif // !VOXELTEST_XBOX — end of hot-reload block; CreateM4/Vis are PC+Xbox
 
 // ===== M4 — PointCS_Block compute rasterizer ================================
 
@@ -1410,26 +1411,32 @@ bool Renderer::CreateM4()
 
     ComPtr<IDxcBlob> cs1, cs2, csDilate, vsR, psR, vsTaa, psTaa, psPost, psGrMark, psGrBlur;
     std::string err;
-    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"csmain_pass1_depth", L"cs_6_0", {}, cs1, &err))
-    { OutputDebugStringA(("[m4] cs1 compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"csmain_pass2_color", L"cs_6_0", {}, cs2, &err))
-    { OutputDebugStringA(("[m4] cs2 compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"csmain_dilate",       L"cs_6_0", {}, csDilate, &err))
-    { OutputDebugStringA(("[m4] csDilate compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"vsmain_resolve",    L"vs_6_0", {}, vsR, &err))
-    { OutputDebugStringA(("[m4] vsR compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_lw.hlsl", L"psmain_resolve",    L"ps_6_0", {}, psR, &err))
-    { OutputDebugStringA(("[m4] psR compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"vsmain_taa", L"vs_6_0", {}, vsTaa, &err))
-    { OutputDebugStringA(("[m4] vsTaa compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"psmain_taa", L"ps_6_0", {}, psTaa, &err))
-    { OutputDebugStringA(("[m4] psTaa compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"psmain_post", L"ps_6_0", {}, psPost, &err))
-    { OutputDebugStringA(("[m4] psPost compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"psmain_godray_mark", L"ps_6_0", {}, psGrMark, &err))
-    { OutputDebugStringA(("[m4] psGrMark compile: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m4_taa_post.hlsl", L"psmain_godray_blur", L"ps_6_0", {}, psGrBlur, &err))
-    { OutputDebugStringA(("[m4] psGrBlur compile: " + err + "\n").c_str()); return false; }
+    auto loadShader = [&](const wchar_t* hlsl, const wchar_t* entry,
+                          const wchar_t* profile, ComPtr<IDxcBlob>& out,
+                          const char* tag) -> bool
+    {
+#if defined(VOXELTEST_XBOX)
+        (void)profile;
+        std::wstring cso = std::wstring(L"shaders/") + (hlsl + 8) // strip "shaders/"
+                         + L"_" + entry + L".cso";
+        if (!shaderc_.LoadCso(cso, out, &err))
+        { OutputDebugStringA(("[m4] " + std::string(tag) + " load: " + err + "\n").c_str()); return false; }
+#else
+        if (!shaderc_.Compile(hlsl, entry, profile, {}, out, &err))
+        { OutputDebugStringA(("[m4] " + std::string(tag) + " compile: " + err + "\n").c_str()); return false; }
+#endif
+        return true;
+    };
+    if (!loadShader(L"shaders/m4_lw.hlsl",       L"csmain_pass1_depth", L"cs_6_0", cs1,      "cs1")) return false;
+    if (!loadShader(L"shaders/m4_lw.hlsl",       L"csmain_pass2_color", L"cs_6_0", cs2,      "cs2")) return false;
+    if (!loadShader(L"shaders/m4_lw.hlsl",       L"csmain_dilate",      L"cs_6_0", csDilate, "csDilate")) return false;
+    if (!loadShader(L"shaders/m4_lw.hlsl",       L"vsmain_resolve",     L"vs_6_0", vsR,      "vsR")) return false;
+    if (!loadShader(L"shaders/m4_lw.hlsl",       L"psmain_resolve",     L"ps_6_0", psR,      "psR")) return false;
+    if (!loadShader(L"shaders/m4_taa_post.hlsl", L"vsmain_taa",         L"vs_6_0", vsTaa,    "vsTaa")) return false;
+    if (!loadShader(L"shaders/m4_taa_post.hlsl", L"psmain_taa",         L"ps_6_0", psTaa,    "psTaa")) return false;
+    if (!loadShader(L"shaders/m4_taa_post.hlsl", L"psmain_post",        L"ps_6_0", psPost,   "psPost")) return false;
+    if (!loadShader(L"shaders/m4_taa_post.hlsl", L"psmain_godray_mark", L"ps_6_0", psGrMark, "psGrMark")) return false;
+    if (!loadShader(L"shaders/m4_taa_post.hlsl", L"psmain_godray_blur", L"ps_6_0", psGrBlur, "psGrBlur")) return false;
 
     if (!buildComputePso(m4Pass1RootSig_.Get(), cs1.Get(), m4Pass1Pso_, L"m4Pass1Pso")) return false;
     if (!buildComputePso(m4Pass2RootSig_.Get(), cs2.Get(), m4Pass2Pso_, L"m4Pass2Pso")) return false;
@@ -1461,9 +1468,9 @@ bool Renderer::CreateM4()
         NameObject(out.Get(), name);
         return true;
     };
-    if (!buildFsTri(vsR.Get(), psR.Get(),    DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+    if (!buildFsTri(vsR.Get(), psR.Get(),    DXGI_FORMAT_R11G11B10_FLOAT, false,
                     m4ResolveRootSig_.Get(), m4ResolvePso_, L"m4ResolvePso")) return false;
-    if (!buildFsTri(vsTaa.Get(), psTaa.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+    if (!buildFsTri(vsTaa.Get(), psTaa.Get(), DXGI_FORMAT_R11G11B10_FLOAT, false,
                     m4TaaRootSig_.Get(), m4TaaPso_, L"m4TaaPso")) return false;
     if (!buildFsTri(vsTaa.Get(), psPost.Get(), BackBufferFormat(),         true,
                     m4PostRootSig_.Get(), m4PostPso_, L"m4PostPso")) return false;
@@ -1573,11 +1580,11 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rd.Width = w; rd.Height = h;
         rd.DepthOrArraySize = 1;
         rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         rd.SampleDesc.Count = 1;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         D3D12_CLEAR_VALUE cv{};
-        cv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        cv.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
@@ -1611,10 +1618,10 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rd.Width = w; rd.Height = h;
         rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         rd.SampleDesc.Count = 1;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        D3D12_CLEAR_VALUE cv{}; cv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        D3D12_CLEAR_VALUE cv{}; cv.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
@@ -1658,7 +1665,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
     srvUint.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvUint.Texture2D.MipLevels = 1;
     D3D12_SHADER_RESOURCE_VIEW_DESC srvRgba{};
-    srvRgba.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    srvRgba.Format = DXGI_FORMAT_R11G11B10_FLOAT;
     srvRgba.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvRgba.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvRgba.Texture2D.MipLevels = 1;
@@ -1698,7 +1705,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
     // RTVs into taaRtvHeap_: 0,1=taaHist 2=taaScene 3,4,5=godray[0..2].
     {
         D3D12_RENDER_TARGET_VIEW_DESC rtvD{};
-        rtvD.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rtvD.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         rtvD.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         D3D12_CPU_DESCRIPTOR_HANDLE h = taaRtvHeap_->GetCPUDescriptorHandleForHeapStart();
         device_->CreateRenderTargetView(taaHistTex_[0].Get(), &rtvD, h); h.ptr += taaRtvDescSize_;
@@ -1743,7 +1750,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     MICROPROFILE_SCOPEI("CPU", "DrawLwScene", 0xff60c060);
     MICROPROFILE_SCOPEGPUI("DrawLwScene", 0xff60c060);
 
+#if !defined(VOXELTEST_XBOX)
     PollShaderHotReload();
+#endif
 
     // ---- Frustum + LOD heuristic ----
     hlslpp::float4x4 view = cam.view();
@@ -2437,8 +2446,6 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     ID3D12DescriptorHeap* imguiHeap[] = { imguiSrvHeap_.Get() };
     cmdList_->SetDescriptorHeaps(1, imguiHeap);
 }
-
-#endif // !VOXELTEST_XBOX — end of shader/M4/draw block
 
 Renderer::StreamLodInfo Renderer::GetStreamLodInfo(int L) const
 {
