@@ -3,8 +3,13 @@
 #include "lodworld.h"
 #include "shader.h"
 
-#include <d3d12.h>
-#include <dxgi1_6.h>
+#if defined(_GAMING_XBOX_SCARLETT) || defined(_GAMING_XBOX_XBOXONE)
+  #include <d3d12_xs.h>
+  #define VOXELTEST_XBOX 1
+#else
+  #include <d3d12.h>
+  #include <dxgi1_6.h>
+#endif
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -218,9 +223,14 @@ private:
         uint64_t bytes        = 0;
     };
 
+#if defined(VOXELTEST_XBOX)
+    ComPtr<ID3D12XboxDevice>         device_;
+    D3D12XBOX_FRAME_PIPELINE_TOKEN   frameToken_ = D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL;
+#else
     ComPtr<ID3D12Device>             device_;
     ComPtr<IDXGIFactory6>            factory_;
     ComPtr<IDXGISwapChain3>          swap_;
+#endif
     ComPtr<ID3D12CommandQueue>       cmdQueue_;
     ComPtr<ID3D12CommandAllocator>   cmdAlloc_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmdList_;

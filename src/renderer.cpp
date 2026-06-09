@@ -76,6 +76,10 @@ Renderer::~Renderer() { Shutdown(); }
 std::vector<std::string> Renderer::EnumerateAdapters()
 {
     std::vector<std::string> names;
+#if defined(VOXELTEST_XBOX)
+    names.emplace_back("Xbox Series X|S (Scarlett)");
+    return names;
+#else
     ComPtr<IDXGIFactory6> f;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&f)))) return names;
 
@@ -96,6 +100,7 @@ std::vector<std::string> Renderer::EnumerateAdapters()
         a.Reset();
     }
     return names;
+#endif
 }
 
 bool Renderer::Init(HWND hwnd, int adapterIdx)
@@ -169,6 +174,63 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
     return true;
 }
 
+#if defined(VOXELTEST_XBOX)
+bool Renderer::CreateDeviceAndSwap(HWND, int)
+{
+    // ---- Xbox Scarlett device + swap chain (PresentX flow) ----
+    D3D12XBOX_CREATE_DEVICE_PARAMETERS params = {};
+    params.Version = D3D12_SDK_VERSION;
+#if defined(_DEBUG)
+    params.ProcessDebugFlags = D3D12_PROCESS_DEBUG_FLAG_DEBUG_LAYER_ENABLED;
+#endif
+    params.GraphicsCommandQueueRingSizeBytes = D3D12XBOX_DEFAULT_SIZE_BYTES;
+    params.GraphicsScratchMemorySizeBytes    = D3D12XBOX_DEFAULT_SIZE_BYTES;
+    params.ComputeScratchMemorySizeBytes     = D3D12XBOX_DEFAULT_SIZE_BYTES;
+    if (FAILED(D3D12XboxCreateDevice(nullptr, &params, IID_PPV_ARGS(&device_))))
+        return false;
+    NameObject(device_.Get(), L"device");
+
+    {
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&cmdQueue_)))) return false;
+        NameObject(cmdQueue_.Get(), L"cmdQueue");
+    }
+
+    // Backbuffers as committed default-heap render-target textures. No DXGI swap.
+    for (UINT i = 0; i < kFrameCount; ++i)
+    {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = width_; rd.Height = height_;
+        rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = BackBufferFormat();
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv{}; cv.Format = BackBufferFormat();
+        if (FAILED(device_->CreateCommittedResource(
+                       &hp, D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES, &rd,
+                       D3D12_RESOURCE_STATE_PRESENT, &cv,
+                       IID_PPV_ARGS(&backBuffers_[i])))) return false;
+    }
+
+    // Frame-event registration. RegisterFrameEventsX takes plane params for the
+    // primary swap. Token sourced via WaitFrameEventX(ORIGIN) each frame.
+    D3D12XBOX_FRAME_PIPELINE_TOKEN preToken = D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL;
+    if (FAILED(device_->RegisterFrameEventsX(0, nullptr, nullptr, D3D12XBOX_FRAME_INTERVAL_60_HZ, D3D12XBOX_FRAME_INTERVAL_FLAG_NONE)))
+        return false;
+
+    for (UINT i = 0; i < kFrameCount; ++i)
+    {
+        if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   IID_PPV_ARGS(&cmdAlloc_[i])))) return false;
+    }
+    frameIndex_ = 0;
+    tearingSupported_ = false;
+    return true;
+}
+#else
 bool Renderer::CreateDeviceAndSwap(HWND hwnd, int adapterIdx)
 {
     UINT dxgiFlags = 0;
@@ -264,6 +326,7 @@ bool Renderer::CreateDeviceAndSwap(HWND hwnd, int adapterIdx)
     }
     return true;
 }
+#endif // !VOXELTEST_XBOX
 
 bool Renderer::CreateRenderTargets()
 {
@@ -413,6 +476,11 @@ void Renderer::ImGuiSrvFree(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HA
 
 void Renderer::Resize(uint32_t w, uint32_t h)
 {
+#if defined(VOXELTEST_XBOX)
+    // Xbox = fixed 1920x1080 / 3840x2160 backbuffer; no dynamic resize.
+    (void)w; (void)h;
+    return;
+#else
     if (!device_ || !swap_) return;
     if (w == width_ && h == height_) return;
     if (w == 0 || h == 0) return;
@@ -430,6 +498,7 @@ void Renderer::Resize(uint32_t w, uint32_t h)
     frameIndex_ = swap_->GetCurrentBackBufferIndex();
     CreateRenderTargets();
     if (m4TexHeap_) CreateVisTextures(w, h);
+#endif
 }
 
 void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
@@ -475,13 +544,21 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
     }
 #endif
 
+#if defined(VOXELTEST_XBOX)
+    // Block on frame origin so the frame token is valid for PresentX later.
+    frameToken_ = D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL;
+    device_->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, INFINITE,
+                             nullptr, D3D12XBOX_WAIT_FRAME_EVENT_FLAG_NONE,
+                             &frameToken_);
+#endif
+
     auto& alloc = cmdAlloc_[frameIndex_];
     ThrowIfFailed(alloc->Reset(), "alloc reset");
     ThrowIfFailed(cmdList_->Reset(alloc.Get(), nullptr), "list reset");
 
-    // Register the cmd list as the GPU context for MicroProfile so that any
-    // MICROPROFILE_SCOPEGPUI() calls during this frame record into it.
+#if MICROPROFILE_ENABLED
     MicroProfileGpuSetContext(cmdList_.Get());
+#endif
 
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -537,9 +614,18 @@ void Renderer::EndFrame(bool vsync)
     ID3D12CommandList* lists[] = { cmdList_.Get() };
     cmdQueue_->ExecuteCommandLists(1, lists);
 
+#if defined(VOXELTEST_XBOX)
+    (void)vsync;
+    D3D12XBOX_PRESENT_PLANE_PARAMETERS plane{};
+    plane.Token = frameToken_;
+    plane.ResourceCount = 1;
+    plane.ppResources = backBuffers_[frameIndex_].GetAddressOf();
+    cmdQueue_->PresentX(1, &plane, nullptr);
+#else
     UINT syncInterval = vsync ? 1 : 0;
     UINT presentFlags = (!vsync && tearingSupported_) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     swap_->Present(syncInterval, presentFlags);
+#endif
 
     if (graphicsMemory_) graphicsMemory_->Commit(cmdQueue_.Get());
 
