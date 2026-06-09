@@ -1,14 +1,30 @@
 #pragma once
-#include "camera.h"
-#include "lodworld.h"
-#include "shader.h"
 
+// D3D headers come FIRST — on Xbox `d3d12_xs.h` errors if stock dxgicommon.h
+// is pulled before it. Everything else (camera.h via hlsl++, lodworld.h, etc.)
+// goes after.
 #if defined(_GAMING_XBOX_SCARLETT) || defined(_GAMING_XBOX_XBOXONE)
-  #include <d3d12_xs.h>
   #define VOXELTEST_XBOX 1
+  #include <wrl/client.h>
+  #include <gxdk.h>
+  #include <d3d12_xs.h>
+  // Xbox D3D types don't derive from standard IUnknown — WRL's IID_PPV_ARGS
+  // hits a static_assert. Redirect to IID_GRAPHICS_PPV_ARGS which expects T**.
+  // Existing call sites pass `&ptr` (ComPtr<T>*). `(&ptr)->ReleaseAndGetAddressOf()`
+  // == `ptr.ReleaseAndGetAddressOf()` → T**.
+  #ifdef IID_PPV_ARGS
+    #undef IID_PPV_ARGS
+  #endif
+  #define IID_PPV_ARGS(x) IID_GRAPHICS_PPV_ARGS((x).ReleaseAndGetAddressOf())
 #else
   #include <d3d12.h>
   #include <dxgi1_6.h>
+#endif
+
+#include "camera.h"
+#include "lodworld.h"
+#if !defined(VOXELTEST_XBOX)
+  #include "shader.h"
 #endif
 #include <vector>
 #include <string>
@@ -147,7 +163,13 @@ public:
     ID3D12Device*               Device() const     { return device_.Get(); }
     ID3D12GraphicsCommandList*  CommandList() const{ return cmdList_.Get(); }
     ID3D12CommandQueue*         CommandQueue() const{ return cmdQueue_.Get(); }
-    DXGI_FORMAT                 BackBufferFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
+    DXGI_FORMAT                 BackBufferFormat() const {
+#if defined(VOXELTEST_XBOX)
+        return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+#else
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+#endif
+    }
     UINT                        FrameIndex() const { return frameIndex_; }
 
     // Shader-visible CBV/SRV/UAV heap shared with imgui. Reserve a small range
@@ -223,11 +245,12 @@ private:
         uint64_t bytes        = 0;
     };
 
+    // On Xbox d3d12_xs.h decorates ID3D12Device with WaitFrameEventX etc.
+    // Same interface name, different methods. Sample uses ID3D12Device.
+    ComPtr<ID3D12Device>             device_;
 #if defined(VOXELTEST_XBOX)
-    ComPtr<ID3D12XboxDevice>         device_;
     D3D12XBOX_FRAME_PIPELINE_TOKEN   frameToken_ = D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL;
 #else
-    ComPtr<ID3D12Device>             device_;
     ComPtr<IDXGIFactory6>            factory_;
     ComPtr<IDXGISwapChain3>          swap_;
 #endif
@@ -260,7 +283,9 @@ private:
     std::unique_ptr<DirectX::GraphicsMemory> graphicsMemory_;
 
     // M2 — validation demo (DXC compile + rootsig + PSO + IA-less triangle).
+#if !defined(VOXELTEST_XBOX)
     ShaderCompiler                   shaderc_;
+#endif
     ComPtr<ID3D12RootSignature>      m2RootSig_;
     ComPtr<ID3D12PipelineState>      m2Pso_;
 

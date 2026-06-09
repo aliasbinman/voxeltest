@@ -5,7 +5,12 @@
 // returning safe defaults — they will be ported incrementally in M3+.
 #define NOMINMAX
 #include "renderer.h"
+#if !defined(VOXELTEST_XBOX)
 #include "microprofile.h"
+#else
+#define MICROPROFILE_SCOPEI(group, name, color) do{}while(0)
+#define MICROPROFILE_SCOPEGPUI(name, color)     do{}while(0)
+#endif
 #include <hlsl++.h>
 
 #include <DescriptorHeap.h>
@@ -107,10 +112,16 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
 {
     hwnd_ = hwnd;
 
+#if defined(VOXELTEST_XBOX)
+    (void)hwnd;
+    width_  = 1920;
+    height_ = 1080;
+#else
     RECT rc{};
     GetClientRect(hwnd, &rc);
     width_  = (uint32_t)std::max<LONG>(1, rc.right  - rc.left);
     height_ = (uint32_t)std::max<LONG>(1, rc.bottom - rc.top);
+#endif
 
     try
     {
@@ -141,8 +152,8 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         imguiSrvNextSlot_ = 0;
 
+#if !defined(VOXELTEST_XBOX)
         graphicsMemory_ = std::make_unique<DirectX::GraphicsMemory>(device_.Get());
-
         if (!shaderc_.Init())
         {
             OutputDebugStringA("ShaderCompiler::Init failed\n");
@@ -164,6 +175,7 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
 
         if (!CreateM4()) return false;
         if (!CreateVisTextures(width_, height_)) return false;
+#endif // !VOXELTEST_XBOX
     }
     catch (const std::exception& e)
     {
@@ -210,16 +222,31 @@ bool Renderer::CreateDeviceAndSwap(HWND, int)
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         D3D12_CLEAR_VALUE cv{}; cv.Format = BackBufferFormat();
         if (FAILED(device_->CreateCommittedResource(
-                       &hp, D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES, &rd,
+                       &hp, D3D12_HEAP_FLAG_ALLOW_DISPLAY, &rd,
                        D3D12_RESOURCE_STATE_PRESENT, &cv,
                        IID_PPV_ARGS(&backBuffers_[i])))) return false;
     }
 
-    // Frame-event registration. RegisterFrameEventsX takes plane params for the
-    // primary swap. Token sourced via WaitFrameEventX(ORIGIN) each frame.
-    D3D12XBOX_FRAME_PIPELINE_TOKEN preToken = D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL;
-    if (FAILED(device_->RegisterFrameEventsX(0, nullptr, nullptr, D3D12XBOX_FRAME_INTERVAL_60_HZ, D3D12XBOX_FRAME_INTERVAL_FLAG_NONE)))
-        return false;
+    // Frame interval registration. Path = device → DXGI device → adapter →
+    // output → SetFrameIntervalX. WaitFrameEventX(ORIGIN) sources the per-frame
+    // token in BeginFrame.
+    {
+        ComPtr<IDXGIDevice1> dxgiDevice;
+        if (FAILED(device_.As(&dxgiDevice))) return false;
+        ComPtr<IDXGIAdapter> dxgiAdapter;
+        if (FAILED(dxgiDevice->GetAdapter(&dxgiAdapter))) return false;
+        ComPtr<IDXGIOutput> dxgiOutput;
+        if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) return false;
+        if (FAILED(device_->SetFrameIntervalX(dxgiOutput.Get(),
+                                              D3D12XBOX_FRAME_INTERVAL_60_HZ,
+                                              kFrameCount - 1u,
+                                              D3D12XBOX_FRAME_INTERVAL_FLAG_NONE)))
+            return false;
+        if (FAILED(device_->ScheduleFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN,
+                                                 0, nullptr,
+                                                 D3D12XBOX_SCHEDULE_FRAME_EVENT_FLAG_NONE)))
+            return false;
+    }
 
     for (UINT i = 0; i < kFrameCount; ++i)
     {
@@ -342,13 +369,16 @@ bool Renderer::CreateRenderTargets()
         D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
         for (UINT i = 0; i < kFrameCount; ++i)
         {
+#if !defined(VOXELTEST_XBOX)
             ThrowIfFailed(swap_->GetBuffer(i, IID_PPV_ARGS(&backBuffers_[i])),
                           "GetBuffer");
+#endif
             device_->CreateRenderTargetView(backBuffers_[i].Get(), nullptr, h);
             h.ptr += rtvDescSize_;
         }
     }
 
+#if !defined(VOXELTEST_XBOX)
     {
         D3D12_DESCRIPTOR_HEAP_DESC d{};
         d.NumDescriptors = 1;
@@ -384,9 +414,11 @@ bool Renderer::CreateRenderTargets()
         device_->CreateDepthStencilView(depthTex_.Get(), &dvd,
                                         dsvHeap_->GetCPUDescriptorHandleForHeapStart());
     }
+#endif
     return true;
 }
 
+#if !defined(VOXELTEST_XBOX)
 bool Renderer::CreateM2Demo()
 {
     // Empty root signature — shader uses only SV_VertexID + immediate consts.
@@ -455,6 +487,7 @@ bool Renderer::CreateM2Demo()
     NameObject(m2Pso_.Get(), L"m2Pso");
     return true;
 }
+#endif // !VOXELTEST_XBOX
 
 void Renderer::ImGuiSrvAlloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
                              D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
@@ -518,7 +551,7 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
         return;
     }
 
-#if defined(_DEBUG)
+#if defined(_DEBUG) && !defined(VOXELTEST_XBOX)
     // Drain D3D12 info queue → stdout so warnings / errors aren't silent.
     {
         ComPtr<ID3D12InfoQueue> iq;
@@ -570,14 +603,21 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += SIZE_T(frameIndex_) * rtvDescSize_;
+#if defined(VOXELTEST_XBOX)
+    cmdList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = {}; (void)dsv;
+#else
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
     cmdList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+#endif
 
     {
         MICROPROFILE_SCOPEGPUI("BeginFrame/Clear", 0xff60a0c0);
         if (!skipClear)
             cmdList_->ClearRenderTargetView(rtv, clear, 0, nullptr);
+#if !defined(VOXELTEST_XBOX)
         cmdList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+#endif
     }
 
     D3D12_VIEWPORT vp{ 0, 0, (float)width_, (float)height_, 0.0f, 1.0f };
@@ -585,8 +625,10 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
     cmdList_->RSSetViewports(1, &vp);
     cmdList_->RSSetScissorRects(1, &sc);
 
-    ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap_.Get() };
-    cmdList_->SetDescriptorHeaps(1, heaps);
+    if (imguiSrvHeap_) {
+        ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap_.Get() };
+        cmdList_->SetDescriptorHeaps(1, heaps);
+    }
 
     // M2 demo only when LW world isn't loaded — once we have voxels, draw those.
     if (m2Pso_ && !lwHasWorld_)
@@ -649,7 +691,11 @@ void Renderer::MoveToNextFrame()
 {
     const UINT64 sig = fenceValues_[frameIndex_];
     ThrowIfFailed(cmdQueue_->Signal(fence_.Get(), sig), "Signal");
+#if defined(VOXELTEST_XBOX)
+    frameIndex_ = (frameIndex_ + 1) % kFrameCount;
+#else
     frameIndex_ = swap_->GetCurrentBackBufferIndex();
+#endif
     if (fence_->GetCompletedValue() < fenceValues_[frameIndex_])
     {
         ThrowIfFailed(fence_->SetEventOnCompletion(fenceValues_[frameIndex_], fenceEvent_),
@@ -676,10 +722,14 @@ void Renderer::Shutdown()
     m2Pso_.Reset();
     m2RootSig_.Reset();
     cmdQueue_.Reset();
+#if !defined(VOXELTEST_XBOX)
     swap_.Reset();
+#endif
     fence_.Reset();
     device_.Reset();
+#if !defined(VOXELTEST_XBOX)
     factory_.Reset();
+#endif
 }
 
 // ===== M3 — LW upload =======================================================
@@ -998,6 +1048,7 @@ static uint64_t LatestShaderMtime()
     return mx;
 }
 
+#if !defined(VOXELTEST_XBOX)
 void Renderer::PollShaderHotReload()
 {
     uint64_t now = LatestShaderMtime();
@@ -2386,6 +2437,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     ID3D12DescriptorHeap* imguiHeap[] = { imguiSrvHeap_.Get() };
     cmdList_->SetDescriptorHeaps(1, imguiHeap);
 }
+
+#endif // !VOXELTEST_XBOX — end of shader/M4/draw block
 
 Renderer::StreamLodInfo Renderer::GetStreamLodInfo(int L) const
 {

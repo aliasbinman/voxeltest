@@ -1,5 +1,11 @@
 # Build outputs
 build/
+build_xbox/
+
+# Xbox GDK platform deploy stage (VS auto-creates next to vcxproj)
+Gaming.Xbox.Scarlett.x64/
+Gaming.Xbox.XboxOne.x64/
+
 *.exe
 *.obj
 *.pdb
@@ -11,6 +17,7 @@ build/
 *.exp
 *.tlog
 *.log
+*.dll
 
 # Visual Studio user/temp files
 .vs/
