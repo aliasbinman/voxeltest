@@ -106,6 +106,7 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     float2 currUv = currUvCenter + float2(gJitter.x * 0.5, -gJitter.y * 0.5);
     float4 curSample = gTaaScene.SampleLevel(gTaaSamp, currUv, 0);
     float3 curC = curSample.rgb;
+
     float outAlpha = curSample.a;
     float  d  = gTaaDepth.Load(int3(pix, 0));
     if (d <= 0.0) {
@@ -179,7 +180,9 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     float dist = length(clipped - prevC) / max(length(nMax - nMin), 1e-4);
     float alpha = lerp(0.1, 0.5, saturate(dist));
     float3 outC = lerp(clipped, curC, alpha);
-    return float4(outC, outAlpha);
+    outC.r = 1.0;
+    
+    return float4(outC, 0.0);//    outAlpha);
 }
 
 // ---------------- Post pass: sky for empty pixels + unsharp + godrays ----------------

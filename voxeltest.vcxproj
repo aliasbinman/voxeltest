@@ -109,6 +109,7 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
   <ItemGroup>
     <None Include="shaders\m2_demo.hlsl" />
     <None Include="shaders\m4_lw.hlsl" />
+    <None Include="shaders\m4_taa_post.hlsl" />
     <None Include="shaders\voxel.hlsl" />
     <None Include="shaders\lodworld.hlsl" />
     <None Include="shaders\postfx.hlsl" />

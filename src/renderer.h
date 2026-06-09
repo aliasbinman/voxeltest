@@ -183,7 +183,12 @@ public:
     enum class ReloadStatus { None, Success, Failed };
     ReloadStatus lastReloadStatus_ = ReloadStatus::None;
     uint32_t reloadCount_ = 0;
-    bool ForceReloadShaders() { return false; }
+    bool ForceReloadShaders();
+private:
+    void PollShaderHotReload();
+    bool RecompileShaders();
+    uint64_t lastShaderMtime_ = 0;
+public:
 
 private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
@@ -261,15 +266,41 @@ private:
     // m4TexHeap_:  0=depthUav  1=colorUav  2=depthSrv  3=colorSrv.
     ComPtr<ID3D12Resource>            visDepthTex_;
     ComPtr<ID3D12Resource>            visColorTex_;
-    ComPtr<ID3D12DescriptorHeap>      m4TexHeap_;        // shader-visible
-    ComPtr<ID3D12DescriptorHeap>      m4TexClearHeap_;   // non-shader-visible mirror (for ClearUAV)
+    ComPtr<ID3D12Resource>            visColor2Tex_;     // dilated color (R32_UINT)
+    ComPtr<ID3D12Resource>            visDepth2Tex_;     // dilated depth (R32_FLOAT, gNearZ/viewZ form)
+    ComPtr<ID3D12Resource>            taaSceneTex_;      // resolve output (R11G11B10F)
+    ComPtr<ID3D12Resource>            godrayDummyTex_;   // 1x1 R32F black, bound at t9/t10
+    // m4TexHeap slot layout (13 entries):
+    //   0=visDepthUav   1=visColorUav   2=visDepthSrv   3=visColorSrv
+    //   4=taaHistSrv[0] 5=taaHistSrv[1]
+    //   6=visColor2Uav  7=visDepth2Uav
+    //   8=visDepth2Srv  9=visColor2Srv
+    //   10=taaSceneSrv  11=godrayDummySrv  12=godrayDummySrv (alias t10)
+    ComPtr<ID3D12DescriptorHeap>      m4TexHeap_;
+    ComPtr<ID3D12DescriptorHeap>      m4TexClearHeap_;
     UINT                              m4TexDescSize_ = 0;
     ComPtr<ID3D12RootSignature>       m4Pass1RootSig_;
     ComPtr<ID3D12RootSignature>       m4Pass2RootSig_;
+    ComPtr<ID3D12RootSignature>       m4DilateRootSig_;
     ComPtr<ID3D12RootSignature>       m4ResolveRootSig_;
+    ComPtr<ID3D12RootSignature>       m4TaaRootSig_;
+    ComPtr<ID3D12RootSignature>       m4PostRootSig_;
     ComPtr<ID3D12PipelineState>       m4Pass1Pso_;
     ComPtr<ID3D12PipelineState>       m4Pass2Pso_;
+    ComPtr<ID3D12PipelineState>       m4DilatePso_;
     ComPtr<ID3D12PipelineState>       m4ResolvePso_;
+    ComPtr<ID3D12PipelineState>       m4TaaPso_;
+    ComPtr<ID3D12PipelineState>       m4PostPso_;
+
+    // TAA — ping-pong history RGBA8 RTs. Resolve writes to taaHist[curr]
+    // sampling taaHist[prev]; blit then samples taaHist[curr] to backbuffer.
+    ComPtr<ID3D12Resource>            taaHistTex_[2];
+    ComPtr<ID3D12DescriptorHeap>      taaRtvHeap_; // slots 0,1=taaHist[0,1] RTV, 2=taaScene RTV
+    UINT                              taaRtvDescSize_ = 0;
+    uint32_t                          taaCurrIdx_ = 0;
+    uint32_t                          taaFrame_   = 0; // resets to 0 on world change / resize
+    bool                              taaHistValid_[2] = {false, false};
+    float                             taaPrevVP_[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
     uint32_t                          visTexW_ = 0;
     uint32_t                          visTexH_ = 0;
 
