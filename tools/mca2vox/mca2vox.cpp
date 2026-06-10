@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cassert>
+#include <deque>
+#include <utility>
+#include <tuple>
 
 namespace fs = std::filesystem;
 
@@ -539,11 +542,25 @@ static void ForEachChunk(const std::vector<RegionFile_>& regs, Cb cb)
 int main(int argc, char** argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: mca2vox <world_dir> <out.vox>\n");
+        fprintf(stderr, "usage: mca2vox <world_dir> <out.vox> [--sky-cull] [--height-cull[=N]]\n");
         return 1;
     }
     const char* worldPath = argv[1];
     const char* outPath = argv[2];
+    bool skyCull = false;
+    bool heightCull = false;
+    int  heightCullN = 10;
+    for (int i = 3; i < argc; ++i) {
+        if (!strcmp(argv[i], "--sky-cull")) skyCull = true;
+        else if (!strcmp(argv[i], "--height-cull")) heightCull = true;
+        else if (!strncmp(argv[i], "--height-cull=", 14)) {
+            heightCull = true;
+            heightCullN = atoi(argv[i] + 14);
+            if (heightCullN < 0) heightCullN = 0;
+        }
+        else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 1; }
+    }
+    if (heightCull) skyCull = false;     // height-cull overrides sky-cull
     const int   D = 64;                       // chunkDim of output
 
     fs::path regionDir = fs::path(worldPath) / "region";
@@ -659,17 +676,341 @@ int main(int argc, char** argv)
            pass1Chunks, globalSolid.size(), pal.rgb.size(),
            (double)globalSolid.size() * u64PerCol * 8.0 / (1024 * 1024));
 
-    // ----- Pass 2: re-scan, emit voxels with global-neighbour visMask, cull vm==0. -----
+    // ----- Helpers shared by pass 2 (and sky flood below). -----
+    auto NormCol = [&](int& cx, int& cz, int& lx, int& lz) {
+        if (lx < 0)        { cx -= 1; lx += 16; }
+        else if (lx >= 16) { cx += 1; lx -= 16; }
+        if (lz < 0)        { cz -= 1; lz += 16; }
+        else if (lz >= 16) { cz += 1; lz -= 16; }
+    };
     auto SolidAt = [&](int mcCX, int mcCZ, int lx, int ly, int lz) -> bool {
         if (ly < 0 || ly >= yCount) return false;
-        // wrap lx/lz across mc-chunk boundaries
-        int dx = 0, dz = 0;
-        if (lx < 0)      { dx = -1; lx += 16; }
-        else if (lx >= 16) { dx = +1; lx -= 16; }
-        if (lz < 0)      { dz = -1; lz += 16; }
-        else if (lz >= 16) { dz = +1; lz -= 16; }
-        auto it = globalSolid.find(McKey(mcCX + dx, mcCZ + dz));
+        NormCol(mcCX, mcCZ, lx, lz);
+        auto it = globalSolid.find(McKey(mcCX, mcCZ));
         if (it == globalSolid.end()) return false;
+        int ci = ColIdx(lx, ly, lz);
+        return (it->second.bits[ci >> 6] >> (ci & 63)) & 1ull;
+    };
+
+    // ----- Sky flood + kept derivation. -----
+    std::unordered_map<uint64_t, ColSolid> globalKept;
+    if (skyCull) {
+        // 1. Classify absent cols: BFS over col grid from outer shell through absent cols.
+        int cxMin = INT32_MAX, cxMax = INT32_MIN;
+        int czMin = INT32_MAX, czMax = INT32_MIN;
+        for (auto& kv : globalSolid) {
+            int cx = (int32_t)(kv.first & 0xFFFFFFFFu);
+            int cz = (int32_t)(kv.first >> 32);
+            cxMin = std::min(cxMin, cx); cxMax = std::max(cxMax, cx);
+            czMin = std::min(czMin, cz); czMax = std::max(czMax, cz);
+        }
+        std::unordered_map<uint64_t, uint8_t> colAir;
+        {
+            std::deque<std::pair<int,int>> q;
+            auto Try = [&](int cx, int cz) {
+                if (globalSolid.find(McKey(cx, cz)) != globalSolid.end()) return;
+                uint64_t k = McKey(cx, cz);
+                if (colAir.emplace(k, 1).second) q.push_back({ cx, cz });
+            };
+            for (int cz = czMin - 1; cz <= czMax + 1; ++cz) {
+                Try(cxMin - 1, cz); Try(cxMax + 1, cz);
+            }
+            for (int cx = cxMin - 1; cx <= cxMax + 1; ++cx) {
+                Try(cx, czMin - 1); Try(cx, czMax + 1);
+            }
+            while (!q.empty()) {
+                auto [cx, cz] = q.front(); q.pop_front();
+                for (int d = 0; d < 4; ++d) {
+                    const int dx[4] = { +1, -1, 0, 0 };
+                    const int dz[4] = { 0, 0, +1, -1 };
+                    int nx = cx + dx[d], nz = cz + dz[d];
+                    if (nx < cxMin - 1 || nx > cxMax + 1) continue;
+                    if (nz < czMin - 1 || nz > czMax + 1) continue;
+                    Try(nx, nz);
+                }
+            }
+            printf("[skycull] col-grid cx[%d..%d] cz[%d..%d] absent-air=%zu\n",
+                   cxMin, cxMax, czMin, czMax, colAir.size());
+        }
+        auto AbsentColIsAir = [&](int cx, int cz) -> bool {
+            return colAir.find(McKey(cx, cz)) != colAir.end();
+        };
+
+        // 2. Build exposed-air bitset per col via voxel-level BFS.
+        std::unordered_map<uint64_t, ColSolid> globalExposed;
+        globalExposed.reserve(globalSolid.size() * 2);
+        printf("[skycull] expected exposed colMem ~%.1f MB\n",
+               (double)globalSolid.size() * u64PerCol * 8.0 / (1024 * 1024));
+
+        // Seed.
+        struct QE { int cx, cz, lx, ly, lz; };
+        std::deque<QE> q;
+        for (auto& kv : globalSolid) {
+            int cx = (int32_t)(kv.first & 0xFFFFFFFFu);
+            int cz = (int32_t)(kv.first >> 32);
+            ColSolid& s = kv.second;
+            ColSolid& e = globalExposed[McKey(cx, cz)];
+            if (e.bits.empty()) e.bits.assign(u64PerCol, 0);
+
+            // Seed top-Y plane (ly = yCount-1).
+            int topY = yCount - 1;
+            for (int lz = 0; lz < 16; ++lz)
+            for (int lx = 0; lx < 16; ++lx) {
+                int ci = ColIdx(lx, topY, lz);
+                if ((s.bits[ci >> 6] >> (ci & 63)) & 1ull) continue;
+                e.bits[ci >> 6] |= (uint64_t)1 << (ci & 63);
+                q.push_back({ cx, cz, lx, topY, lz });
+            }
+            // Seed lateral cells whose +X/-X/+Z/-Z neighbor col is absent-air.
+            const int faceDir[4][2] = { { +1, 0 }, { -1, 0 }, { 0, +1 }, { 0, -1 } };
+            for (int d = 0; d < 4; ++d) {
+                int ncx = cx + faceDir[d][0];
+                int ncz = cz + faceDir[d][1];
+                if (globalSolid.find(McKey(ncx, ncz)) != globalSolid.end()) continue;
+                if (!AbsentColIsAir(ncx, ncz)) continue;
+                int axis = (faceDir[d][0] != 0) ? 0 : 1;     // 0=X face, 1=Z face
+                int fixed = (axis == 0)
+                            ? (faceDir[d][0] > 0 ? 15 : 0)
+                            : (faceDir[d][1] > 0 ? 15 : 0);
+                for (int ly = 0; ly < yCount; ++ly)
+                for (int b = 0; b < 16; ++b) {
+                    int lx, lz;
+                    if (axis == 0) { lx = fixed; lz = b; }
+                    else           { lx = b; lz = fixed; }
+                    int ci = ColIdx(lx, ly, lz);
+                    if ((s.bits[ci >> 6] >> (ci & 63)) & 1ull) continue;
+                    if ((e.bits[ci >> 6] >> (ci & 63)) & 1ull) continue;
+                    e.bits[ci >> 6] |= (uint64_t)1 << (ci & 63);
+                    q.push_back({ cx, cz, lx, ly, lz });
+                }
+            }
+        }
+        printf("[skycull] seeded %zu cells, BFS...\n", q.size());
+
+        // BFS propagate.
+        size_t bfsVisited = 0;
+        const int kNbr6[6][3] = {
+            { +1, 0, 0 }, { -1, 0, 0 },
+            { 0, +1, 0 }, { 0, -1, 0 },
+            { 0, 0, +1 }, { 0, 0, -1 },
+        };
+        while (!q.empty()) {
+            QE c = q.front(); q.pop_front();
+            ++bfsVisited;
+            for (int d = 0; d < 6; ++d) {
+                int ncx = c.cx, ncz = c.cz;
+                int nx = c.lx + kNbr6[d][0];
+                int ny = c.ly + kNbr6[d][1];
+                int nz = c.lz + kNbr6[d][2];
+                if (ny < 0 || ny >= yCount) continue;
+                NormCol(ncx, ncz, nx, nz);
+                auto itS = globalSolid.find(McKey(ncx, ncz));
+                if (itS == globalSolid.end()) continue;       // absent col → already classified
+                int ci = ColIdx(nx, ny, nz);
+                if ((itS->second.bits[ci >> 6] >> (ci & 63)) & 1ull) continue;  // solid
+                ColSolid& en = globalExposed[McKey(ncx, ncz)];
+                if (en.bits.empty()) en.bits.assign(u64PerCol, 0);
+                if ((en.bits[ci >> 6] >> (ci & 63)) & 1ull) continue;            // already exposed
+                en.bits[ci >> 6] |= (uint64_t)1 << (ci & 63);
+                q.push_back({ ncx, ncz, nx, ny, nz });
+            }
+            if ((bfsVisited & 0xFFFFFF) == 0) {
+                printf("[skycull] BFS visited=%zu queue=%zu\n", bfsVisited, q.size());
+            }
+        }
+        printf("[skycull] BFS done visited=%zu\n", bfsVisited);
+
+        // 3. Derive kept bitset = solid AND (any 6-neighbor air cell is exposed OR absent-air col).
+        size_t keptTotal = 0;
+        for (auto& kv : globalSolid) {
+            int cx = (int32_t)(kv.first & 0xFFFFFFFFu);
+            int cz = (int32_t)(kv.first >> 32);
+            ColSolid& s = kv.second;
+            ColSolid& k = globalKept[McKey(cx, cz)];
+            k.bits.assign(u64PerCol, 0);
+            for (int ly = 0; ly < yCount; ++ly)
+            for (int lz = 0; lz < 16; ++lz)
+            for (int lx = 0; lx < 16; ++lx) {
+                int ci = ColIdx(lx, ly, lz);
+                if (!((s.bits[ci >> 6] >> (ci & 63)) & 1ull)) continue;
+                bool exp = false;
+                for (int d = 0; d < 6; ++d) {
+                    int ncx = cx, ncz = cz;
+                    int nx = lx + kNbr6[d][0];
+                    int ny = ly + kNbr6[d][1];
+                    int nz = lz + kNbr6[d][2];
+                    if (ny < 0)            { continue; }
+                    if (ny >= yCount)      { exp = true; break; }     // above world = sky
+                    NormCol(ncx, ncz, nx, nz);
+                    auto itS = globalSolid.find(McKey(ncx, ncz));
+                    if (itS == globalSolid.end()) {
+                        if (AbsentColIsAir(ncx, ncz)) { exp = true; break; }
+                        continue;                                      // absent-solid
+                    }
+                    int ni = ColIdx(nx, ny, nz);
+                    if ((itS->second.bits[ni >> 6] >> (ni & 63)) & 1ull) continue;   // solid
+                    auto itE = globalExposed.find(McKey(ncx, ncz));
+                    if (itE == globalExposed.end()) continue;
+                    if ((itE->second.bits[ni >> 6] >> (ni & 63)) & 1ull) { exp = true; break; }
+                }
+                if (exp) {
+                    k.bits[ci >> 6] |= (uint64_t)1 << (ci & 63);
+                    ++keptTotal;
+                }
+            }
+        }
+        auto Popcnt = [](uint64_t w) {
+            w = w - ((w >> 1) & 0x5555555555555555ull);
+            w = (w & 0x3333333333333333ull) + ((w >> 2) & 0x3333333333333333ull);
+            w = (w + (w >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+            return (size_t)((w * 0x0101010101010101ull) >> 56);
+        };
+        size_t solidTotal = 0;
+        for (auto& kv : globalSolid)
+            for (uint64_t w : kv.second.bits) solidTotal += Popcnt(w);
+        printf("[skycull] kept=%zu of %zu solid  (%.1f%% culled)\n",
+               keptTotal, solidTotal, 100.0 - 100.0 * (double)keptTotal / std::max<size_t>(solidTotal, 1));
+
+        // Free exposed bitset; not needed for emit.
+        globalExposed.clear();
+    }
+
+    // ----- Height-map cull: keep surface + cliff/wall + N-voxel rind. -----
+    if (heightCull) {
+        // 1. Per-col heightmap: 16x16 int16 (=-1 if no solid in column).
+        struct ColH { std::vector<int16_t> h; };  // size 256
+        std::unordered_map<uint64_t, ColH> heights;
+        heights.reserve(globalSolid.size() * 2);
+        for (auto& kv : globalSolid) {
+            int cx = (int32_t)(kv.first & 0xFFFFFFFFu);
+            int cz = (int32_t)(kv.first >> 32);
+            ColSolid& s = kv.second;
+            ColH& h = heights[McKey(cx, cz)];
+            h.h.assign(256, (int16_t)-1);
+            // Scan top-down per (lx,lz).
+            for (int lz = 0; lz < 16; ++lz)
+            for (int lx = 0; lx < 16; ++lx) {
+                int hi = -1;
+                for (int ly = yCount - 1; ly >= 0; --ly) {
+                    int ci = ColIdx(lx, ly, lz);
+                    if ((s.bits[ci >> 6] >> (ci & 63)) & 1ull) { hi = ly; break; }
+                }
+                h.h[lz * 16 + lx] = (int16_t)hi;
+            }
+        }
+        auto HAt = [&](int cx, int cz, int lx, int lz) -> int {
+            // wrap lateral; cross-col lookup
+            int dx = 0, dz = 0;
+            if (lx < 0)        { dx = -1; lx += 16; }
+            else if (lx >= 16) { dx = +1; lx -= 16; }
+            if (lz < 0)        { dz = -1; lz += 16; }
+            else if (lz >= 16) { dz = +1; lz -= 16; }
+            auto it = heights.find(McKey(cx + dx, cz + dz));
+            if (it == heights.end()) return -1;
+            return it->second.h[lz * 16 + lx];
+        };
+
+        // 2. Seed bitset: surface voxels + cliff-face voxels.
+        std::unordered_map<uint64_t, ColSolid> seedBits;
+        seedBits.reserve(globalSolid.size() * 2);
+        struct QE { int cx, cz, lx, ly, lz; };
+        std::deque<QE> q;
+        size_t seedCount = 0;
+        for (auto& kv : globalSolid) {
+            int cx = (int32_t)(kv.first & 0xFFFFFFFFu);
+            int cz = (int32_t)(kv.first >> 32);
+            ColSolid& s = kv.second;
+            ColH& h = heights[McKey(cx, cz)];
+            ColSolid& seed = seedBits[McKey(cx, cz)];
+            seed.bits.assign(u64PerCol, 0);
+            for (int lz = 0; lz < 16; ++lz)
+            for (int lx = 0; lx < 16; ++lx) {
+                int hi = h.h[lz * 16 + lx];
+                if (hi < 0) continue;
+                // Pre-fetch 4 lateral neighbour heights once per (lx,lz).
+                int hpx = HAt(cx, cz, lx + 1, lz);
+                int hnx = HAt(cx, cz, lx - 1, lz);
+                int hpz = HAt(cx, cz, lx, lz + 1);
+                int hnz = HAt(cx, cz, lx, lz - 1);
+                for (int ly = hi; ly >= 0; --ly) {
+                    int ci = ColIdx(lx, ly, lz);
+                    if (!((s.bits[ci >> 6] >> (ci & 63)) & 1ull)) continue;
+                    bool vis = false;
+                    if (ly == hi) vis = true;
+                    else if ((hpx >= 0 && hpx < ly) || (hnx >= 0 && hnx < ly)
+                          || (hpz >= 0 && hpz < ly) || (hnz >= 0 && hnz < ly)) vis = true;
+                    else if (hpx < 0 || hnx < 0 || hpz < 0 || hnz < 0) {
+                        // neighbour col absent → treat as deep void → cliff face
+                        vis = true;
+                    }
+                    if (vis) {
+                        seed.bits[ci >> 6] |= (uint64_t)1 << (ci & 63);
+                        q.push_back({ cx, cz, lx, ly, lz });
+                        ++seedCount;
+                    }
+                }
+            }
+        }
+        printf("[hcull] seeds=%zu (surface+cliffs), dilating by N=%d\n", seedCount, heightCullN);
+
+        // 3. Dilate seed bits by N steps via 6-conn BFS inside solid cells.
+        // Use level-by-level BFS.
+        const int kNbr6[6][3] = {
+            { +1, 0, 0 }, { -1, 0, 0 },
+            { 0, +1, 0 }, { 0, -1, 0 },
+            { 0, 0, +1 }, { 0, 0, -1 },
+        };
+        std::deque<QE> next;
+        for (int step = 0; step < heightCullN; ++step) {
+            while (!q.empty()) {
+                QE c = q.front(); q.pop_front();
+                for (int d = 0; d < 6; ++d) {
+                    int ncx = c.cx, ncz = c.cz;
+                    int nx = c.lx + kNbr6[d][0];
+                    int ny = c.ly + kNbr6[d][1];
+                    int nz = c.lz + kNbr6[d][2];
+                    if (ny < 0 || ny >= yCount) continue;
+                    NormCol(ncx, ncz, nx, nz);
+                    auto itS = globalSolid.find(McKey(ncx, ncz));
+                    if (itS == globalSolid.end()) continue;
+                    int ni = ColIdx(nx, ny, nz);
+                    if (!((itS->second.bits[ni >> 6] >> (ni & 63)) & 1ull)) continue;   // not solid
+                    ColSolid& sn = seedBits[McKey(ncx, ncz)];
+                    if (sn.bits.empty()) sn.bits.assign(u64PerCol, 0);
+                    if ((sn.bits[ni >> 6] >> (ni & 63)) & 1ull) continue;               // already
+                    sn.bits[ni >> 6] |= (uint64_t)1 << (ni & 63);
+                    next.push_back({ ncx, ncz, nx, ny, nz });
+                }
+            }
+            std::swap(q, next);
+            printf("[hcull] dilate step=%d  frontier=%zu\n", step + 1, q.size());
+        }
+
+        // 4. Move seeds into globalKept; count.
+        auto Popcnt = [](uint64_t w) {
+            w = w - ((w >> 1) & 0x5555555555555555ull);
+            w = (w & 0x3333333333333333ull) + ((w >> 2) & 0x3333333333333333ull);
+            w = (w + (w >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+            return (size_t)((w * 0x0101010101010101ull) >> 56);
+        };
+        size_t keptTotal = 0, solidTotal = 0;
+        for (auto& kv : seedBits)
+            for (uint64_t w : kv.second.bits) keptTotal += Popcnt(w);
+        for (auto& kv : globalSolid)
+            for (uint64_t w : kv.second.bits) solidTotal += Popcnt(w);
+        globalKept = std::move(seedBits);
+        printf("[hcull] kept=%zu of %zu solid  (%.1f%% culled)\n",
+               keptTotal, solidTotal,
+               100.0 - 100.0 * (double)keptTotal / std::max<size_t>(solidTotal, 1));
+    }
+
+    // Either skyCull or heightCull populated globalKept; pass 2 uses KeptAt.
+    bool kullActive = skyCull || heightCull;
+    auto KeptAt = [&](int mcCX, int mcCZ, int lx, int ly, int lz) -> bool {
+        if (ly < 0 || ly >= yCount) return false;
+        NormCol(mcCX, mcCZ, lx, lz);
+        auto it = globalKept.find(McKey(mcCX, mcCZ));
+        if (it == globalKept.end()) return false;
         int ci = ColIdx(lx, ly, lz);
         return (it->second.bits[ci >> 6] >> (ci & 63)) & 1ull;
     };
@@ -703,15 +1044,24 @@ int main(int argc, char** argv)
                     int16_t g = localToGlobal[pi];
                     if (g < 0) continue;
 
-                    // Cross-section / cross-chunk neighbour lookup via globalSolid.
+                    // visMask + cull. When --sky-cull: voxel kept iff KeptAt set;
+                    // visMask faces use kept neighbours (sky-occluded neighbour = solid).
                     uint8_t vm = 0;
-                    if (!SolidAt(mcCX, mcCZ, x + 1, ly, z)) vm |= 1u << 0;
-                    if (!SolidAt(mcCX, mcCZ, x - 1, ly, z)) vm |= 1u << 1;
-                    if (!SolidAt(mcCX, mcCZ, x, ly + 1, z)) vm |= 1u << 2;
-                    // -Y bit always 0 per format spec
-                    if (!SolidAt(mcCX, mcCZ, x, ly, z + 1)) vm |= 1u << 4;
-                    if (!SolidAt(mcCX, mcCZ, x, ly, z - 1)) vm |= 1u << 5;
-                    if (vm == 0) continue;          // fully occluded → cull
+                    if (kullActive) {
+                        if (!KeptAt(mcCX, mcCZ, x, ly, z)) continue;
+                        if (!KeptAt(mcCX, mcCZ, x + 1, ly, z)) vm |= 1u << 0;
+                        if (!KeptAt(mcCX, mcCZ, x - 1, ly, z)) vm |= 1u << 1;
+                        if (!KeptAt(mcCX, mcCZ, x, ly + 1, z)) vm |= 1u << 2;
+                        if (!KeptAt(mcCX, mcCZ, x, ly, z + 1)) vm |= 1u << 4;
+                        if (!KeptAt(mcCX, mcCZ, x, ly, z - 1)) vm |= 1u << 5;
+                    } else {
+                        if (!SolidAt(mcCX, mcCZ, x + 1, ly, z)) vm |= 1u << 0;
+                        if (!SolidAt(mcCX, mcCZ, x - 1, ly, z)) vm |= 1u << 1;
+                        if (!SolidAt(mcCX, mcCZ, x, ly + 1, z)) vm |= 1u << 2;
+                        if (!SolidAt(mcCX, mcCZ, x, ly, z + 1)) vm |= 1u << 4;
+                        if (!SolidAt(mcCX, mcCZ, x, ly, z - 1)) vm |= 1u << 5;
+                        if (vm == 0) continue;          // fully occluded → cull
+                    }
 
                     int32_t wx = chunkBaseX + x - bxMin;
                     int32_t wyo = wy - byMin;

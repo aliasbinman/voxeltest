@@ -303,7 +303,7 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
     <CopyFileToFolders Include="xbox_assets\LargeLogo.png" />
     <CopyFileToFolders Include="xbox_assets\StoreLogo.png" />
     <CopyFileToFolders Include="xbox_assets\SplashScreen.png" />
-    <CopyFileToFolders Include="assets\kingslanding25.lw">
+    <CopyFileToFolders Include="assets\kingslanding_sky.lw">
       <DestinationFolders>$(OutDir)</DestinationFolders>
     </CopyFileToFolders>
     <MGCCompile Include="MicrosoftGameConfig.mgc" />

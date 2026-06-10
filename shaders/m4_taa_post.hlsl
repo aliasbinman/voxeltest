@@ -78,9 +78,7 @@ float4 psmain_taa(VTaaOut i) : SV_Target
     float2 currUv = currUvCenter + float2(gJitter.x * 0.5, -gJitter.y * 0.5);
     float4 curSample = gTaaScene.SampleLevel(gTaaSamp, currUv, 0);
     float3 curC = curSample.rgb;
-    
-    
-    
+      
     float outAlpha = curSample.a;
     float  d  = gTaaDepth.Load(int3(pix, 0));
     if (d <= 0.0) {
@@ -241,24 +239,16 @@ float4 psmain_post(VTaaOut i) : SV_Target
     int W = (int)gScreenSize.x;
     int H = (int)gScreenSize.y;
     float4 inC = gPostIn.Load(int3(pix, 0));
-    // Sky test from depth, not alpha — RT is R11G11B10F (no alpha channel).
-    // Dilate writes depth=0 for pixels with no voxel hit.
-    float postD = gPostDepth.Load(int3(pix, 0));
-    float3 c;
-    if (postD <= 0.0) {
-        float3 rd = PostPixelWorldDir(pix, W, H);
-        c = SkyColor(rd) ;
-    } else {
-        c = inC.rgb;
-        float2 qv = float2(float(pix.x & 1) * 2.0 - 1.0,
-                           float(pix.y & 1) * 2.0 - 1.0);
-        float3 cH = c - ddx_fine(c) * qv.x;
-        float3 cV = c - ddy_fine(c) * qv.y;
-        int2 oH = int2(clamp(pix.x + (int)qv.x, 0, W - 1), pix.y);
-        int2 oV = int2(pix.x, clamp(pix.y + (int)qv.y, 0, H - 1));
-        float3 cOH = gPostIn.Load(int3(oH, 0)).rgb;
-        float3 cOV = gPostIn.Load(int3(oV, 0)).rgb;
-        float3 avg = (cH + cV + cOH + cOV) * 0.25;
+    // Sky already baked into taaHist by resolve+TAA. Unsharp runs everywhere
+    // (no-op on smooth sky gradient).
+    float3 c = inC.rgb;
+    {
+        float3 cpH = gPostIn.Load(int3(pix.x + 1, pix.y, 0)).rgb;
+        float3 cnH = gPostIn.Load(int3(pix.x - 1, pix.y, 0)).rgb;
+        float3 cpV = gPostIn.Load(int3(pix.x, pix.y + 1, 0)).rgb;
+        float3 cnV = gPostIn.Load(int3(pix.x, pix.y - 1, 0)).rgb;
+        
+        float3 avg = (cpH + cpV + cnH + cnV) * 0.25;
         c = c + 0.5 * (c - avg);
     }
     float facingFade = saturate(gSunFacing * 5.0);

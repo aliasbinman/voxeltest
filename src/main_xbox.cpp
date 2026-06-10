@@ -36,7 +36,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int)
 
     lw::World world;
     std::string err;
-    const char* lwPath = "kingslanding25.lw";
+    const char* lwPath = "kingslanding_sky.lw";
     bool haveWorld = false;
     if (!lw::LoadWorld(lwPath, world, err))
     {

@@ -139,6 +139,65 @@ int main(int argc, char** argv)
         return it == chunks.end() ? nullptr : &it->second;
     };
 
+    // ----- Chunk-grid air BFS: classify absent chunks as air vs solid. -----
+    // Compute chunk-grid AABB.
+    int cxMin = INT32_MAX, cxMax = INT32_MIN;
+    int cyMin = INT32_MAX, cyMax = INT32_MIN;
+    int czMin = INT32_MAX, czMax = INT32_MIN;
+    for (auto& kv : chunks) {
+        int cx = (int16_t)(kv.first & 0xFFFF);
+        int cy = (int16_t)((kv.first >> 16) & 0xFFFF);
+        int cz = (int16_t)((kv.first >> 32) & 0xFFFF);
+        cxMin = std::min(cxMin, cx); cxMax = std::max(cxMax, cx);
+        cyMin = std::min(cyMin, cy); cyMax = std::max(cyMax, cy);
+        czMin = std::min(czMin, cz); czMax = std::max(czMax, cz);
+    }
+    // BFS over absent chunks inside extended box [cxMin-1..cxMax+1] etc.
+    // Absent chunks reachable from outer shell = "open air".
+    std::unordered_map<uint64_t, uint8_t> chunkAir;  // present = true-air
+    auto AddIfAbsent = [&](int cx, int cy, int cz, std::deque<std::tuple<int,int,int>>& q) {
+        if (chunks.find(CKey(cx, cy, cz)) != chunks.end()) return;
+        uint64_t k = CKey(cx, cy, cz);
+        if (chunkAir.emplace(k, 1).second) q.push_back({ cx, cy, cz });
+    };
+    {
+        std::deque<std::tuple<int,int,int>> q;
+        // Seed: outer shell (one layer outside AABB).
+        for (int cy = cyMin - 1; cy <= cyMax + 1; ++cy)
+        for (int cz = czMin - 1; cz <= czMax + 1; ++cz) {
+            AddIfAbsent(cxMin - 1, cy, cz, q);
+            AddIfAbsent(cxMax + 1, cy, cz, q);
+        }
+        for (int cx = cxMin - 1; cx <= cxMax + 1; ++cx)
+        for (int cz = czMin - 1; cz <= czMax + 1; ++cz) {
+            AddIfAbsent(cx, cyMin - 1, cz, q);
+            AddIfAbsent(cx, cyMax + 1, cz, q);
+        }
+        for (int cx = cxMin - 1; cx <= cxMax + 1; ++cx)
+        for (int cy = cyMin - 1; cy <= cyMax + 1; ++cy) {
+            AddIfAbsent(cx, cy, czMin - 1, q);
+            AddIfAbsent(cx, cy, czMax + 1, q);
+        }
+        while (!q.empty()) {
+            auto [cx, cy, cz] = q.front(); q.pop_front();
+            for (int d = 0; d < 6; ++d) {
+                int nx = cx + kNbr[d][0];
+                int ny = cy + kNbr[d][1];
+                int nz = cz + kNbr[d][2];
+                if (nx < cxMin - 1 || nx > cxMax + 1) continue;
+                if (ny < cyMin - 1 || ny > cyMax + 1) continue;
+                if (nz < czMin - 1 || nz > czMax + 1) continue;
+                AddIfAbsent(nx, ny, nz, q);
+            }
+        }
+        printf("[voxskycull] chunk-grid AABB cx[%d..%d] cy[%d..%d] cz[%d..%d]  air-absent=%zu\n",
+               cxMin, cxMax, cyMin, cyMax, czMin, czMax, chunkAir.size());
+    }
+
+    auto AbsentIsAir = [&](int cx, int cy, int cz) -> bool {
+        return chunkAir.find(CKey(cx, cy, cz)) != chunkAir.end();
+    };
+
     // Normalize neighbor (cx,cy,cz, lx,ly,lz) crossing chunk boundaries.
     auto Norm = [&](int& cx, int& cy, int& cz, int& lx, int& ly, int& lz) {
         if (lx < 0)      { cx -= 1; lx += D; }
@@ -163,6 +222,7 @@ int main(int argc, char** argv)
             int ncy = cy + kNbr[d][1];
             int ncz = cz + kNbr[d][2];
             if (FindGrid(ncx, ncy, ncz)) continue;     // neighbor chunk exists
+            if (!AbsentIsAir(ncx, ncy, ncz)) continue; // absent-solid: no seed
             // Iterate face cells.
             int axis = d >> 1;             // 0=X, 1=Y, 2=Z
             bool plus = (d & 1) == 0;
@@ -196,7 +256,7 @@ int main(int argc, char** argv)
             int nz = c.lz + kNbr[d][2];
             Norm(ncx, ncy, ncz, nx, ny, nz);
             Grid* ng = FindGrid(ncx, ncy, ncz);
-            if (!ng) continue;                     // outside the scene → trivially air
+            if (!ng) continue;                     // absent → already classified; flood does not enter
             int ni = Idx(nx, ny, nz);
             if (Get(ng->solid, ni)) continue;
             if (Get(ng->exposed, ni)) continue;
@@ -229,7 +289,10 @@ int main(int argc, char** argv)
                 int nz = lz + kNbr[d][2];
                 Norm(ncx, ncy, ncz, nx, ny, nz);
                 Grid* ng = FindGrid(ncx, ncy, ncz);
-                if (!ng) { exposed = true; break; }   // outside → exposed-air
+                if (!ng) {
+                    if (AbsentIsAir(ncx, ncy, ncz)) { exposed = true; break; }
+                    continue;                          // absent-solid: neighbor opaque
+                }
                 int ni = Idx(nx, ny, nz);
                 if (Get(ng->solid, ni)) continue;     // neighbor solid
                 if (Get(ng->exposed, ni)) { exposed = true; break; }
@@ -272,9 +335,12 @@ int main(int argc, char** argv)
                 int nz = v.z + kNbr[d][2];
                 Norm(ncx, ncy, ncz, nx, ny, nz);
                 Grid* ng = FindGrid(ncx, ncy, ncz);
-                if (!ng) { vm |= 1u << faceBit[d]; continue; }
+                if (!ng) {
+                    if (AbsentIsAir(ncx, ncy, ncz)) vm |= 1u << faceBit[d];
+                    continue;                           // absent-solid: face hidden
+                }
                 int ni = Idx(nx, ny, nz);
-                if (Get(ng->kept, ni)) continue;        // neighbor is solid+kept → face hidden
+                if (Get(ng->kept, ni)) continue;        // neighbor solid+kept → face hidden
                 vm |= 1u << faceBit[d];
             }
             vm &= ~(1u << 3);   // -Y always 0 per format spec

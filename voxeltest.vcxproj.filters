@@ -1,11 +1,118 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
+    <Filter Include="src">
+      <UniqueIdentifier>{1A2B3C4D-0001-4000-8000-000000000001}</UniqueIdentifier>
+    </Filter>
     <Filter Include="shaders">
       <UniqueIdentifier>{5F8C2A1B-8E0B-4A1C-8B2D-2E7C9F1A3B4D}</UniqueIdentifier>
     </Filter>
+    <Filter Include="third_party">
+      <UniqueIdentifier>{1A2B3C4D-0002-4000-8000-000000000002}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party\imgui">
+      <UniqueIdentifier>{1A2B3C4D-0003-4000-8000-000000000003}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party\imgui\backends">
+      <UniqueIdentifier>{1A2B3C4D-0004-4000-8000-000000000004}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party\DirectXTK12">
+      <UniqueIdentifier>{1A2B3C4D-0005-4000-8000-000000000005}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party\lz4">
+      <UniqueIdentifier>{1A2B3C4D-0006-4000-8000-000000000006}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="third_party\microprofile">
+      <UniqueIdentifier>{1A2B3C4D-0007-4000-8000-000000000007}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
+
   <ItemGroup>
+    <ClCompile Include="src\renderer.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\shader.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lw_loader.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\main.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\main_xbox.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+
+    <ClCompile Include="third_party\imgui\imgui.cpp">
+      <Filter>third_party\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_draw.cpp">
+      <Filter>third_party\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_tables.cpp">
+      <Filter>third_party\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_widgets.cpp">
+      <Filter>third_party\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_demo.cpp">
+      <Filter>third_party\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp">
+      <Filter>third_party\imgui\backends</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx12.cpp">
+      <Filter>third_party\imgui\backends</Filter>
+    </ClCompile>
+
+    <ClCompile Include="third_party\DirectXTK12\Src\GraphicsMemory.cpp">
+      <Filter>third_party\DirectXTK12</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\DirectXTK12\Src\LinearAllocator.cpp">
+      <Filter>third_party\DirectXTK12</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\DirectXTK12\Src\DescriptorHeap.cpp">
+      <Filter>third_party\DirectXTK12</Filter>
+    </ClCompile>
+    <ClCompile Include="third_party\DirectXTK12\Src\DirectXHelpers.cpp">
+      <Filter>third_party\DirectXTK12</Filter>
+    </ClCompile>
+
+    <ClCompile Include="third_party\lz4\lz4.c">
+      <Filter>third_party\lz4</Filter>
+    </ClCompile>
+
+    <ClCompile Include="third_party\microprofile\microprofile_impl.cpp">
+      <Filter>third_party\microprofile</Filter>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\camera.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\lodworld.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\renderer.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\shader.h">
+      <Filter>src</Filter>
+    </ClInclude>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="shaders\m2_demo.hlsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="shaders\m4_lw.hlsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="shaders\m4_taa_post.hlsl">
+      <Filter>shaders</Filter>
+    </None>
     <None Include="shaders\voxel.hlsl">
       <Filter>shaders</Filter>
     </None>

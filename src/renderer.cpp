@@ -116,8 +116,8 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
 
 #if defined(VOXELTEST_XBOX)
     (void)hwnd;
-    width_  = 1920;
-    height_ = 1080;
+    width_  = 2560;
+    height_ = 1440;
 #else
     RECT rc{};
     GetClientRect(hwnd, &rc);
@@ -516,7 +516,7 @@ void Renderer::ImGuiSrvFree(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HA
 void Renderer::Resize(uint32_t w, uint32_t h)
 {
 #if defined(VOXELTEST_XBOX)
-    // Xbox = fixed 1920x1080 / 3840x2160 backbuffer; no dynamic resize.
+    // Xbox = fixed 2560x1440 backbuffer; no dynamic resize.
     (void)w; (void)h;
     return;
 #else
@@ -1361,13 +1361,9 @@ bool Renderer::CreateM4()
         if (!buildRootSig(rsd, m4TaaRootSig_, L"m4TaaRootSig")) return false;
     }
 
-    // Post root sig — psmain_post needs b0 + b3 (cbGodray) + t6 (postDepth) +
+    // Post root sig — psmain_post needs b0 + b3 (cbGodray) +
     // t7 (postIn) + t9 (godrayTex) + t10 (godrayHistTex) + s0.
     {
-        D3D12_DESCRIPTOR_RANGE depthRange{};
-        depthRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        depthRange.NumDescriptors = 1;
-        depthRange.BaseShaderRegister = 6;
         D3D12_DESCRIPTOR_RANGE inRange{};
         inRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         inRange.NumDescriptors = 1;
@@ -1380,16 +1376,15 @@ bool Renderer::CreateM4()
         gr10.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         gr10.NumDescriptors = 1;
         gr10.BaseShaderRegister = 10;
-        D3D12_ROOT_PARAMETER p[6]{};
+        D3D12_ROOT_PARAMETER p[5]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0, 0};
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {3, 0};
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[2].DescriptorTable = {1, &depthRange};
-        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[3].DescriptorTable = {1, &inRange};
-        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[4].DescriptorTable = {1, &gr9};
-        p[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[5].DescriptorTable = {1, &gr10};
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[2].DescriptorTable = {1, &inRange};
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[3].DescriptorTable = {1, &gr9};
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[4].DescriptorTable = {1, &gr10};
         for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 6;
+        rsd.NumParameters = 5;
         rsd.pParameters = p;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers = &ssLinear;
@@ -2449,10 +2444,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cmdList_->SetPipelineState(m4PostPso_.Get());
         cmdList_->SetGraphicsRootConstantBufferView(0, cbfAlloc.GpuAddress());
         cmdList_->SetGraphicsRootConstantBufferView(1, cbgAlloc.GpuAddress()); // cbGodray zeroed
-        cmdList_->SetGraphicsRootDescriptorTable(2, gpu(8));           // t6 = postDepth = taaDepth
-        cmdList_->SetGraphicsRootDescriptorTable(3, gpu(4 + currIdx)); // t7 = postIn = taaHist[curr]
-        cmdList_->SetGraphicsRootDescriptorTable(4, gpu(12 + grCurr)); // t9 = current frame's blurred godray
-        cmdList_->SetGraphicsRootDescriptorTable(5, gpu(11));          // t10 = mark (unused at post; needs valid bind)
+        cmdList_->SetGraphicsRootDescriptorTable(2, gpu(4 + currIdx)); // t7 = postIn = taaHist[curr]
+        cmdList_->SetGraphicsRootDescriptorTable(3, gpu(12 + grCurr)); // t9 = current frame's blurred godray
+        cmdList_->SetGraphicsRootDescriptorTable(4, gpu(11));          // t10 = mark (unused at post; needs valid bind)
         cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmdList_->DrawInstanced(3, 1, 0, 0);
     }
