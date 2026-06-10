@@ -80,6 +80,11 @@ cbuffer cbPerFrame : register(b0)
     float    gInvAspect;               // 492
     float    gAspectTanFov;            // 496
     float3   _padPC;                   // 500..512
+    // Burnout Paradise reproject matrix rows (HScreen-UV). Mvel = Mh1_to_h0 - I.
+    float4   gReprojMx;                // 512  (mxx, mxy, mxz, mxw)
+    float4   gReprojMy;                // 528  (myx, myy, myz, myw)
+    float4   gReprojMw;                // 544  (mwx, mwy, mwz, mww)
+    float4   _padReproj;               // 560..576
 };
 
 cbuffer CBLwCS : register(b1)

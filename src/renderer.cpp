@@ -1918,7 +1918,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     }
 
     // ---- CB layouts (must match m4_lw.hlsl) ----
-    // CSTiles cbPerFrame layout, 512 bytes, byte-for-byte.
+    // CSTiles cbPerFrame layout extended with Burnout reproject coeffs, 576 bytes.
     struct CBFrame {
         float viewProj[16];          //   0
         float camPos[3];             //  64
@@ -1963,8 +1963,14 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         float invAspect;             // 492
         float aspectTanFov;          // 496
         float _padPC[3];             // 500..512
+        // Burnout Paradise reproject (Mvel = Mh1_to_h0 - I), paper rows x/y/w
+        // in UV-space HScreen. Used by psmain_taa to skip world-recon + divide.
+        float reprojMx[4];           // 512  (mxx, mxy, mxz, mxw)
+        float reprojMy[4];           // 528  (myx, myy, myz, myw)
+        float reprojMw[4];           // 544  (mwx, mwy, mwz, mww)
+        float _padReproj[4];         // 560..576
     };
-    static_assert(sizeof(CBFrame) == 512, "CBFrame must match CSTiles cbPerFrame layout");
+    static_assert(sizeof(CBFrame) == 576, "CBFrame size mismatch");
     struct CBLwCs  { uint32_t vwSize[2]; uint32_t pointCount; uint32_t numItems;
                      uint32_t lodIdx; int32_t splatRadius; uint32_t _pad[2]; };
 
@@ -2029,6 +2035,42 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cbf.invScreenSize[0] = 1.0f / (float)std::max(1u, width_);
         cbf.invScreenSize[1] = 1.0f / (float)std::max(1u, height_);
     }
+
+    // Burnout Paradise reproject matrix for TAA. Mvel = Mh1_to_h0 - I, in
+    // HScreen-UV space (row-vec convention to match m4_lw.hlsl row_major).
+    //   V_uv:  clip -> hscreen_uv:  (x,y,z,w) -> (0.5x+0.5w, -0.5y+0.5w, z, w)
+    //   C = inv(vp_curr) * vp_prev  (row-vec: clip_curr * C = clip_prev)
+    //   Mh1_to_h0 = invV_uv * C * V_uv
+    {
+        const hlslpp::float4x4 V_uv(
+            0.5f,  0.0f, 0.0f, 0.0f,
+            0.0f, -0.5f, 0.0f, 0.0f,
+            0.0f,  0.0f, 1.0f, 0.0f,
+            0.5f,  0.5f, 0.0f, 1.0f);
+        const hlslpp::float4x4 invV_uv(
+            2.0f,  0.0f, 0.0f, 0.0f,
+            0.0f, -2.0f, 0.0f, 0.0f,
+            0.0f,  0.0f, 1.0f, 0.0f,
+           -1.0f,  1.0f, 0.0f, 1.0f);
+        hlslpp::float4x4 vpPrev(
+            taaPrevVP_[ 0], taaPrevVP_[ 1], taaPrevVP_[ 2], taaPrevVP_[ 3],
+            taaPrevVP_[ 4], taaPrevVP_[ 5], taaPrevVP_[ 6], taaPrevVP_[ 7],
+            taaPrevVP_[ 8], taaPrevVP_[ 9], taaPrevVP_[10], taaPrevVP_[11],
+            taaPrevVP_[12], taaPrevVP_[13], taaPrevVP_[14], taaPrevVP_[15]);
+        hlslpp::float4x4 invVpCurr = hlslpp::inverse(vp);
+        hlslpp::float4x4 C        = hlslpp::mul(invVpCurr, vpPrev);
+        hlslpp::float4x4 H        = hlslpp::mul(hlslpp::mul(invV_uv, C), V_uv);
+        float M[16];
+        hlslpp::store(M, H);
+        // Subtract identity → Mvel.
+        M[ 0] -= 1.0f; M[ 5] -= 1.0f; M[10] -= 1.0f; M[15] -= 1.0f;
+        // Paper rows in column-vec form map to columns of row-vec storage.
+        // Mvel_rv[r][c] = M[r*4 + c]. Paper Mx row = column 0, My = col 1, Mw = col 3.
+        cbf.reprojMx[0] = M[ 0]; cbf.reprojMx[1] = M[ 4]; cbf.reprojMx[2] = M[ 8]; cbf.reprojMx[3] = M[12];
+        cbf.reprojMy[0] = M[ 1]; cbf.reprojMy[1] = M[ 5]; cbf.reprojMy[2] = M[ 9]; cbf.reprojMy[3] = M[13];
+        cbf.reprojMw[0] = M[ 3]; cbf.reprojMw[1] = M[ 7]; cbf.reprojMw[2] = M[11]; cbf.reprojMw[3] = M[15];
+    }
+
     auto cbfAlloc = graphicsMemory_->AllocateConstant(cbf);
 
     // Per-LOD CB + worklist allocations.

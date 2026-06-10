@@ -48,6 +48,11 @@ cbuffer cbPerFrame : register(b0)
     float    gInvAspect;
     float    gAspectTanFov;
     float3   _padPC;
+    // Burnout Paradise reproject matrix rows (HScreen-UV). Mvel = Mh1_to_h0 - I.
+    float4   gReprojMx;
+    float4   gReprojMy;
+    float4   gReprojMw;
+    float4   _padReproj;
 };
 
 // ---- TAA bindings (match CSTiles postfx.hlsl) ----
@@ -85,18 +90,17 @@ float4 psmain_taa(VTaaOut i) : SV_Target
         return float4(curC, outAlpha);
     }
 
-    float viewZ = gNearZ / d;
-    float ndcX = currUvCenter.x * 2.0 - 1.0;
-    float ndcY = 1.0 - currUvCenter.y * 2.0;
-    float viewX = ndcX * gAspectTanFov * viewZ;
-    float viewY = ndcY * gTanHalfFovY  * viewZ;
-    float3 world = gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
-
-    float4 prevClip = mul(float4(world, 1.0), gPrevViewProj);
-    if (prevClip.w <= 0.0) return float4(curC, outAlpha);
-    float3 prevNdc = prevClip.xyz / prevClip.w;
-    if (any(abs(prevNdc.xy) > 1.0)) return float4(curC, outAlpha);
-    float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
+    // Burnout Paradise reproject — 2-mad form. Mvel rows baked CPU-side.
+    // F.x = mxx*u + mxy*v + mxw, K.x = mxz; same for y, w. G = K*d + F.
+    // V.xy = G.z*S.xy + G.xy. Paper sign: V = S_prev - S_curr → prevUV = currUV + V.
+    // Our d (gTaaDepth) = nearZ/viewZ = NDC z (reverse-Z infinite-far proj).
+    float Fx = gReprojMx.x * currUvCenter.x + (gReprojMx.y * currUvCenter.y + gReprojMx.w);
+    float Fy = gReprojMy.x * currUvCenter.x + (gReprojMy.y * currUvCenter.y + gReprojMy.w);
+    float Fw = gReprojMw.x * currUvCenter.x + (gReprojMw.y * currUvCenter.y + gReprojMw.w);
+    float3 G = float3(gReprojMx.z, gReprojMy.z, gReprojMw.z) * d + float3(Fx, Fy, Fw);
+    float2 vel = currUvCenter * G.z + G.xy;
+    float2 prevUv = currUvCenter + vel;
+    if (any(prevUv < 0.0) || any(prevUv > 1.0)) return float4(curC, outAlpha);
 
     float2 texSize = gScreenSize;
     float2 sp = prevUv * texSize;
