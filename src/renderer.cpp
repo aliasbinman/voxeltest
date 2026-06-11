@@ -160,7 +160,6 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
             OutputDebugStringA("ShaderCompiler::Init failed\n");
             return false;
         }
-        if (!CreateM2Demo()) return false;
 
         // LW SRV heap — shader-visible, shared across all LODs.
         D3D12_DESCRIPTOR_HEAP_DESC ld{};
@@ -424,77 +423,6 @@ bool Renderer::CreateRenderTargets()
     return true;
 }
 
-bool Renderer::CreateM2Demo()
-{
-    // Empty root signature — shader uses only SV_VertexID + immediate consts.
-    {
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-        ComPtr<ID3DBlob> sig, err;
-        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
-                                                 &sig, &err);
-        if (FAILED(hr))
-        {
-            if (err) OutputDebugStringA((const char*)err->GetBufferPointer());
-            return false;
-        }
-        ThrowIfFailed(device_->CreateRootSignature(0, sig->GetBufferPointer(),
-                                                   sig->GetBufferSize(),
-                                                   IID_PPV_ARGS(&m2RootSig_)),
-                      "m2 rootsig");
-        NameObject(m2RootSig_.Get(), L"m2RootSig");
-    }
-
-    // Load vs + ps from shaders/m2_demo.hlsl. PC compiles at runtime via DXC;
-    // Xbox loads prebuilt .cso from disk (no DXC at runtime).
-    ComPtr<IDxcBlob> vs, ps;
-    std::string err;
-#if defined(VOXELTEST_XBOX)
-    if (!shaderc_.LoadCso(L"shaders/m2_demo.hlsl_vsmain.cso", vs, &err))
-    { OutputDebugStringA(("M2 vs load failed: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.LoadCso(L"shaders/m2_demo.hlsl_psmain.cso", ps, &err))
-    { OutputDebugStringA(("M2 ps load failed: " + err + "\n").c_str()); return false; }
-#else
-    if (!shaderc_.Compile(L"shaders/m2_demo.hlsl", L"vsmain", L"vs_6_0", {}, vs, &err))
-    { OutputDebugStringA(("M2 vs compile failed: " + err + "\n").c_str()); return false; }
-    if (!shaderc_.Compile(L"shaders/m2_demo.hlsl", L"psmain", L"ps_6_0", {}, ps, &err))
-    { OutputDebugStringA(("M2 ps compile failed: " + err + "\n").c_str()); return false; }
-#endif
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = m2RootSig_.Get();
-    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.SampleMask = UINT_MAX;
-    pd.SampleDesc.Count = 1;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = BackBufferFormat();
-    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-
-    // Rasterizer — default solid, back-cull, but we want no cull for a simple
-    // demo so winding doesn't matter.
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.FrontCounterClockwise = FALSE;
-    pd.RasterizerState.DepthClipEnable = TRUE;
-
-    // Blend — opaque, no blend.
-    for (auto& rt : pd.BlendState.RenderTarget)
-    {
-        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    }
-
-    // Depth — write+test off (drawing before depth-using passes anyway).
-    pd.DepthStencilState.DepthEnable = FALSE;
-    pd.DepthStencilState.StencilEnable = FALSE;
-
-    ThrowIfFailed(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m2Pso_)),
-                  "m2 PSO");
-    NameObject(m2Pso_.Get(), L"m2Pso");
-    return true;
-}
-
 void Renderer::ImGuiSrvAlloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
                              D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
 {
@@ -525,6 +453,7 @@ void Renderer::Resize(uint32_t w, uint32_t h)
     if (w == 0 || h == 0) return;
 
     WaitForGpu();
+    const UINT64 curFence = fenceValues_[frameIndex_];
 
     for (UINT i = 0; i < kFrameCount; ++i) backBuffers_[i].Reset();
     depthTex_.Reset();
@@ -535,6 +464,9 @@ void Renderer::Resize(uint32_t w, uint32_t h)
     width_ = w;
     height_ = h;
     frameIndex_ = swap_->GetCurrentBackBufferIndex();
+    // frameIndex_ jumps after ResizeBuffers; stale per-frame fence values would
+    // signal the fence backwards and deadlock the next frame's wait.
+    for (UINT i = 0; i < kFrameCount; ++i) fenceValues_[i] = curFence;
     CreateRenderTargets();
     if (m4TexHeap_) CreateVisTextures(w, h);
 #endif
@@ -629,14 +561,6 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
         cmdList_->SetDescriptorHeaps(1, heaps);
     }
 
-    // M2 demo only when LW world isn't loaded — once we have voxels, draw those.
-    if (m2Pso_ && !lwHasWorld_)
-    {
-        cmdList_->SetGraphicsRootSignature(m2RootSig_.Get());
-        cmdList_->SetPipelineState(m2Pso_.Get());
-        cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        cmdList_->DrawInstanced(3, 1, 0, 0);
-    }
 }
 
 void Renderer::EndFrame(bool vsync)
@@ -718,8 +642,6 @@ void Renderer::Shutdown()
     dsvHeap_.Reset();
     depthTex_.Reset();
     imguiSrvHeap_.Reset();
-    m2Pso_.Reset();
-    m2RootSig_.Reset();
     cmdQueue_.Reset();
 #if !defined(VOXELTEST_XBOX)
     swap_.Reset();

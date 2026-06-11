@@ -104,9 +104,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="shaders\m2_demo.hlsl">
-      <Filter>shaders</Filter>
-    </None>
     <None Include="shaders\m4_lw.hlsl">
       <Filter>shaders</Filter>
     </None>

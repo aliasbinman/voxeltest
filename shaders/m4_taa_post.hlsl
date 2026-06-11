@@ -154,8 +154,6 @@ float4 psmain_taa(VTaaOut i) : SV_Target
 
     float dist = length(clipped - prevC) / max(length(nMax - nMin), 1e-4);
     float alpha = lerp(0.1, 0.5, saturate(dist));
-   // alpha = 0.0;//
-   // float3 outC = clipped;
     float3 outC = lerp(clipped, curC, alpha);
     return float4(outC, outAlpha);
 }

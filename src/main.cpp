@@ -122,6 +122,10 @@ void SetCwdToProjectRoot()
 
 struct AppState
 {
+    HWND hwnd = nullptr;
+    // Resolution combo request; applied at top of main loop (SetWindowPos
+    // sends WM_SIZE synchronously, which must not run mid-frame).
+    int pendingClientW = 0, pendingClientH = 0;
     Renderer renderer;
     Camera camera;
     ShadingMode mode = ShadingMode::Lit;
@@ -142,7 +146,7 @@ struct AppState
     bool shadowBlur = false;
     float exposureEV = 0.0f; // log2 stops; linear = 2^EV
     float roughness = 0.6f;
-    bool vsync = false;
+    bool vsync = true;
     int gridSize = 1;
     bool taa = true;
     PointLighting pointLight = PointLighting::Complex;
@@ -998,20 +1002,50 @@ void FrameControlsWindow()
         return;
     }
 
-    if (ImGui::Button("Copy camera (pos+rot)"))
+    if (g_app.graphicsAdapters.size() > 1)
     {
-        float cp[3];
-        hlslpp::store(cp, g_app.camera.position);
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-                      "pos=(%.4f, %.4f, %.4f) yaw=%.6f pitch=%.6f fov=%.2f",
-                      cp[0], cp[1], cp[2],
-                      g_app.camera.yaw, g_app.camera.pitch, g_app.camera.fovDeg);
-        ImGui::SetClipboardText(buf);
+        std::vector<const char*> names;
+        names.reserve(g_app.graphicsAdapters.size() + 1);
+        names.push_back("(system default)");
+        for (auto& n : g_app.graphicsAdapters)
+            names.push_back(n.c_str());
+        int sel = (g_app.adapterIdx < 0) ? 0 : (g_app.adapterIdx + 1);
+        if (sel >= (int)names.size())
+            sel = 0;
+        if (ImGui::Combo("GPU adapter", &sel, names.data(), (int)names.size()))
+        {
+            g_app.adapterIdx = (sel == 0) ? -1 : (sel - 1);
+            Settings st = LoadSettings();
+            st.adapterIdx = g_app.adapterIdx;
+            SaveSettings(st);
+        }
+        if (g_app.adapterIdx != g_app.activeAdapterIdx)
+        {
+            ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1), "Restart to apply");
+        }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(yaw/pitch in radians)");
-
+    {
+        // Preset window resolutions; shows "Custom" when the client area
+        // was resized manually. WM_SIZE resizes the swapchain.
+        static const POINT kRes[] = {{1280, 720}, {1920, 1080}, {2560, 1440}};
+        static const char* kResNames[] = {"Custom", "1280x720", "1920x1080", "2560x1440"};
+        RECT cr{};
+        GetClientRect(g_app.hwnd, &cr);
+        int sel = 0;
+        for (int i = 0; i < IM_ARRAYSIZE(kRes); ++i)
+        {
+            if (cr.right == kRes[i].x && cr.bottom == kRes[i].y)
+            {
+                sel = i + 1;
+                break;
+            }
+        }
+        if (ImGui::Combo("Resolution", &sel, kResNames, IM_ARRAYSIZE(kResNames)) && sel > 0)
+        {
+            g_app.pendingClientW = kRes[sel - 1].x;
+            g_app.pendingClientH = kRes[sel - 1].y;
+        }
+    }
     {
         // Dataset combo built from discovered assets/*.vox at startup.
         std::vector<const char*> names;
@@ -1077,15 +1111,7 @@ void FrameControlsWindow()
         g_app.pointLod = (PointLod)lo;
     }
     ImGui::SliderFloat("LOD distance", &g_app.pointLodScale, 0.25f, 8.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-    ImGui::Checkbox("Splat CS filter", &g_app.splatFilter);
-    ImGui::Checkbox("Splat 2-pass dilate", &g_app.splatDilate2Pass);
     ImGui::SliderInt("Splat radius", &g_app.splatRadius, 1, 16);
-    const char* pls[] = {"Simple", "Complex"};
-    int pli = (int)g_app.pointLight;
-    if (ImGui::Combo("Point lighting", &pli, pls, IM_ARRAYSIZE(pls)))
-    {
-        g_app.pointLight = (PointLighting)pli;
-    }
     const char* modes[] = {"Lit", "Flat Color", "Normals", "AO", "AO+LODViz"};
     int m = (int)g_app.mode;
     if (ImGui::Combo("Shading", &m, modes, IM_ARRAYSIZE(modes)))
@@ -1093,41 +1119,17 @@ void FrameControlsWindow()
         g_app.mode = (ShadingMode)m;
     }
     ImGui::Checkbox("VSync", &g_app.vsync);
-    ImGui::SliderInt("Grid size", &g_app.gridSize, 1, 10);
     ImGui::Checkbox("TAA", &g_app.taa);
 
     if (ImGui::BeginTabBar("##controlTabs"))
     {
         if (ImGui::BeginTabItem("Render"))
         {
-            if (g_app.graphicsAdapters.size() > 1)
-            {
-                std::vector<const char*> names;
-                names.reserve(g_app.graphicsAdapters.size() + 1);
-                names.push_back("(system default)");
-                for (auto& n : g_app.graphicsAdapters)
-                    names.push_back(n.c_str());
-                int sel = (g_app.adapterIdx < 0) ? 0 : (g_app.adapterIdx + 1);
-                if (sel >= (int)names.size())
-                    sel = 0;
-                if (ImGui::Combo("GPU adapter", &sel, names.data(), (int)names.size()))
-                {
-                    g_app.adapterIdx = (sel == 0) ? -1 : (sel - 1);
-                    Settings st = LoadSettings();
-                    st.adapterIdx = g_app.adapterIdx;
-                    SaveSettings(st);
-                }
-                if (g_app.adapterIdx != g_app.activeAdapterIdx)
-                {
-                    ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1), "Restart to apply");
-                }
-            }
             ImGui::SliderFloat("Sun pitch", &g_app.sunPitchDeg, 5.0f, 89.0f, "%.1f deg");
             ImGui::SliderFloat("Sun yaw", &g_app.sunYawDeg, -180.0f, 180.0f, "%.1f deg");
             ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
             ImGui::SliderFloat("Exposure", &g_app.exposureEV, -3.0f, 3.0f, "%.2f EV");
             ImGui::SliderFloat("Roughness", &g_app.roughness, 0.05f, 1.0f, "%.2f");
-            ImGui::ColorEdit3("Clear color", g_app.bgColor);
             ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
             ImGui::Checkbox("LW: Cheap top-down AO", &g_app.cheapAO);
             if (g_app.cheapAO)
@@ -1146,10 +1148,46 @@ void FrameControlsWindow()
                 }
             }
             ImGui::Checkbox("Skip backbuffer clear (post writes all px)", &g_app.skipBackbufferClear);
-            ImGui::Separator();
-            ImGui::Text("Camera");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Camera"))
+        {
+            if (ImGui::Button("Copy camera (pos+rot)"))
+            {
+                float cp[3];
+                hlslpp::store(cp, g_app.camera.position);
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              "pos=(%.4f, %.4f, %.4f) yaw=%.6f pitch=%.6f fov=%.2f",
+                              cp[0], cp[1], cp[2],
+                              g_app.camera.yaw, g_app.camera.pitch, g_app.camera.fovDeg);
+                ImGui::SetClipboardText(buf);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(yaw/pitch in radians)");
             ImGui::SliderFloat("Move speed", &g_app.camera.moveSpeed, 0.1f, 5000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("FOV", &g_app.camera.fovDeg, 30.0f, 110.0f, "%.0f");
+            ImGui::Separator();
+            if (ImGui::Button("View 1 (auto-fit)"))
+            {
+                if (g_app.view1Valid)
+                {
+                    g_app.camera.position = hlslpp::float3(
+                        g_app.view1Pos[0], g_app.view1Pos[1], g_app.view1Pos[2]);
+                    g_app.camera.yaw = g_app.view1Yaw;
+                    g_app.camera.pitch = g_app.view1Pitch;
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(g_app.view1Valid ? "captured at first load"
+                                                  : "(load a scene first)");
+            if (ImGui::Button("View 2 (curated)"))
+            {
+                g_app.camera.position = hlslpp::float3(274.4363f, 274.3316f, 353.6918f);
+                g_app.camera.yaw = 0.802501f;
+                g_app.camera.pitch = -0.505000f;
+                g_app.camera.fovDeg = 70.0f;
+            }
             ImGui::Separator();
             ImGui::TextUnformatted("RMB drag: look | WASD: move | Wheel: speed | Q/E or Ctrl/Space: down/up");
             ImGui::EndTabItem();
@@ -1221,39 +1259,17 @@ void FrameControlsWindow()
             ImGui::SliderInt("Stride (px)", &g_app.godraySeparableStride, 1, 12);
             ImGui::ColorEdit3("Tint", g_app.godrayTint);
             ImGui::Separator();
+            ImGui::BeginGroup();
             ImGui::TextUnformatted("Mark (pre-blur):");
             { auto s = g_app.renderer.GodrayMarkSrv();
               if (s.ptr) ImGui::Image((ImTextureID)s.ptr, ImVec2(192, 192)); }
+            ImGui::EndGroup();
             ImGui::SameLine();
             ImGui::BeginGroup();
             ImGui::TextUnformatted("Blurred (sampled):");
             { auto s = g_app.renderer.GodraySrv();
               if (s.ptr) ImGui::Image((ImTextureID)s.ptr, ImVec2(192, 192)); }
             ImGui::EndGroup();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Camera"))
-        {
-            if (ImGui::Button("View 1 (auto-fit)"))
-            {
-                if (g_app.view1Valid)
-                {
-                    g_app.camera.position = hlslpp::float3(
-                        g_app.view1Pos[0], g_app.view1Pos[1], g_app.view1Pos[2]);
-                    g_app.camera.yaw = g_app.view1Yaw;
-                    g_app.camera.pitch = g_app.view1Pitch;
-                }
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled(g_app.view1Valid ? "captured at first load"
-                                                  : "(load a scene first)");
-            if (ImGui::Button("View 2 (curated)"))
-            {
-                g_app.camera.position = hlslpp::float3(274.4363f, 274.3316f, 353.6918f);
-                g_app.camera.yaw = 0.802501f;
-                g_app.camera.pitch = -0.505000f;
-                g_app.camera.fovDeg = 70.0f;
-            }
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -1293,6 +1309,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                                 style, CW_USEDEFAULT, CW_USEDEFAULT,
                                 rc.right - rc.left, rc.bottom - rc.top,
                                 nullptr, nullptr, hInst, nullptr);
+    g_app.hwnd = hwnd;
 
     // Place on monitor index from settings (0-based EnumDisplayMonitors order;
     // stable per boot but not guaranteed to match Display Settings numbering).
@@ -1537,6 +1554,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         }
         if (g_app.wantQuit)
             break;
+
+        if (g_app.pendingClientW > 0)
+        {
+            RECT wr = {0, 0, g_app.pendingClientW, g_app.pendingClientH};
+            AdjustWindowRect(&wr, (DWORD)GetWindowLongPtrW(g_app.hwnd, GWL_STYLE), FALSE);
+            SetWindowPos(g_app.hwnd, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            g_app.pendingClientW = g_app.pendingClientH = 0;
+        }
 
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - last).count();

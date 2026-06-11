@@ -218,7 +218,6 @@ public:
 private:
     bool CreateDeviceAndSwap(HWND hwnd, int adapterIdx);
     bool CreateRenderTargets();
-    bool CreateM2Demo();
     bool CreateM4();
     bool CreateVisTextures(uint32_t w, uint32_t h);
     bool UploadLwLod(const lw::World& w, int L);
@@ -280,10 +279,7 @@ private:
 
     std::unique_ptr<DirectX::GraphicsMemory> graphicsMemory_;
 
-    // M2 — validation demo (DXC compile + rootsig + PSO + IA-less triangle).
     ShaderCompiler                   shaderc_;
-    ComPtr<ID3D12RootSignature>      m2RootSig_;
-    ComPtr<ID3D12PipelineState>      m2Pso_;
 
     // M3 — LW upload. Per-LOD GPU buffers + a shared shader-visible SRV heap
     // (sized for all LODs' structured buffers, with headroom for M4 combined +

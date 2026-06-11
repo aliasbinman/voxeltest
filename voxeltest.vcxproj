@@ -286,7 +286,6 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
 
   <!-- =================== Shader source files (display only) =================== -->
   <ItemGroup>
-    <None Include="shaders\m2_demo.hlsl" />
     <None Include="shaders\m4_lw.hlsl" />
     <None Include="shaders\m4_taa_post.hlsl" />
     <None Include="shaders\voxel.hlsl" />
@@ -314,16 +313,6 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
 
   <!-- =================== Xbox shader compile: HLSL -> .cso via host SDK DXC =================== -->
   <ItemGroup Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Platform)', 'Gaming\..+\.x64'))">
-    <ShaderEntry Include="m2_demo.hlsl_vsmain">
-      <Source>shaders\m2_demo.hlsl</Source>
-      <Entry>vsmain</Entry>
-      <Profile>vs_6_0</Profile>
-    </ShaderEntry>
-    <ShaderEntry Include="m2_demo.hlsl_psmain">
-      <Source>shaders\m2_demo.hlsl</Source>
-      <Entry>psmain</Entry>
-      <Profile>ps_6_0</Profile>
-    </ShaderEntry>
     <ShaderEntry Include="m4_lw.hlsl_csmain_pass1_depth">
       <Source>shaders\m4_lw.hlsl</Source>
       <Entry>csmain_pass1_depth</Entry>
