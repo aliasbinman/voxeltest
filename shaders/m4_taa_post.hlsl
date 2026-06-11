@@ -1,3 +1,8 @@
+// Reprojection method toggle (hot-reloadable — save file to swap).
+//   1 = Burnout Paradise 2-mad reproject matrix (gReprojMx/My/Mw, CPU-baked)
+//   0 = reference: reconstruct world pos from depth, project with gPrevViewProj
+#define USE_BURNOUT_REPROJECT 1
+
 // m4_taa_post.hlsl — verbatim port of CSTiles postfx.hlsl psmain_taa + psmain_post.
 // Same cbPerFrame layout as m4_lw.hlsl so all compiles read matching offsets.
 // Godray + shadow CB / SRVs bound to zeroed dummies — corresponding shader
@@ -90,17 +95,36 @@ float4 psmain_taa(VTaaOut i) : SV_Target
         return float4(curC, outAlpha);
     }
 
+#if USE_BURNOUT_REPROJECT
     // Burnout Paradise reproject — 2-mad form. Mvel rows baked CPU-side.
     // F.x = mxx*u + mxy*v + mxw, K.x = mxz; same for y, w. G = K*d + F.
-    // V.xy = G.z*S.xy + G.xy. Paper sign: V = S_prev - S_curr → prevUV = currUV + V.
+    // G = homogeneous delta (prevH - currH) in HScreen-UV. Paper velocity is
+    // the divide-free first-order form: V = G.xy - S*G.z (≈ exact
+    // (S+G.xy)/(1+G.z) - S for small per-frame deltas).
     // Our d (gTaaDepth) = nearZ/viewZ = NDC z (reverse-Z infinite-far proj).
     float Fx = gReprojMx.x * currUvCenter.x + (gReprojMx.y * currUvCenter.y + gReprojMx.w);
     float Fy = gReprojMy.x * currUvCenter.x + (gReprojMy.y * currUvCenter.y + gReprojMy.w);
     float Fw = gReprojMw.x * currUvCenter.x + (gReprojMw.y * currUvCenter.y + gReprojMw.w);
     float3 G = float3(gReprojMx.z, gReprojMy.z, gReprojMw.z) * d + float3(Fx, Fy, Fw);
-    float2 vel = currUvCenter * G.z + G.xy;
+    float2 vel = G.xy - currUvCenter * G.z;
     float2 prevUv = currUvCenter + vel;
     if (any(prevUv < 0.0) || any(prevUv > 1.0)) return float4(curC, outAlpha);
+#else
+    // Reference reproject — reconstruct world position from linear depth,
+    // project with previous frame's view-proj.
+    float viewZ = gNearZ / d;
+    float ndcX = currUvCenter.x * 2.0 - 1.0;
+    float ndcY = 1.0 - currUvCenter.y * 2.0;
+    float viewX = ndcX * gAspectTanFov * viewZ;
+    float viewY = ndcY * gTanHalfFovY  * viewZ;
+    float3 world = gCamPos + gCamRight * viewX + gCamUp * viewY + gCamForward * viewZ;
+
+    float4 prevClip = mul(float4(world, 1.0), gPrevViewProj);
+    if (prevClip.w <= 0.0) return float4(curC, outAlpha);
+    float3 prevNdc = prevClip.xyz / prevClip.w;
+    if (any(abs(prevNdc.xy) > 1.0)) return float4(curC, outAlpha);
+    float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
+#endif
 
     float2 texSize = gScreenSize;
     float2 sp = prevUv * texSize;
