@@ -262,6 +262,11 @@ void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
                               : ((visPack.y >> ((i - 4u) * 8u)) & 0x3Fu);
         if (mask == 0u) mask = 0x3Fu;
 
+        // Depth-win gate FIRST: only the winning voxel pays for the AO fetch +
+        // average loop and pack below; discarded voxels skip all of it.
+        const uint kLinDepthSlop = 64u;
+        if (myLin > gLwDepthSrv.Load(int3(pix, 0)) + kLinDepthSlop) continue;
+
         // Lit (gMode == 0): bake AO into albedo here. Per-voxel scalar = average
         // of the exposed (visible) faces' baked AO — view-independent, so no
         // cube/splotch. The dilate then lights this AO-darkened albedo.
@@ -299,15 +304,11 @@ void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
         // even for pitch-black albedo + visMask 0.
         uint argb32 = (3u << 30) | (mask << 24) | (b8 << 16) | (g8 << 8) | r8;
 
-        // Pass2 writes color at the SINGLE projected pixel only. Pass1's NxN
-        // depth splat handles coverage; if we splatted color too, multiple
-        // voxels with the same winning depth would last-writer-wins per pixel
-        // → horizontal banding from dispatch order. Single-pixel write keeps
-        // each voxel honest, accepting holes that Pass1's depth-only splat
-        // leaves at distance.
-        const uint kLinDepthSlop = 64u;
-        uint winDepth = gLwDepthSrv.Load(int3(pix, 0));
-        if (myLin > winDepth + kLinDepthSlop) continue;
+        // Pass2 writes color at the SINGLE projected pixel only (depth-win gate
+        // already applied above). Pass1's NxN depth splat handles coverage; if
+        // we splatted color too, multiple voxels with the same winning depth
+        // would last-writer-wins per pixel → horizontal banding from dispatch
+        // order. Single-pixel write keeps each voxel honest.
         gLwVisUav[pix] = argb32;
     }
 }
