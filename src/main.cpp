@@ -211,6 +211,7 @@ struct AppState
     float aoFadeUnits = 16.0f;
     float aoPushTexels = 1.0f;
     float aoStrength = 1.0f;
+    float ambient = 0.35f; // ambient term boost
     // Saved camera views. view1 = auto-fit from world AABB (legacy default,
     // captured on first load). view2 = curated viewpoint hardcoded below.
     float view1Pos[3] = {0.0f, 0.0f, 0.0f};
@@ -1130,11 +1131,13 @@ void FrameControlsWindow()
             ImGui::SliderFloat("Sun intensity", &g_app.sunIntensityEV, -4.0f, 4.0f, "%.2f EV");
             ImGui::SliderFloat("Exposure", &g_app.exposureEV, -3.0f, 3.0f, "%.2f EV");
             ImGui::SliderFloat("Roughness", &g_app.roughness, 0.05f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Ambient boost", &g_app.ambient, 0.0f, 2.0f, "%.2f");
+            // Baked per-face AO darkening (Lit mode). Always visible.
+            ImGui::SliderFloat("Baked AO strength", &g_app.aoStrength, 0.0f, 1.0f, "%.2f");
             ImGui::Checkbox("LW: draw chunk bounds (LOD coloured)", &g_app.lwShowBounds);
             ImGui::Checkbox("LW: Cheap top-down AO", &g_app.cheapAO);
             if (g_app.cheapAO)
             {
-                ImGui::SliderFloat("  AO strength",   &g_app.aoStrength,   0.0f, 1.0f,  "%.2f");
                 ImGui::SliderFloat("  AO fade units", &g_app.aoFadeUnits,  1.0f, 64.0f, "%.1f");
                 ImGui::SliderFloat("  AO push (tx)",  &g_app.aoPushTexels, 0.0f, 8.0f,  "%.1f");
             }
@@ -1876,6 +1879,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.lwShowBounds = g_app.lwShowBounds;
             ps.cheapAO = g_app.cheapAO;
             ps.aoStrength = g_app.aoStrength;
+            ps.ambient = g_app.ambient;
             ps.aoFadeUnits = g_app.aoFadeUnits;
             ps.aoPushTexels = g_app.aoPushTexels;
             ps.exposure = exp2f(g_app.exposureEV);

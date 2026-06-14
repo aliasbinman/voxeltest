@@ -79,7 +79,8 @@ cbuffer cbPerFrame : register(b0)
     float    gAspect;                  // 488
     float    gInvAspect;               // 492
     float    gAspectTanFov;            // 496
-    float3   _padPC;                   // 500..512
+    float    gAoStrength;              // 500  baked AO darkening (0..1)
+    float2   _padPC;                   // 504..512
     // Burnout Paradise reproject matrix rows (HScreen-UV). Mvel = Mh1_to_h0 - I.
     float4   gReprojMx;                // 512  (mxx, mxy, mxz, mxw)
     float4   gReprojMy;                // 528  (myx, myy, myz, myw)
@@ -117,6 +118,9 @@ StructuredBuffer<uint2>       gLwBlockVis   : register(t6);
 StructuredBuffer<uint>        gLwBlockAo    : register(t7);
 
 RWTexture2D<uint>             gLwVisUav     : register(u0);
+// Per-face AO (low 24 bits = 6 faces * 4-bit) written at the splat winner pixel.
+// Dilate reads it and indexes by the true hit face for Lit shading.
+RWTexture2D<uint>             gLwAoUav      : register(u1);
 
 // Linear-depth encoding — uniform precision over [0, 100km] view-Z.
 static const float kLinDepthFar   = 100000.0;
@@ -267,36 +271,20 @@ void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
         const uint kLinDepthSlop = 64u;
         if (myLin > gLwDepthSrv.Load(int3(pix, 0)) + kLinDepthSlop) continue;
 
-        // Lit (gMode == 0): bake AO into albedo here. Per-voxel scalar = average
-        // of the exposed (visible) faces' baked AO — view-independent, so no
-        // cube/splotch. The dilate then lights this AO-darkened albedo.
-        if ((int)gMode == 0)
-        {
-            uint aoW = gLwBlockAo[(blockBase + (gid - firstThread)) * 8u + i];
-            float aoSum = 0.0; uint aoN = 0u;
-            [unroll]
-            for (uint f = 0u; f < 6u; ++f)
-            {
-                if (((mask >> f) & 1u) == 0u) continue;
-                aoSum += (float)((aoW >> (f * 4u)) & 0xFu) * (1.0 / 15.0);
-                ++aoN;
-            }
-            float ao = (aoN > 0u) ? (aoSum / (float)aoN) : 1.0;
-            r8 = (uint)((float)r8 * ao);
-            g8 = (uint)((float)g8 * ao);
-            b8 = (uint)((float)b8 * ao);
-        }
+        // Per-face AO (low 24 bits) for this winning voxel. Written to the AO
+        // splat texture so the dilate can index it by the real hit face for Lit
+        // shading — same per-face data the AO-viz uses, now in Lit too.
+        uint aoFace24 = gLwBlockAo[(blockBase + (gid - firstThread)) * 8u + i] & 0x00FFFFFFu;
+        gLwAoUav[pix] = aoFace24;
 
         // AO viz (gMode == 3): stash the full 24-bit packed per-face AO into the
         // RGB bits. Dilate indexes it by the true ray-AABB hit face (bestFace),
         // so AO is view-independent — no per-face guessing here.
         if ((int)gMode == 3)
         {
-            // gLwBlockAo: 1 uint/voxel, 8 per block. Index voxel i of this block.
-            uint aoW = gLwBlockAo[(blockBase + (gid - firstThread)) * 8u + i] & 0x00FFFFFFu;
-            r8 =  aoW        & 0xFFu;
-            g8 = (aoW >>  8) & 0xFFu;
-            b8 = (aoW >> 16) & 0xFFu;
+            r8 =  aoFace24        & 0xFFu;
+            g8 = (aoFace24 >>  8) & 0xFFu;
+            b8 = (aoFace24 >> 16) & 0xFFu;
         }
 
         // Pack: bits 0-7=R, 8-15=G, 16-23=B, 24-29=visMask, 30-31=marker(0b11).
@@ -321,6 +309,7 @@ void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
 // ============================================================
 Texture2D<uint>   gDilateDepthSrv : register(t0);
 Texture2D<uint>   gDilateColorIn  : register(t1);
+Texture2D<uint>   gDilateAoIn     : register(t2); // per-face AO at splat winner
 RWTexture2D<uint>  gDilateColorOut : register(u0);
 RWTexture2D<float> gDilateDepthOut : register(u1); // gNearZ/viewZ form (CSTiles)
 
@@ -426,6 +415,7 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
     float bestT       = 1e30;
     uint  bestPck     = 0;
     uint  bestFace    = 0;
+    int2  bestSp      = pix;   // source pixel of bestPck (for AO lookup)
     bool  haveHit     = false;
     float fbBestD     = 1e30;
     uint  fbPck       = 0;
@@ -490,6 +480,7 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
             bestT    = tHit;
             bestPck  = c;
             bestFace = face;
+            bestSp   = sp;
             haveHit  = true;
         }
     }}
@@ -621,10 +612,34 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
     }
     else
     {
+        // Per-face baked AO from the splat winner pixel, indexed by the true hit
+        // face (same data the AO-viz shows). Attenuates ambient/indirect only —
+        // direct sun stays full so lit faces aren't muddied.
+        uint  aoPck = gDilateAoIn.Load(int3(bestSp, 0));
+        float ao;
+        if (haveHit)
+        {
+            ao = (float)((aoPck >> (bestFace * 4u)) & 0xFu) * (1.0 / 15.0);
+        }
+        else
+        {
+            float s = 0.0; uint n = 0u;
+            [unroll]
+            for (uint f = 0u; f < 6u; ++f)
+            {
+                if (((mask >> f) & 1u) == 0u) continue;
+                s += (float)((aoPck >> (f * 4u)) & 0xFu) * (1.0 / 15.0);
+                ++n;
+            }
+            ao = (n > 0u) ? (s / (float)n) : 1.0;
+        }
         float3 sunCol = float3(1.0, 0.95, 0.85) * (gSunIntensity * 3.0);
         float3 amb    = AmbientCube(Nshade) * gAmbient;
         float3 light  = amb + NdotL * sunCol;
         lit = albedo * light;
+        // AO darkens the whole result (ambient + direct). No sun-shadow pass in
+        // this path, so baked AO doubles as contact shadow. gAoStrength = 0..1.
+        lit *= lerp(1.0, ao, gAoStrength);
         // Fog applied in world space — distance + height-based attenuation
         // matching CSTiles ApplyFog. Hit pixels use ray-AABB hit position;
         // fallback pixels use fbCenter (close enough — neighbor's voxel).

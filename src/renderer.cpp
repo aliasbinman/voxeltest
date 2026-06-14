@@ -879,18 +879,34 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
     if (visBytes > 0 && !up.Upload(src.blockVisPool.data(), visBytes, g.blockVisSb))
         return false;
 
-    // ---- BlockAo: repack 3 B/voxel (aoPacked) -> 1 uint/voxel (low 24 bits),
-    // 8 voxels/block, parallel to blockPosPool. Shader reads as StructuredBuffer.
+    // ---- BlockAo: repack 3 B/voxel (aoPacked) -> 1 uint/voxel, 8 voxels/block,
+    // parallel to blockPosPool. Low 24 bits = 6 faces * 4-bit (mode-3 viz reads
+    // per-face by hit face). Top byte = precomputed average over visible faces
+    // (0..255), so Lit-mode shading needs one load + multiply, no per-voxel loop.
     std::vector<uint32_t> aoFlat;
+    const bool haveVis = !src.blockVisPool.empty();
     const uint64_t aoBytes = (uint64_t)src.blockAoPool.size() * 8u * sizeof(uint32_t);
     if (!src.blockAoPool.empty())
     {
         aoFlat.resize(src.blockAoPool.size() * 8u);
         for (size_t b = 0; b < src.blockAoPool.size(); ++b)
             for (int i = 0; i < 8; ++i)
-                aoFlat[b * 8 + i] = (uint32_t)src.blockAoPool[b].ao[i][0]
-                                  | ((uint32_t)src.blockAoPool[b].ao[i][1] << 8)
-                                  | ((uint32_t)src.blockAoPool[b].ao[i][2] << 16);
+            {
+                const uint8_t* ao = src.blockAoPool[b].ao[i];
+                uint32_t low = (uint32_t)ao[0] | ((uint32_t)ao[1] << 8) | ((uint32_t)ao[2] << 16);
+                uint8_t vm = haveVis ? (src.blockVisPool[b].visMask[i] & 0x3Fu) : 0x3Fu;
+                if (vm == 0u) vm = 0x3Fu;
+                uint32_t sum = 0, cnt = 0;
+                for (int f = 0; f < 6; ++f)
+                {
+                    if (!((vm >> f) & 1u)) continue;
+                    uint32_t nib = (low >> (f * 4)) & 0xFu;
+                    sum += nib * 17u; // nibble 0..15 -> 0..255
+                    ++cnt;
+                }
+                uint32_t avg = cnt ? (sum / cnt) : 255u;
+                aoFlat[b * 8 + i] = low | (avg << 24);
+            }
         if (!up.Upload(aoFlat.data(), aoBytes, g.blockAoSb)) return false;
     }
 
@@ -1107,7 +1123,7 @@ bool Renderer::RecompileShaders()
 bool Renderer::CreateM4()
 {
     D3D12_DESCRIPTOR_HEAP_DESC td{};
-    td.NumDescriptors = 14;
+    td.NumDescriptors = 16; // 0..13 + visAoUav(14) + visAoSrv(15)
     td.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     td.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(device_->CreateDescriptorHeap(&td, IID_PPV_ARGS(&m4TexHeap_)),
@@ -1186,8 +1202,13 @@ bool Renderer::CreateM4()
         uavRange.NumDescriptors = 1;
         uavRange.BaseShaderRegister = 0;  // u0
         uavRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_DESCRIPTOR_RANGE aoUavRange{};
+        aoUavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        aoUavRange.NumDescriptors = 1;
+        aoUavRange.BaseShaderRegister = 1;  // u1 = visAo
+        aoUavRange.OffsetInDescriptorsFromTableStart = 0;
 
-        D3D12_ROOT_PARAMETER p[11]{};
+        D3D12_ROOT_PARAMETER p[12]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0,0};
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {1,0};
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor = {0,0}; // chunkInfo
@@ -1201,10 +1222,12 @@ bool Renderer::CreateM4()
         p[8].DescriptorTable = { 1, &uavRange };
         p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[9].Descriptor = {6,0};  // blockVis
         p[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[10].Descriptor = {7,0}; // blockAo
+        p[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[11].DescriptorTable = { 1, &aoUavRange }; // u1 = visAo splat texture
         for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 11;
+        rsd.NumParameters = 12;
         rsd.pParameters = p;
         if (!buildRootSig(rsd, m4Pass2RootSig_, L"m4Pass2RootSig")) return false;
     }
@@ -1257,16 +1280,22 @@ bool Renderer::CreateM4()
         uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         uavRange.NumDescriptors = 2;
         uavRange.BaseShaderRegister = 0;
-        D3D12_ROOT_PARAMETER p[4]{};
+        D3D12_DESCRIPTOR_RANGE aoSrvRange{};
+        aoSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        aoSrvRange.NumDescriptors = 1;
+        aoSrvRange.BaseShaderRegister = 2;  // t2 = visAo
+        D3D12_ROOT_PARAMETER p[5]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0, 0};
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {1, 0};
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable = {1, &srvRange};
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[3].DescriptorTable = {1, &uavRange};
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[4].DescriptorTable = {1, &aoSrvRange}; // t2 = visAo splat texture
         for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 4;
+        rsd.NumParameters = 5;
         rsd.pParameters = p;
         if (!buildRootSig(rsd, m4DilateRootSig_, L"m4DilateRootSig")) return false;
     }
@@ -1483,6 +1512,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
     WaitForGpu();
     visDepthTex_.Reset();
     visColorTex_.Reset();
+    visAoTex_.Reset();
     visColor2Tex_.Reset();
     visDepth2Tex_.Reset();
     taaHistTex_[0].Reset();
@@ -1532,6 +1562,7 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
     };
     if (!createUintTex(visDepthTex_,  L"visDepthTex"))  return false;
     if (!createUintTex(visColorTex_,  L"visColorTex"))  return false;
+    if (!createUintTex(visAoTex_,     L"visAoTex"))     return false;
     if (!createUintTex(visColor2Tex_, L"visColor2Tex")) return false;
     // visDepth2 is R32_FLOAT (CSTiles depth = gNearZ/viewZ).
     {
@@ -1638,6 +1669,9 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         device_->CreateShaderResourceView (godrayTex_[0].Get(),  &srvR16,          cpu(heap, 11));
         device_->CreateShaderResourceView (godrayTex_[1].Get(),  &srvR16,          cpu(heap, 12));
         device_->CreateShaderResourceView (godrayTex_[2].Get(),  &srvR16,          cpu(heap, 13));
+        // Per-face AO splat texture: UAV (pass2 write) + SRV (dilate read).
+        device_->CreateUnorderedAccessView(visAoTex_.Get(),      nullptr, &uavD,    cpu(heap, 14));
+        device_->CreateShaderResourceView (visAoTex_.Get(),      &srvUint,         cpu(heap, 15));
     }
 
     // RTVs into taaRtvHeap_: 0,1=taaHist 2=taaScene 3,4,5=godray[0..2].
@@ -1933,7 +1967,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     cbf.camPos[0] = camP[0];
     cbf.camPos[1] = camP[1];
     cbf.camPos[2] = camP[2];
-    cbf.ambient = 0.35f;
+    cbf.ambient = std::max(0.0f, args.ambient);
     {
         float sx = args.sunDir[0], sy = args.sunDir[1], sz = args.sunDir[2];
         float il = 1.0f / std::max(1e-4f, sqrtf(sx*sx + sy*sy + sz*sz));
@@ -1952,6 +1986,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     cbf.sunIntensity = std::max(args.sunIntensity, 0.0f);
     cbf.exposure = std::max(args.exposure, 0.001f);
     cbf.roughness = args.roughness;
+    cbf._padPC[0] = std::max(0.0f, args.aoStrength); // baked AO darkening strength
     cbf.gridSize = (float)std::max(1, args.gridSize);
     cbf.shadowEnable = 0.0f;
     cbf.shadowBias = args.shadowBias;
@@ -2114,8 +2149,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cmdList_->SetComputeRootSignature(m4Pass2RootSig_.Get());
         cmdList_->SetPipelineState(m4Pass2Pso_.Get());
         cmdList_->SetComputeRootConstantBufferView(0, cbfAlloc.GpuAddress());
-        cmdList_->SetComputeRootDescriptorTable(7, gpu(2)); // t5 = depthSrv
-        cmdList_->SetComputeRootDescriptorTable(8, gpu(1)); // u0 = colorUav
+        cmdList_->SetComputeRootDescriptorTable(7, gpu(2));  // t5 = depthSrv
+        cmdList_->SetComputeRootDescriptorTable(8, gpu(1));  // u0 = colorUav
+        cmdList_->SetComputeRootDescriptorTable(11, gpu(14)); // u1 = visAoUav
         bool firstPass2 = true;
         for (int L = 0; L < lw::kLodCount; ++L)
         {
@@ -2143,16 +2179,20 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         }
     }
 
-    // Transition visColor UAV → NON_PIXEL_SRV for dilate input. visDepth stays
-    // NON_PIXEL_SRV (dilate also reads it).
+    // Transition visColor + visAo UAV → NON_PIXEL_SRV for dilate input. visDepth
+    // stays NON_PIXEL_SRV (dilate also reads it).
     {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = visColorTex_.Get();
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        cmdList_->ResourceBarrier(1, &b);
+        D3D12_RESOURCE_BARRIER b[2]{};
+        for (int k = 0; k < 2; ++k)
+        {
+            b[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[k].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            b[k].Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            b[k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        b[0].Transition.pResource = visColorTex_.Get();
+        b[1].Transition.pResource = visAoTex_.Get();
+        cmdList_->ResourceBarrier(2, b);
     }
 
     // ---- Dilate compute pass: visColor + visDepth → visColor2 ----
@@ -2167,6 +2207,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cmdList_->SetComputeRootConstantBufferView(1, csCb);                  // b1 vwSize/radius
         cmdList_->SetComputeRootDescriptorTable(2, gpu(2));                   // t0..t1
         cmdList_->SetComputeRootDescriptorTable(3, gpu(6));                   // u0=visColor2, u1=visDepth2
+        cmdList_->SetComputeRootDescriptorTable(4, gpu(15));                  // t2 = visAo
         UINT gx = (visTexW_ + 7) / 8;
         UINT gy = (visTexH_ + 7) / 8;
         cmdList_->Dispatch(gx, gy, 1);
@@ -2175,7 +2216,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     // Post-dilate: visDepth back to UAV (next frame's pass1 needs it); dilated
     // outputs UAV → PIXEL_SRV for resolve.
     {
-        D3D12_RESOURCE_BARRIER b[3]{};
+        D3D12_RESOURCE_BARRIER b[4]{};
         b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b[0].Transition.pResource = visDepthTex_.Get();
         b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -2191,7 +2232,13 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         b[2].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         b[2].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        cmdList_->ResourceBarrier(3, b);
+        // visAo NON_PIXEL_SRV → UAV for next frame's pass2 write.
+        b[3].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[3].Transition.pResource = visAoTex_.Get();
+        b[3].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b[3].Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[3].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList_->ResourceBarrier(4, b);
     }
 
     // ---- Resolve PS — fullscreen blit to backbuffer (already bound by BeginFrame) ----

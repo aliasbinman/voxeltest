@@ -80,6 +80,7 @@ struct DrawSceneParams
     float sunIntensity = 1.0f;
     float exposure = 1.0f;
     float roughness = 0.6f;
+    float ambient = 0.35f; // ambient term boost (gAmbient)
     bool sunShadows = false;
     int shadowCascades = 1;
     int shadowMapSize = 2048;
@@ -299,6 +300,7 @@ private:
     // m4TexHeap_:  0=depthUav  1=colorUav  2=depthSrv  3=colorSrv.
     ComPtr<ID3D12Resource>            visDepthTex_;
     ComPtr<ID3D12Resource>            visColorTex_;
+    ComPtr<ID3D12Resource>            visAoTex_;         // per-face AO at splat winner (R32_UINT)
     ComPtr<ID3D12Resource>            visColor2Tex_;     // dilated color (R32_UINT)
     ComPtr<ID3D12Resource>            visDepth2Tex_;     // dilated depth (R32_FLOAT, gNearZ/viewZ form)
     ComPtr<ID3D12Resource>            taaSceneTex_;      // resolve output (R11G11B10F)
