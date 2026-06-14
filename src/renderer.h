@@ -231,12 +231,14 @@ private:
         ComPtr<ID3D12Resource> blockPosSb;
         ComPtr<ID3D12Resource> blockColSb;
         ComPtr<ID3D12Resource> blockVisSb;
+        ComPtr<ID3D12Resource> blockAoSb; // 1 uint/voxel (24-bit AO), 8/block
         // Shader-visible SRV descriptor indices into lwSrvHeap_ (UINT32_MAX = none).
         uint32_t chunkInfoSrv = UINT32_MAX;
         uint32_t paletteSrv   = UINT32_MAX;
         uint32_t blockPosSrv  = UINT32_MAX;
         uint32_t blockColSrv  = UINT32_MAX;
         uint32_t blockVisSrv  = UINT32_MAX;
+        uint32_t blockAoSrv   = UINT32_MAX;
         uint32_t slotCount    = 0;
         uint32_t blockCount   = 0;
         uint64_t bytes        = 0;

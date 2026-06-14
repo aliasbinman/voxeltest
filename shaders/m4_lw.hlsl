@@ -113,6 +113,8 @@ StructuredBuffer<uint2>       gLwBlockCol   : register(t3);
 StructuredBuffer<uint4>       gLwWorkItems  : register(t4);
 Texture2D<uint>               gLwDepthSrv   : register(t5);
 StructuredBuffer<uint2>       gLwBlockVis   : register(t6);
+// Baked per-voxel AO, 1 uint/voxel (low 24 bits = 6 faces * 4-bit), 8/block.
+StructuredBuffer<uint>        gLwBlockAo    : register(t7);
 
 RWTexture2D<uint>             gLwVisUav     : register(u0);
 
@@ -259,6 +261,38 @@ void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
         uint mask = (i < 4u) ? ((visPack.x >> (i * 8u)) & 0x3Fu)
                               : ((visPack.y >> ((i - 4u) * 8u)) & 0x3Fu);
         if (mask == 0u) mask = 0x3Fu;
+
+        // Lit (gMode == 0): bake AO into albedo here. Per-voxel scalar = average
+        // of the exposed (visible) faces' baked AO — view-independent, so no
+        // cube/splotch. The dilate then lights this AO-darkened albedo.
+        if ((int)gMode == 0)
+        {
+            uint aoW = gLwBlockAo[(blockBase + (gid - firstThread)) * 8u + i];
+            float aoSum = 0.0; uint aoN = 0u;
+            [unroll]
+            for (uint f = 0u; f < 6u; ++f)
+            {
+                if (((mask >> f) & 1u) == 0u) continue;
+                aoSum += (float)((aoW >> (f * 4u)) & 0xFu) * (1.0 / 15.0);
+                ++aoN;
+            }
+            float ao = (aoN > 0u) ? (aoSum / (float)aoN) : 1.0;
+            r8 = (uint)((float)r8 * ao);
+            g8 = (uint)((float)g8 * ao);
+            b8 = (uint)((float)b8 * ao);
+        }
+
+        // AO viz (gMode == 3): stash the full 24-bit packed per-face AO into the
+        // RGB bits. Dilate indexes it by the true ray-AABB hit face (bestFace),
+        // so AO is view-independent — no per-face guessing here.
+        if ((int)gMode == 3)
+        {
+            // gLwBlockAo: 1 uint/voxel, 8 per block. Index voxel i of this block.
+            uint aoW = gLwBlockAo[(blockBase + (gid - firstThread)) * 8u + i] & 0x00FFFFFFu;
+            r8 =  aoW        & 0xFFu;
+            g8 = (aoW >>  8) & 0xFFu;
+            b8 = (aoW >> 16) & 0xFFu;
+        }
 
         // Pack: bits 0-7=R, 8-15=G, 16-23=B, 24-29=visMask, 30-31=marker(0b11).
         // Marker keeps argb != 0 so resolve's sky test ('color==0') still works
@@ -558,6 +592,31 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
         };
         // Hit path: per-pixel face color. Fallback path: gray (triplanar).
         lit = haveHit ? kFaceColor[bestFace] : float3(0.5, 0.5, 0.5);
+    }
+    else if ((int)gMode == 3)
+    {
+        // AO viz: low 24 bits of bestPck carry 6 faces * 4-bit baked AO. Index
+        // by the true ray-AABB hit face (view-independent). Fallback pixels
+        // (no hit) average visible faces so they stay stable under camera move.
+        uint aoW = bestPck & 0x00FFFFFFu;
+        float ao;
+        if (haveHit)
+        {
+            ao = (float)((aoW >> (bestFace * 4u)) & 0xFu) * (1.0 / 15.0);
+        }
+        else
+        {
+            float s = 0.0; uint n = 0u;
+            [unroll]
+            for (uint f = 0u; f < 6u; ++f)
+            {
+                if (((mask >> f) & 1u) == 0u) continue;
+                s += (float)((aoW >> (f * 4u)) & 0xFu) * (1.0 / 15.0);
+                ++n;
+            }
+            ao = (n > 0u) ? (s / (float)n) : 1.0;
+        }
+        lit = float3(ao, ao, ao);
     }
     else
     {

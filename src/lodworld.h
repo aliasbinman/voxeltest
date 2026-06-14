@@ -95,10 +95,18 @@ struct BlockVis
 {
     uint8_t visMask[8];
 };
+// Per-voxel baked AO. 6 faces * 4-bit = 24 bits = 3 B/voxel, mirrors BlockCol
+// layout (8 voxel slots). Packing matches DiskVoxel::aoPacked: face fi's nibble
+// lives at bit fi*4 across the 3 bytes. Populated from kFlagAo octet payload.
+struct BlockAo
+{
+    uint8_t ao[8][3];
+};
 #pragma pack(pop)
 static_assert(sizeof(BlockPos) == 4, "");
 static_assert(sizeof(BlockCol) == 8, "");
 static_assert(sizeof(BlockVis) == 8, "");
+static_assert(sizeof(BlockAo) == 24, "");
 
 // kFlag for chunk blob: compact per-chunk OCTET stream at end of blob.
 // Format (V3, file version 2):
@@ -211,12 +219,15 @@ static_assert(sizeof(DiskChunkHeader) == 60, "");
 // =====================================================================
 
 inline constexpr uint32_t kFileMagic = 0x31574F4Cu; // "LOW1" little-endian
-inline constexpr uint32_t kFileVersion = 2u;
+inline constexpr uint32_t kFileVersion = 3u;
 
 inline constexpr uint32_t kFlagLz4 = 1u << 0;
 // kFlagVisMask: octet stream payload appends 1 byte (6-bit visMask) per
 // occupied voxel after the mode-specific palette bytes.
 inline constexpr uint32_t kFlagVisMask = 1u << 3;
+// kFlagAo: octet stream payload appends 3 bytes (6 faces * 4-bit AO) per
+// occupied voxel after the visMask byte. Packing matches DiskVoxel::aoPacked.
+inline constexpr uint32_t kFlagAo = 1u << 4;
                                                   // (empty cell adjacent to solid voxel in chunk grid)
 
 // =====================================================================
@@ -446,6 +457,9 @@ struct LODWorld
     std::vector<BlockPos> blockPosPool;
     std::vector<BlockCol> blockColPool;
     std::vector<BlockVis> blockVisPool;
+    // Per-voxel baked AO (3 B/voxel). Empty unless kFlagAo was set on the chunk
+    // blob. Same index into pool as blockPosPool/blockColPool.
+    std::vector<BlockAo> blockAoPool;
 };
 
 struct World

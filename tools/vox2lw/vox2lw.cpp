@@ -141,9 +141,10 @@ struct ClusterEnc
     uint32_t cellAoCount = 0;
 };
 
-// Stripped: PointCS_Block format doesn't use AO or visMask. Defaults now off.
-static bool g_storeAo = false;
-static bool g_bakeAo = false;
+// AO baked + stored by default (6 faces * 4-bit = 3 B/voxel in octet stream).
+// --noao disables both the hemisphere bake and the on-disk AO payload.
+static bool g_storeAo = true;
+static bool g_bakeAo = true;
 static bool g_storeVisMask = false;
 static bool g_storeCellAo = false;
 static bool g_storeBlocks = true; // V2 octet stream for PointCS_Block (only output)
@@ -340,7 +341,10 @@ int main(int argc, char** argv)
         if (strcmp(argv[a], "--ao") == 0)
             g_storeAo = true;
         else if (strcmp(argv[a], "--noao") == 0)
+        {
             g_bakeAo = false;
+            g_storeAo = false;
+        }
         else if (strcmp(argv[a], "--vm") == 0)
             g_storeVisMask = true;
         else if (strcmp(argv[a], "--cellao") == 0)
@@ -1286,9 +1290,13 @@ int main(int argc, char** argv)
                 p.posZ = (uint8_t)lz;
                 p.palIdx = (uint8_t)palMap[v.color];
                 p.visMask = v.visMask & 0x3Fu;
-                p.aoPacked[0] = 0;
-                p.aoPacked[1] = 0;
-                p.aoPacked[2] = 0;
+                // Pack 6 per-face AO bytes -> 6 nibbles (face fi at bit fi*4).
+                uint32_t aoW = 0;
+                for (int fi = 0; fi < 6; ++fi)
+                    aoW |= (uint32_t)(v.aoFace[fi] >> 4) << (fi * 4);
+                p.aoPacked[0] = (uint8_t)(aoW & 0xFFu);
+                p.aoPacked[1] = (uint8_t)((aoW >> 8) & 0xFFu);
+                p.aoPacked[2] = (uint8_t)((aoW >> 16) & 0xFFu);
                 bucket[slot].push_back(p);
                 // Measure: faces actually visible; boundary face = on cluster face.
                 ++lodVoxelCount;
@@ -1780,7 +1788,8 @@ int main(int argc, char** argv)
                 {
                     uint8_t mask = 0;
                     uint8_t pal[8] = {};
-                    uint8_t vmask[8] = {}; // per-voxel 6-bit visMask
+                    uint8_t vmask[8] = {};  // per-voxel 6-bit visMask
+                    uint8_t ao[8][3] = {};  // per-voxel 6-face 4-bit AO (3 B)
                 };
                 // Per-cluster: map octetIdx -> OctetEnc.
                 std::vector<std::map<uint32_t, OctetEnc>> perCluster(lw::kClustersPerChunk);
@@ -1809,6 +1818,9 @@ int main(int argc, char** argv)
                     oe.mask |= (uint8_t)(1u << vi);
                     oe.pal[vi] = p.palIdx;
                     oe.vmask[vi] = p.visMask & 0x3Fu;
+                    oe.ao[vi][0] = p.aoPacked[0];
+                    oe.ao[vi][1] = p.aoPacked[1];
+                    oe.ao[vi][2] = p.aoPacked[2];
                 }
                 // Collect non-empty clusters and emit.
                 std::vector<uint32_t> nonEmpty;
@@ -1962,6 +1974,16 @@ int main(int argc, char** argv)
                             if (oe.mask & (1u << vi))
                                 push(&oe.vmask[vi], 1);
                         }
+                        // kFlagAo payload: 3 bytes per occupied voxel, appended
+                        // after the visMask byte. 6 faces * 4-bit AO packed.
+                        if (g_storeAo)
+                        {
+                            for (int vi = 0; vi < 8; ++vi)
+                            {
+                                if (oe.mask & (1u << vi))
+                                    push(oe.ao[vi], 3);
+                            }
+                        }
                     }
                 }
             }
@@ -1974,6 +1996,8 @@ int main(int argc, char** argv)
             {
                 flags |= lw::kFlagBlocks;
                 flags |= lw::kFlagVisMask; // always bake visMask byte per voxel
+                if (g_storeAo)
+                    flags |= lw::kFlagAo; // 3 B/voxel AO payload after visMask
             }
             const int rawSize = (int)blob.size();
             const int cap = LZ4_compressBound(rawSize);

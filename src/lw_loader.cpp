@@ -112,6 +112,7 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
         lw.blockPosPool.clear();
         lw.blockColPool.clear();
         lw.blockVisPool.clear();
+        lw.blockAoPool.clear();
         const uint32_t cc = lh[L].chunkCount;
         if (cc == 0)
             continue;
@@ -403,6 +404,32 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                                     vmFull[vi] = 0x3Fu;
                             }
 
+                            // kFlagAo payload: 3 B per occupied voxel after the
+                            // visMask byte. 6 faces * 4-bit AO (DiskVoxel packing).
+                            uint8_t aoFull[8][3] = {};
+                            if (ce.flags & kFlagAo)
+                            {
+                                for (int vi = 0; vi < 8; ++vi)
+                                {
+                                    if (mask & (1u << vi))
+                                    {
+                                        aoFull[vi][0] = *p++;
+                                        aoFull[vi][1] = *p++;
+                                        aoFull[vi][2] = *p++;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // No baked AO → full bright (0xF nibbles).
+                                for (int vi = 0; vi < 8; ++vi)
+                                {
+                                    aoFull[vi][0] = 0xFFu;
+                                    aoFull[vi][1] = 0xFFu;
+                                    aoFull[vi][2] = 0xFFu;
+                                }
+                            }
+
                             uint32_t ox = curOctetIdx & 0xFu;
                             uint32_t oz = (curOctetIdx >> 4) & 0xFu;
                             uint32_t oy = (curOctetIdx >> 8) & 0xFu;
@@ -437,6 +464,14 @@ bool LoadWorldStreaming(const char* path, World& out, std::string& err,
                             for (int vi = 0; vi < 8; ++vi)
                                 bv.visMask[vi] = vmFull[vi];
                             lw.blockVisPool.push_back(bv);
+                            BlockAo ba{};
+                            for (int vi = 0; vi < 8; ++vi)
+                            {
+                                ba.ao[vi][0] = aoFull[vi][0];
+                                ba.ao[vi][1] = aoFull[vi][1];
+                                ba.ao[vi][2] = aoFull[vi][2];
+                            }
+                            lw.blockAoPool.push_back(ba);
                             ++rc.blockCount;
                             ++octetCount;
                             if (clusterEnd && implicitRemaining == 0)

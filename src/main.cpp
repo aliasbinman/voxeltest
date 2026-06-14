@@ -1,4 +1,4 @@
-#define _CRT_SECURE_NO_WARNINGS
+﻿#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <windowsx.h>
 
@@ -67,7 +67,7 @@ void SaveSettings(const Settings& s)
     f << "monitor=" << s.monitorIdx << "\n";
 }
 
-// Compat wrappers — call sites pass a path-only or want the path only.
+// Compat wrappers â€” call sites pass a path-only or want the path only.
 std::string LoadLastVoxFromSettings()
 {
     return LoadSettings().lastVox;
@@ -184,8 +184,8 @@ struct AppState
     float playTotal = 0.0f;
     bool  playPaused = false;
     float smoothSec = 0.0f;
-    bool  showRecording = true;
-    bool  showGpuProfile = false;
+    bool  showRecording = false;
+    bool  showGpuProfile = true;
     bool  showGpuRes  = false;
     static constexpr int kGpuProfHistory = 10;
     float  gpuProfHist[1024][kGpuProfHistory] = {};
@@ -193,8 +193,8 @@ struct AppState
     // non-firing frames so toggles don't poison the rolling average.
     bool   gpuProfFired[1024][kGpuProfHistory] = {};
     int    gpuProfHistIdx = 0;
-    float  gpuProfUsPerPx = 10.0f; // µs of GPU time per displayed pixel
-    // Sticky "first-seen" registry — once a GPU timer fires it stays in the
+    float  gpuProfUsPerPx = 10.0f; // Âµs of GPU time per displayed pixel
+    // Sticky "first-seen" registry â€” once a GPU timer fires it stays in the
     // table (in registration / first-seen order) so rows don't jump as
     // features get toggled.
     bool  gpuProfSeen[1024] = {};
@@ -228,11 +228,11 @@ struct AppState
     std::atomic<int> lodReadyFlag[lw::kLodCount] = {{-1}, {-1}, {-1}, {-1}, {-1}};
     // Phase 2a continuous streaming.
     std::atomic<float> camPosAtomic[3] = {{0.0f}, {0.0f}, {0.0f}};
-    std::atomic<float> frustumAtomic[24] = {}; // 6 planes × 4 floats
+    std::atomic<float> frustumAtomic[24] = {}; // 6 planes Ã— 4 floats
     std::atomic<bool> frustumValid{false};
     std::atomic<bool> loaderQuit{false};
     std::atomic<bool> loaderTrigger{false};
-    std::atomic<float> streamRadiusScale{3.0f}; // wider shells preload finer LODs farther out → less pop-in
+    std::atomic<float> streamRadiusScale{3.0f}; // wider shells preload finer LODs farther out â†’ less pop-in
     // psmain_post writes every pixel (sky branch + scene branch both emit
     // float4(c, 1.0)) so the swapchain RTV clear is redundant when post is on.
     bool skipBackbufferClear = true;
@@ -241,7 +241,7 @@ struct AppState
     std::thread loaderThread;
     float lastTriggerCam[3] = {0, 0, 0};
     // Per-LOD mutex guards pendingLwWorld.lods[L] across the loader/main
-    // boundary — worker holds while moving fresh LOD in, main holds while
+    // boundary â€” worker holds while moving fresh LOD in, main holds while
     // reading during UploadLwLodOnly.
     std::mutex lodMu[lw::kLodCount];
     std::atomic<bool> loadOk{false};
@@ -256,8 +256,8 @@ struct AppState
 
     // window visibility
     bool showControls = true;
-    bool showFps = true;
-    bool showStats = true;
+    bool showFps = false;
+    bool showStats = false;
 };
 
 AppState g_app;
@@ -311,7 +311,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_MOUSEWHEEL:
     {
-        // Recording captures the cursor — let wheel through even if a hidden
+        // Recording captures the cursor â€” let wheel through even if a hidden
         // ImGui window thinks it wants the mouse.
         if (ImGui::GetIO().WantCaptureMouse &&
             g_app.recMode != AppState::RecMode::Recording)
@@ -422,7 +422,7 @@ inline float CR(float p0, float p1, float p2, float p3, float t)
         (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
 }
 
-// Subsample raw samples at fixed time intervals → keyframes for spline.
+// Subsample raw samples at fixed time intervals â†’ keyframes for spline.
 struct Key { float t; float pos[3]; float yaw; float pitch; };
 void BuildKeyframes(const std::vector<AppState::CamSample>& s,
                     float interval, std::vector<Key>& out)
@@ -754,7 +754,7 @@ void FrameGpuResourcesWindow()
         ImGui::Separator();
         ImGui::PopID();
     }
-    ImGui::TextDisabled("Bars scaled to largest per-LOD total. Buffers are IMMUTABLE — used == capacity.");
+    ImGui::TextDisabled("Bars scaled to largest per-LOD total. Buffers are IMMUTABLE â€” used == capacity.");
     ImGui::End();
 }
 
@@ -817,9 +817,9 @@ void FrameGpuProfileWindow()
         if (!g_app.gpuProfSeen[i]) continue;
         rows.push_back({i, raw, avg, mx});
     }
-    // µs/pixel — bar widths stay constant across frames + toggles.
+    // Âµs/pixel â€” bar widths stay constant across frames + toggles.
     ImGui::SetNextItemWidth(180.0f);
-    ImGui::SliderFloat("µs / pixel", &g_app.gpuProfUsPerPx, 0.5f, 200.0f, "%.1f",
+    ImGui::SliderFloat("Âµs / pixel", &g_app.gpuProfUsPerPx, 0.5f, 200.0f, "%.1f",
                        ImGuiSliderFlags_Logarithmic);
     ImGui::SameLine();
     ImGui::Text("smooth %df    active %d", AppState::kGpuProfHistory, (int)rows.size());
@@ -837,7 +837,7 @@ void FrameGpuProfileWindow()
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                           ImGuiTableFlags_ScrollY))
     {
-        ImGui::TableSetupColumn("Marker", ImGuiTableColumnFlags_WidthFixed, 360.0f);
+        ImGui::TableSetupColumn("Marker", ImGuiTableColumnFlags_WidthFixed, 160.0f);
         ImGui::TableSetupColumn("Avg",    ImGuiTableColumnFlags_WidthFixed,  64.0f);
         ImGui::TableSetupColumn("Raw",    ImGuiTableColumnFlags_WidthFixed,  64.0f);
         ImGui::TableSetupColumn("Bar",    ImGuiTableColumnFlags_WidthStretch);
@@ -937,7 +937,7 @@ void FrameStatsWindow()
             // Each block = 1 thread = up to 8 voxel atomics ("octet").
             // No GPU readback for actual pixels-written, so report block count
             // and upper-bound atomic count (= blocks * 8).
-            ImGui::Text("  Block CS:        %llu blocks  (≤ %llu atomics)  %u dispatches",
+            ImGui::Text("  Block CS:        %llu blocks  (â‰¤ %llu atomics)  %u dispatches",
                         (unsigned long long)blk,
                         (unsigned long long)(blk * 8ull),
                         blkDisp);
@@ -1069,7 +1069,7 @@ void FrameControlsWindow()
             }
         }
     }
-    // Tech pulldowns — only PointCS_Block wired today; others reserved for
+    // Tech pulldowns â€” only PointCS_Block wired today; others reserved for
     // future octet-based revivals. Close/Far checkboxes gate each ring.
     struct TechEntry { const char* name; RenderTech val; };
     static const TechEntry kTechList[] = {
@@ -1230,7 +1230,7 @@ void FrameControlsWindow()
             }
             else
             {
-                ImGui::TextUnformatted("(no shadow map — enable Sun shadows)");
+                ImGui::TextUnformatted("(no shadow map â€” enable Sun shadows)");
             }
             ImGui::EndTabItem();
         }
@@ -1313,7 +1313,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
     // Place on monitor index from settings (0-based EnumDisplayMonitors order;
     // stable per boot but not guaranteed to match Display Settings numbering).
-    // monitorIdx < 0 → leave default placement.
+    // monitorIdx < 0 â†’ leave default placement.
     {
         int targetIdx = LoadSettings().monitorIdx;
         if (targetIdx >= 0)
@@ -1408,7 +1408,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
     // Continuous loader thread (Phase 2a): runs forever, re-streams when
     // main signals a meaningful camera move. Per-LOD shell radii decide
-    // which chunks load each cycle. No eviction yet — Phase 2b adds slot
+    // which chunks load each cycle. No eviction yet â€” Phase 2b adds slot
     // pool + per-chunk deltas.
     auto pickDataset = []() -> std::string
     {
@@ -1694,7 +1694,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         }
         prevRec = g_app.recMode;
 
-        // View hotkeys — work in playback too. Only suppressed for text input.
+        // View hotkeys â€” work in playback too. Only suppressed for text input.
         if (!ImGui::GetIO().WantTextInput)
         {
             if (g_app.keys['1']) g_app.mode = ShadingMode::Lit;
@@ -1732,7 +1732,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             float M[16];
             hlslpp::store(M, vp);
             // Same Gribb-Hartmann (row-major / vector*matrix) extraction as
-            // renderer.cpp ExtractFrustumPlanes — 6 planes packed as ax+by+cz+d.
+            // renderer.cpp ExtractFrustumPlanes â€” 6 planes packed as ax+by+cz+d.
             float pl[6][4] = {
                 {M[0] + M[3], M[4] + M[7], M[8] + M[11], M[12] + M[15]},  // left
                 {M[3] - M[0], M[7] - M[4], M[11] - M[8], M[15] - M[12]},  // right
@@ -1788,7 +1788,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         // Main DSV only read by wireframe bounds debug path.
         bool dsvUnused = !g_app.lwShowBounds;
         g_app.renderer.BeginFrame(clear, g_app.skipBackbufferClear, dsvUnused);
-        // Draw as soon as ANY LOD is uploaded — streaming flips sceneReady on
+        // Draw as soon as ANY LOD is uploaded â€” streaming flips sceneReady on
         // first LOD ready. loadOk only flips after the worker has finished
         // every LOD; gating on it hides the coarse scene until full load.
         if (g_app.sceneReady)
@@ -1832,9 +1832,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.godraySeparableStride = g_app.godraySeparableStride;
             {
                 // Boost alpha (less smoothing) on translation. Rotation is
-                // fine — sun stays at same world dir, just on different screen
+                // fine â€” sun stays at same world dir, just on different screen
                 // pixel; small history error. Translation shifts parallax so
-                // depth pixels under each godray texel change → history stale.
+                // depth pixels under each godray texel change â†’ history stale.
                 float cx, cy, cz;
                 {
                     float tmp[3];
@@ -1896,7 +1896,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
     // MicroProfileShutdown joins worker threads (web server, context-switch ETW
     // tracer, GPU timers). On Windows the ETW unregister can take seconds.
-    // Skip it — the OS reclaims sockets/threads at process exit.
+    // Skip it â€” the OS reclaims sockets/threads at process exit.
 
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();

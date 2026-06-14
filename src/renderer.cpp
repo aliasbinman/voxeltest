@@ -879,6 +879,21 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
     if (visBytes > 0 && !up.Upload(src.blockVisPool.data(), visBytes, g.blockVisSb))
         return false;
 
+    // ---- BlockAo: repack 3 B/voxel (aoPacked) -> 1 uint/voxel (low 24 bits),
+    // 8 voxels/block, parallel to blockPosPool. Shader reads as StructuredBuffer.
+    std::vector<uint32_t> aoFlat;
+    const uint64_t aoBytes = (uint64_t)src.blockAoPool.size() * 8u * sizeof(uint32_t);
+    if (!src.blockAoPool.empty())
+    {
+        aoFlat.resize(src.blockAoPool.size() * 8u);
+        for (size_t b = 0; b < src.blockAoPool.size(); ++b)
+            for (int i = 0; i < 8; ++i)
+                aoFlat[b * 8 + i] = (uint32_t)src.blockAoPool[b].ao[i][0]
+                                  | ((uint32_t)src.blockAoPool[b].ao[i][1] << 8)
+                                  | ((uint32_t)src.blockAoPool[b].ao[i][2] << 16);
+        if (!up.Upload(aoFlat.data(), aoBytes, g.blockAoSb)) return false;
+    }
+
     if (!up.Flush()) return false;
 
     // Build SRVs on lwSrvHeap_.
@@ -897,12 +912,15 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
     if (visBytes)
         g.blockVisSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
             g.blockVisSb.Get(), (UINT)src.blockVisPool.size(), (UINT)sizeof(lw::BlockVis));
+    if (aoBytes)
+        g.blockAoSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
+            g.blockAoSb.Get(), (UINT)(src.blockAoPool.size() * 8u), (UINT)sizeof(uint32_t));
 
     g.slotCount = slotCount;
     g.blockCount = (uint32_t)src.blockPosPool.size();
     g.bytes = infos.size() * sizeof(lw::GpuChunkInfo)
             + atlas.size() * sizeof(uint32_t)
-            + posBytes + colBytes + visBytes;
+            + posBytes + colBytes + visBytes + aoBytes;
     std::printf("[lw] LOD %d uploaded: %u slots, %u blocks, %.2f MB GPU\n",
                 L, g.slotCount, g.blockCount, g.bytes / (1024.0 * 1024.0));
     lwHasWorld_ = true;
@@ -923,6 +941,8 @@ bool Renderer::UploadLwWorld(const lw::World& w)
         lwWorld_.lods[L].blockColPool.shrink_to_fit();
         lwWorld_.lods[L].blockVisPool.clear();
         lwWorld_.lods[L].blockVisPool.shrink_to_fit();
+        lwWorld_.lods[L].blockAoPool.clear();
+        lwWorld_.lods[L].blockAoPool.shrink_to_fit();
     }
     return true;
 }
@@ -1167,7 +1187,7 @@ bool Renderer::CreateM4()
         uavRange.BaseShaderRegister = 0;  // u0
         uavRange.OffsetInDescriptorsFromTableStart = 0;
 
-        D3D12_ROOT_PARAMETER p[10]{};
+        D3D12_ROOT_PARAMETER p[11]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0,0};
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {1,0};
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor = {0,0}; // chunkInfo
@@ -1179,11 +1199,12 @@ bool Renderer::CreateM4()
         p[7].DescriptorTable = { 1, &srvRange };
         p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[8].DescriptorTable = { 1, &uavRange };
-        p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[9].Descriptor = {6,0}; // blockVis
+        p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[9].Descriptor = {6,0};  // blockVis
+        p[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[10].Descriptor = {7,0}; // blockAo
         for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 10;
+        rsd.NumParameters = 11;
         rsd.pParameters = p;
         if (!buildRootSig(rsd, m4Pass2RootSig_, L"m4Pass2RootSig")) return false;
     }
@@ -2113,6 +2134,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                 cmdList_->SetComputeRootShaderResourceView(9, g.blockVisSb->GetGPUVirtualAddress());
             else
                 cmdList_->SetComputeRootShaderResourceView(9, g.blockPosSb->GetGPUVirtualAddress()); // fallback (mask read as garbage; will pick face)
+            if (g.blockAoSb)
+                cmdList_->SetComputeRootShaderResourceView(10, g.blockAoSb->GetGPUVirtualAddress());
+            else
+                cmdList_->SetComputeRootShaderResourceView(10, g.blockPosSb->GetGPUVirtualAddress()); // fallback (AO viz reads garbage)
             UINT groups = (perLodTotal[L] + 63) / 64;
             cmdList_->Dispatch(groups, 1, 1);
         }
