@@ -8,6 +8,12 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "vox2lw", "vox2lw.vcxproj", 
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "voxtile", "voxtile.vcxproj", "{8DA21A33-AABB-44C1-9F5D-3B22EE33FF44}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "voxskycull", "voxskycull.vcxproj", "{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "lwstats", "lwstats.vcxproj", "{D3E55F22-88BA-4EED-C466-BC00DD33EE44}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "mca2vox", "mca2vox.vcxproj", "{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -51,6 +57,33 @@ Global
 		{8DA21A33-AABB-44C1-9F5D-3B22EE33FF44}.Debug|Gaming.Xbox.Scarlett.x64.ActiveCfg = Debug|x64
 		{8DA21A33-AABB-44C1-9F5D-3B22EE33FF44}.Profile|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
 		{8DA21A33-AABB-44C1-9F5D-3B22EE33FF44}.Release|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Debug|x64.ActiveCfg = Debug|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Debug|x64.Build.0 = Debug|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Profile|x64.ActiveCfg = Release|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Profile|x64.Build.0 = Release|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Release|x64.ActiveCfg = Release|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Release|x64.Build.0 = Release|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Debug|Gaming.Xbox.Scarlett.x64.ActiveCfg = Debug|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Profile|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
+		{F1A23B4C-5D6E-4F70-9CAB-77E2D5C12345}.Release|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Debug|x64.ActiveCfg = Debug|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Debug|x64.Build.0 = Debug|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Profile|x64.ActiveCfg = Release|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Profile|x64.Build.0 = Release|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Release|x64.ActiveCfg = Release|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Release|x64.Build.0 = Release|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Debug|Gaming.Xbox.Scarlett.x64.ActiveCfg = Debug|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Profile|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
+		{D3E55F22-88BA-4EED-C466-BC00DD33EE44}.Release|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Debug|x64.ActiveCfg = Debug|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Debug|x64.Build.0 = Debug|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Profile|x64.ActiveCfg = Release|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Profile|x64.Build.0 = Release|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Release|x64.ActiveCfg = Release|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Release|x64.Build.0 = Release|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Debug|Gaming.Xbox.Scarlett.x64.ActiveCfg = Debug|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Profile|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
+		{D7F4B1A2-9C5E-4D6F-8B11-7A2C9E3F4B55}.Release|Gaming.Xbox.Scarlett.x64.ActiveCfg = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
