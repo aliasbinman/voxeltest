@@ -1501,6 +1501,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                     g_app.pendingLwWorld.worldAabbMax[2] = tls->worldAabbMax[2];
                     g_app.pendingLwWorld.lods[L] = std::move(tls->lods[L]);
                 }
+                // Heavy GPU upload prep (staging build, memcpy, resource create,
+                // command-list record) runs HERE on the loader thread so the main
+                // render thread never stalls. Main only executes the recorded copy
+                // (CommitLwLod). lods[L] is owned by the loader until commit.
+                g_app.renderer.PrepareLwLod(g_app.pendingLwWorld, L);
                 g_app.lodReadyFlag[L].store(0);
             };
             bool ok = lw::LoadWorldStreaming(voxPath.c_str(), tlsWorld, err,
@@ -1629,10 +1634,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                 g_app.lastTriggerCam[1] = -1e9f;
                 g_app.lastTriggerCam[2] = -1e9f;
             }
-            {
-                std::lock_guard<std::mutex> lk(g_app.lodMu[L]);
-                g_app.renderer.UploadLwLodOnly(g_app.pendingLwWorld, L);
-            }
+            // Cheap: execute the loader-prepared copy + install buffers. No lock
+            // (pendingUpload_[L] published via the lodReadyFlag release/acquire).
+            g_app.renderer.CommitLwLod(L);
             g_app.lodReadyFlag[L].store(1);
             break; // one LOD per frame
         }

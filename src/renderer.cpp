@@ -132,6 +132,8 @@ bool Renderer::Init(HWND hwnd, int adapterIdx)
 
         ThrowIfFailed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)),
                       "CreateFence");
+        ThrowIfFailed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&lwUploadFence_)),
+                      "CreateFence(lwUpload)");
         fenceValues_[frameIndex_] = 1;
         fenceEvent_ = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
         if (!fenceEvent_) return false;
@@ -476,6 +478,8 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
 {
     if (!device_) return;
 
+    CollectLwRetired(); // free streamed buffers whose copy fence has signalled
+
     HRESULT removed = device_->GetDeviceRemovedReason();
     if (FAILED(removed))
     {
@@ -631,6 +635,7 @@ void Renderer::MoveToNextFrame()
 void Renderer::Shutdown()
 {
     if (cmdQueue_ && fence_) WaitForGpu();
+    lwRetire_.clear(); // GPU idle — release any parked streamed resources
     if (fenceEvent_) { CloseHandle(fenceEvent_); fenceEvent_ = nullptr; }
     ClearLwWorld();
     lwSrvHeap_.Reset();
@@ -744,25 +749,38 @@ namespace
             return true;
         }
 
-        bool Flush()
+        // Submit the recorded copies and signal the uploader's fence — but do
+        // NOT block. The copy runs on the SAME queue as frame rendering, so it
+        // is guaranteed to complete before any later frame that reads the new
+        // buffers (in-order execution). Caller parks the GPU objects via
+        // Detach() and releases them once Fence() reaches FlushValue().
+        bool FlushAsync()
         {
             if (!recording_) return true;
             recording_ = false;
             if (FAILED(cmd_->Close())) return false;
             ID3D12CommandList* lists[] = { cmd_.Get() };
             queue_->ExecuteCommandLists(1, lists);
-            const UINT64 v = ++fenceVal_;
-            if (FAILED(queue_->Signal(fence_.Get(), v))) return false;
-            if (fence_->GetCompletedValue() < v)
-            {
-                if (FAILED(fence_->SetEventOnCompletion(v, evt_))) return false;
-                WaitForSingleObjectEx(evt_, INFINITE, FALSE);
-            }
-            scratch_.clear(); // upload heap resources safe to release now
+            flushVal_ = ++fenceVal_;
+            if (FAILED(queue_->Signal(fence_.Get(), flushVal_))) return false;
             return true;
         }
 
+        Microsoft::WRL::ComPtr<ID3D12Fence> FenceComPtr() const { return fence_; }
+        UINT64 FlushValue() const { return flushVal_; }
+
+        // Hand over every GPU object that must outlive the in-flight copy
+        // (upload-heap scratch + this uploader's allocator and command list).
+        void Detach(std::vector<Microsoft::WRL::ComPtr<IUnknown>>& out)
+        {
+            for (auto& s : scratch_) out.push_back(s);
+            scratch_.clear();
+            out.push_back(alloc_);
+            out.push_back(cmd_);
+        }
+
     private:
+        UINT64 flushVal_ = 0;
         ID3D12Device* device_ = nullptr;
         ID3D12CommandQueue* queue_ = nullptr;
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc_;
@@ -782,12 +800,35 @@ void Renderer::ClearLwWorld()
     for (int L = 0; L < lw::kLodCount; ++L)
         if (lwGpu_[L].chunkInfoSb) { anyLive = true; break; }
     if (anyLive) WaitForGpu();
+    lwRetire_.clear(); // GPU idle after WaitForGpu — parked resources safe to free
     for (int L = 0; L < lw::kLodCount; ++L)
+    {
         lwGpu_[L] = LwGpu{};
+        pendingUpload_[L] = PendingLwUpload{}; // drop any uncommitted prepared upload
+    }
     // Bump-allocator reset: M3 doesn't free per-LOD slots, so a full ClearLwWorld
     // reclaims all of them at once. Sufficient for one-world-at-a-time workflow.
     lwSrvNextSlot_ = 0;
     lwHasWorld_ = false;
+}
+
+// Free streamed-buffer retirements whose copy fence has completed. Cheap poll;
+// called each frame and before each new upload.
+void Renderer::CollectLwRetired()
+{
+    for (size_t i = 0; i < lwRetire_.size();)
+    {
+        LwRetireBatch& b = lwRetire_[i];
+        if (!b.fence || b.fence->GetCompletedValue() >= b.value)
+        {
+            lwRetire_[i] = std::move(lwRetire_.back());
+            lwRetire_.pop_back();
+        }
+        else
+        {
+            ++i;
+        }
+    }
 }
 
 // Allocates a single SRV slot in lwSrvHeap_; returns slot index and writes the
@@ -814,20 +855,27 @@ static uint32_t CreateStructuredBufferSrv(ID3D12Device* dev,
     return slot;
 }
 
-bool Renderer::UploadLwLod(const lw::World& w, int L)
+// LOADER-THREAD phase: build staging, create resources, memcpy into upload
+// heaps, and record the copy+barrier command list. Touches neither cmdQueue_
+// nor lwGpu_, so it runs concurrently with main-thread rendering. Result parked
+// in pendingUpload_[L]; main thread later calls CommitLwLod(L).
+bool Renderer::PrepareLwLod(const lw::World& w, int L)
 {
     if (!device_) return false;
     if (L < 0 || L >= lw::kLodCount) return false;
     const lw::LODWorld& src = w.lods[L];
-    LwGpu& g = lwGpu_[L];
-    // Old GPU buffers for this LOD may still be referenced by frames in flight.
-    // Releasing the ComPtrs here would free memory the GPU is reading -> TDR.
-    // Flush before reset. Slow during stream but correct; deferred-delete via
-    // fence-tagged retention list is M4f+ optimization.
-    if (g.chunkInfoSb) WaitForGpu();
-    g = LwGpu{};
+    PendingLwUpload& pu = pendingUpload_[L];
+    pu = PendingLwUpload{};
+
+    // CPU-side metadata the draw walk needs (chunks + cull). Copied here on the
+    // loader thread (not the big block pools — those live on the GPU now).
+    pu.meta.lodLevel = src.lodLevel;
+    pu.meta.lodScale = src.lodScale;
+    pu.meta.chunks   = src.chunks;
+    pu.meta.cull     = src.cull;
+
     const uint32_t slotCount = (uint32_t)src.chunks.size();
-    if (slotCount == 0) return true;
+    if (slotCount == 0) { pu.valid = true; pu.empty = true; return true; }
     if (slotCount > lw::kMaxResidentChunksPerLod)
     {
         std::fprintf(stderr, "[lw] LOD %d has %u chunks > max %u\n",
@@ -835,11 +883,49 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
         return false;
     }
 
-    BufferUploader up;
-    if (!up.Init(device_.Get(), cmdQueue_.Get())) return false;
-    if (!up.Begin()) return false;
+    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&pu.alloc)))) return false;
+    if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          pu.alloc.Get(), nullptr,
+                                          IID_PPV_ARGS(&pu.cmd)))) return false;
+    // CreateCommandList opens it recording.
 
-    // ---- ChunkInfo: one entry per slot ----
+    // Create default+upload committed resources, map+memcpy, record copy+barrier.
+    auto record = [&](const void* data, size_t bytes,
+                      Microsoft::WRL::ComPtr<ID3D12Resource>& outDefault) -> bool
+    {
+        if (bytes == 0) return true;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES hpDef{}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &rd,
+                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                      IID_PPV_ARGS(&outDefault)))) return false;
+        D3D12_HEAP_PROPERTIES hpUp{}; hpUp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        Microsoft::WRL::ComPtr<ID3D12Resource> up;
+        if (FAILED(device_->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE, &rd,
+                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                      IID_PPV_ARGS(&up)))) return false;
+        void* mapped = nullptr; D3D12_RANGE noRead{0, 0};
+        if (FAILED(up->Map(0, &noRead, &mapped))) return false;
+        std::memcpy(mapped, data, bytes);
+        up->Unmap(0, nullptr);
+        pu.cmd->CopyBufferRegion(outDefault.Get(), 0, up.Get(), 0, bytes);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = outDefault.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        pu.cmd->ResourceBarrier(1, &b);
+        pu.scratch.push_back(up);
+        return true;
+    };
+
+    // ---- ChunkInfo ----
     std::vector<lw::GpuChunkInfo> infos(slotCount);
     for (uint32_t i = 0; i < slotCount; ++i)
     {
@@ -853,10 +939,9 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
         gi.paletteBase = i * lw::kPaletteSize;
         gi._pad[0] = gi._pad[1] = 0;
     }
-    if (!up.Upload(infos.data(), infos.size() * sizeof(lw::GpuChunkInfo),
-                   g.chunkInfoSb)) return false;
+    if (!record(infos.data(), infos.size() * sizeof(lw::GpuChunkInfo), pu.gpu.chunkInfoSb)) return false;
 
-    // ---- Palette atlas: slotCount × kPaletteSize uint32 ----
+    // ---- Palette atlas ----
     std::vector<uint32_t> atlas((size_t)slotCount * lw::kPaletteSize, 0u);
     for (uint32_t i = 0; i < slotCount; ++i)
     {
@@ -865,26 +950,19 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
         std::memcpy(atlas.data() + (size_t)i * lw::kPaletteSize,
                     rc.palette, n * sizeof(uint32_t));
     }
-    if (!up.Upload(atlas.data(), atlas.size() * sizeof(uint32_t),
-                   g.paletteSb)) return false;
+    if (!record(atlas.data(), atlas.size() * sizeof(uint32_t), pu.gpu.paletteSb)) return false;
 
-    // ---- BlockPos / BlockCol / BlockVis ----
+    // ---- BlockPos / BlockCol / BlockVis (raw memcpy) ----
     const uint64_t posBytes = (uint64_t)src.blockPosPool.size() * sizeof(lw::BlockPos);
     const uint64_t colBytes = (uint64_t)src.blockColPool.size() * sizeof(lw::BlockCol);
     const uint64_t visBytes = (uint64_t)src.blockVisPool.size() * sizeof(lw::BlockVis);
-    if (posBytes > 0 && !up.Upload(src.blockPosPool.data(), posBytes, g.blockPosSb))
-        return false;
-    if (colBytes > 0 && !up.Upload(src.blockColPool.data(), colBytes, g.blockColSb))
-        return false;
-    if (visBytes > 0 && !up.Upload(src.blockVisPool.data(), visBytes, g.blockVisSb))
-        return false;
+    if (!record(src.blockPosPool.data(), posBytes, pu.gpu.blockPosSb)) return false;
+    if (!record(src.blockColPool.data(), colBytes, pu.gpu.blockColSb)) return false;
+    if (!record(src.blockVisPool.data(), visBytes, pu.gpu.blockVisSb)) return false;
 
-    // ---- BlockAo: repack 3 B/voxel (aoPacked) -> 1 uint/voxel, 8 voxels/block,
-    // parallel to blockPosPool. Low 24 bits = 6 faces * 4-bit (mode-3 viz reads
-    // per-face by hit face). Top byte = precomputed average over visible faces
-    // (0..255), so Lit-mode shading needs one load + multiply, no per-voxel loop.
+    // ---- BlockAo: 3 B/voxel -> 1 uint/voxel (low 24 = 6 faces * 4-bit). Tight
+    // pack, no per-voxel average loop (top byte unused; dilate indexes per face).
     std::vector<uint32_t> aoFlat;
-    const bool haveVis = !src.blockVisPool.empty();
     const uint64_t aoBytes = (uint64_t)src.blockAoPool.size() * 8u * sizeof(uint32_t);
     if (!src.blockAoPool.empty())
     {
@@ -893,54 +971,66 @@ bool Renderer::UploadLwLod(const lw::World& w, int L)
             for (int i = 0; i < 8; ++i)
             {
                 const uint8_t* ao = src.blockAoPool[b].ao[i];
-                uint32_t low = (uint32_t)ao[0] | ((uint32_t)ao[1] << 8) | ((uint32_t)ao[2] << 16);
-                uint8_t vm = haveVis ? (src.blockVisPool[b].visMask[i] & 0x3Fu) : 0x3Fu;
-                if (vm == 0u) vm = 0x3Fu;
-                uint32_t sum = 0, cnt = 0;
-                for (int f = 0; f < 6; ++f)
-                {
-                    if (!((vm >> f) & 1u)) continue;
-                    uint32_t nib = (low >> (f * 4)) & 0xFu;
-                    sum += nib * 17u; // nibble 0..15 -> 0..255
-                    ++cnt;
-                }
-                uint32_t avg = cnt ? (sum / cnt) : 255u;
-                aoFlat[b * 8 + i] = low | (avg << 24);
+                aoFlat[b * 8 + i] = (uint32_t)ao[0] | ((uint32_t)ao[1] << 8) | ((uint32_t)ao[2] << 16);
             }
-        if (!up.Upload(aoFlat.data(), aoBytes, g.blockAoSb)) return false;
+        if (!record(aoFlat.data(), aoBytes, pu.gpu.blockAoSb)) return false;
     }
 
-    if (!up.Flush()) return false;
-
-    // Build SRVs on lwSrvHeap_.
-    auto* dev = device_.Get();
-    auto* heap = lwSrvHeap_.Get();
-    g.chunkInfoSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
-        g.chunkInfoSb.Get(), (UINT)infos.size(), (UINT)sizeof(lw::GpuChunkInfo));
-    g.paletteSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
-        g.paletteSb.Get(), (UINT)atlas.size(), (UINT)sizeof(uint32_t));
-    if (posBytes)
-        g.blockPosSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
-            g.blockPosSb.Get(), (UINT)src.blockPosPool.size(), (UINT)sizeof(lw::BlockPos));
-    if (colBytes)
-        g.blockColSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
-            g.blockColSb.Get(), (UINT)src.blockColPool.size(), (UINT)sizeof(lw::BlockCol));
-    if (visBytes)
-        g.blockVisSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
-            g.blockVisSb.Get(), (UINT)src.blockVisPool.size(), (UINT)sizeof(lw::BlockVis));
-    if (aoBytes)
-        g.blockAoSrv = CreateStructuredBufferSrv(dev, heap, lwSrvDescSize_, lwSrvNextSlot_,
-            g.blockAoSb.Get(), (UINT)(src.blockAoPool.size() * 8u), (UINT)sizeof(uint32_t));
-
-    g.slotCount = slotCount;
-    g.blockCount = (uint32_t)src.blockPosPool.size();
-    g.bytes = infos.size() * sizeof(lw::GpuChunkInfo)
-            + atlas.size() * sizeof(uint32_t)
-            + posBytes + colBytes + visBytes + aoBytes;
-    std::printf("[lw] LOD %d uploaded: %u slots, %u blocks, %.2f MB GPU\n",
-                L, g.slotCount, g.blockCount, g.bytes / (1024.0 * 1024.0));
-    lwHasWorld_ = true;
+    if (FAILED(pu.cmd->Close())) return false;
+    pu.gpu.slotCount = slotCount;
+    pu.gpu.blockCount = (uint32_t)src.blockPosPool.size();
+    pu.gpu.bytes = infos.size() * sizeof(lw::GpuChunkInfo)
+                 + atlas.size() * sizeof(uint32_t)
+                 + posBytes + colBytes + visBytes + aoBytes;
+    pu.valid = true;
     return true;
+}
+
+// MAIN-THREAD phase: execute the pre-recorded copy on cmdQueue_, install the new
+// buffers, and park the old ones + upload scratch on the fenced retire list.
+// Cheap — a few API calls, no memcpy, no resource creation, no GPU stall.
+bool Renderer::CommitLwLod(int L)
+{
+    if (L < 0 || L >= lw::kLodCount) return false;
+    PendingLwUpload& pu = pendingUpload_[L];
+    if (!pu.valid) return false;
+    CollectLwRetired();
+
+    // Park this LOD's old buffers (still read by in-flight frames) + the upload
+    // scratch/cmd objects; freed once lwUploadFence_ reaches `v` — by then every
+    // prior frame (in-order on cmdQueue_) plus this copy has completed.
+    LwRetireBatch batch;
+    auto park = [&](Microsoft::WRL::ComPtr<ID3D12Resource>& r)
+    { if (r) batch.objs.push_back(r); };
+    LwGpu& g = lwGpu_[L];
+    park(g.chunkInfoSb); park(g.paletteSb); park(g.blockPosSb);
+    park(g.blockColSb);  park(g.blockVisSb); park(g.blockAoSb);
+
+    if (!pu.empty)
+    {
+        ID3D12CommandList* lists[] = { pu.cmd.Get() };
+        cmdQueue_->ExecuteCommandLists(1, lists);
+        for (auto& s : pu.scratch) batch.objs.push_back(s);
+        if (pu.alloc) batch.objs.push_back(pu.alloc);
+        if (pu.cmd)   batch.objs.push_back(pu.cmd);
+    }
+    const UINT64 v = ++lwUploadFenceVal_;
+    cmdQueue_->Signal(lwUploadFence_.Get(), v);
+    batch.fence = lwUploadFence_;
+    batch.value = v;
+    lwRetire_.push_back(std::move(batch));
+
+    g = std::move(pu.gpu);                  // install new GPU buffers
+    lwWorld_.lods[L] = std::move(pu.meta);  // install CPU metadata for the draw walk
+    if (!pu.empty) lwHasWorld_ = true;
+    pu = PendingLwUpload{};
+    return true;
+}
+
+// Synchronous single-thread upload (non-streaming UploadLwWorld path).
+bool Renderer::UploadLwLod(const lw::World& w, int L)
+{
+    return PrepareLwLod(w, L) && CommitLwLod(L);
 }
 
 bool Renderer::UploadLwWorld(const lw::World& w)

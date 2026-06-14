@@ -126,6 +126,13 @@ public:
     bool UploadLwWorld(const lw::World& w);
     void PrepLwWorld(const lw::World& w);
     bool UploadLwLodOnly(const lw::World& w, int L);
+    // Streaming, two-phase to keep the main thread hitch-free:
+    //   PrepareLwLod — heavy (staging build + memcpy + resource create + record
+    //                  copy list). Safe to call from the LOADER thread; never
+    //                  touches cmdQueue_ or lwGpu_.
+    //   CommitLwLod  — cheap (ExecuteCommandLists + install). MAIN thread only.
+    bool PrepareLwLod(const lw::World& w, int L);
+    bool CommitLwLod(int L);
     bool FinalizeLwUploads() { return true; } // combined-LOD path deferred to M4+
     void ClearLwWorld();
     bool HasLwWorld() const { return lwHasWorld_; }
@@ -279,6 +286,37 @@ private:
     ComPtr<ID3D12Fence>              fence_;
     UINT64                           fenceValues_[kFrameCount] = {};
     HANDLE                           fenceEvent_ = nullptr;
+
+    // Fence-tagged deferred release for streamed LW buffers + upload scratch.
+    // A per-LOD stream upload no longer stalls the GPU: old buffers and the
+    // upload command objects are parked here and freed once their copy fence
+    // signals (checked each frame in CollectLwRetired).
+    struct LwRetireBatch
+    {
+        ComPtr<ID3D12Fence>          fence;
+        UINT64                       value = 0;
+        std::vector<ComPtr<IUnknown>> objs;
+    };
+    std::vector<LwRetireBatch>       lwRetire_;
+    void                             CollectLwRetired();
+
+    // Prepared-but-not-yet-committed per-LOD upload (built on the loader thread).
+    struct PendingLwUpload
+    {
+        LwGpu                                 gpu;     // new default resources
+        lw::LODWorld                          meta;    // CPU chunk + cull metadata
+                                                       // (pools empty) installed into
+                                                       // lwWorld_ for the draw walk
+        ComPtr<ID3D12CommandAllocator>        alloc;
+        ComPtr<ID3D12GraphicsCommandList>     cmd;     // pre-recorded copy+barriers
+        std::vector<ComPtr<ID3D12Resource>>   scratch; // upload heaps (retire after copy)
+        bool                                  valid = false;
+        bool                                  empty = false; // LOD had 0 chunks
+    };
+    PendingLwUpload                  pendingUpload_[lw::kLodCount];
+    // Fence signalled on cmdQueue_ after each CommitLwLod for retiring old data.
+    ComPtr<ID3D12Fence>              lwUploadFence_;
+    UINT64                           lwUploadFenceVal_ = 0;
 
     std::unique_ptr<DirectX::GraphicsMemory> graphicsMemory_;
 
