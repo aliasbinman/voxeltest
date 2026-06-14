@@ -295,7 +295,9 @@ private:
     {
         ComPtr<ID3D12Fence>          fence;
         UINT64                       value = 0;
-        std::vector<ComPtr<IUnknown>> objs;
+        // ID3D12Object (not IUnknown): Xbox D3D12 types don't derive from
+        // IUnknown but do share ID3D12Object as a common base.
+        std::vector<ComPtr<ID3D12Object>> objs;
     };
     std::vector<LwRetireBatch>       lwRetire_;
     void                             CollectLwRetired();
@@ -362,6 +364,8 @@ private:
     ComPtr<ID3D12RootSignature>       m4PostRootSig_;
     ComPtr<ID3D12RootSignature>       m4GodrayMarkRootSig_;
     ComPtr<ID3D12RootSignature>       m4GodrayBlurRootSig_;
+    ComPtr<ID3D12RootSignature>       m4OctetRootSig_;   // OctetBillboards graphics
+    ComPtr<ID3D12PipelineState>       m4OctetPso_;
     ComPtr<ID3D12PipelineState>       m4Pass1Pso_;
     ComPtr<ID3D12PipelineState>       m4Pass2Pso_;
     ComPtr<ID3D12PipelineState>       m4DilatePso_;

@@ -408,7 +408,7 @@ bool Renderer::CreateRenderTargets()
 
         D3D12_CLEAR_VALUE cv{};
         cv.Format = DXGI_FORMAT_D32_FLOAT;
-        cv.DepthStencil.Depth = 1.0f;
+        cv.DepthStencil.Depth = 0.0f; // reverse-Z: far plane = 0, depth func GREATER
 
         ThrowIfFailed(device_->CreateCommittedResource(
                           &hp, D3D12_HEAP_FLAG_NONE, &rd,
@@ -552,7 +552,7 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
         MICROPROFILE_SCOPEGPUI("BeginFrame/Clear", 0xff60a0c0);
         if (!skipClear)
             cmdList_->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        cmdList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        cmdList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr); // reverse-Z far
     }
 
     D3D12_VIEWPORT vp{ 0, 0, (float)width_, (float)height_, 0.0f, 1.0f };
@@ -658,140 +658,6 @@ void Renderer::Shutdown()
 #endif
 }
 
-// ===== M3 — LW upload =======================================================
-namespace
-{
-    // Synchronous batched buffer uploader. One fence wait per Flush().
-    // Records CopyBufferRegion + transition to NON_PIXEL_SHADER_RESOURCE for
-    // each Upload() call into a private cmd list. Releases upload-heap scratch
-    // resources after Flush() (fence-waited).
-    class BufferUploader
-    {
-    public:
-        bool Init(ID3D12Device* dev, ID3D12CommandQueue* q)
-        {
-            device_ = dev; queue_ = q;
-            if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                   IID_PPV_ARGS(&alloc_)))) return false;
-            if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                              alloc_.Get(), nullptr,
-                                              IID_PPV_ARGS(&cmd_)))) return false;
-            // CreateCommandList opens the list in recording state. Close it so
-            // Begin()'s alloc->Reset() doesn't error out (alloc reset is illegal
-            // while any associated list is still recording).
-            if (FAILED(cmd_->Close())) return false;
-            if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) return false;
-            evt_ = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-            return evt_ != nullptr;
-        }
-
-        ~BufferUploader()
-        {
-            if (evt_) CloseHandle(evt_);
-        }
-
-        bool Begin()
-        {
-            recording_ = true;
-            scratch_.clear();
-            if (FAILED(alloc_->Reset())) return false;
-            if (FAILED(cmd_->Reset(alloc_.Get(), nullptr))) return false;
-            return true;
-        }
-
-        bool Upload(const void* data, size_t bytes,
-                    Microsoft::WRL::ComPtr<ID3D12Resource>& outDefault)
-        {
-            if (!recording_ || bytes == 0) return false;
-
-            // Default-heap committed resource (final home).
-            D3D12_HEAP_PROPERTIES hpDef{}; hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC rd{};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = bytes;
-            rd.Height = 1;
-            rd.DepthOrArraySize = 1;
-            rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if (FAILED(device_->CreateCommittedResource(
-                          &hpDef, D3D12_HEAP_FLAG_NONE, &rd,
-                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                          IID_PPV_ARGS(&outDefault)))) return false;
-
-            // Upload-heap committed resource (scratch).
-            D3D12_HEAP_PROPERTIES hpUp{}; hpUp.Type = D3D12_HEAP_TYPE_UPLOAD;
-            Microsoft::WRL::ComPtr<ID3D12Resource> up;
-            if (FAILED(device_->CreateCommittedResource(
-                          &hpUp, D3D12_HEAP_FLAG_NONE, &rd,
-                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                          IID_PPV_ARGS(&up)))) return false;
-
-            // Map + memcpy.
-            void* mapped = nullptr;
-            D3D12_RANGE noRead{0, 0};
-            if (FAILED(up->Map(0, &noRead, &mapped))) return false;
-            std::memcpy(mapped, data, bytes);
-            up->Unmap(0, nullptr);
-
-            // Record copy + transition.
-            cmd_->CopyBufferRegion(outDefault.Get(), 0, up.Get(), 0, bytes);
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = outDefault.Get();
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                     | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            cmd_->ResourceBarrier(1, &b);
-
-            scratch_.push_back(std::move(up));
-            return true;
-        }
-
-        // Submit the recorded copies and signal the uploader's fence — but do
-        // NOT block. The copy runs on the SAME queue as frame rendering, so it
-        // is guaranteed to complete before any later frame that reads the new
-        // buffers (in-order execution). Caller parks the GPU objects via
-        // Detach() and releases them once Fence() reaches FlushValue().
-        bool FlushAsync()
-        {
-            if (!recording_) return true;
-            recording_ = false;
-            if (FAILED(cmd_->Close())) return false;
-            ID3D12CommandList* lists[] = { cmd_.Get() };
-            queue_->ExecuteCommandLists(1, lists);
-            flushVal_ = ++fenceVal_;
-            if (FAILED(queue_->Signal(fence_.Get(), flushVal_))) return false;
-            return true;
-        }
-
-        Microsoft::WRL::ComPtr<ID3D12Fence> FenceComPtr() const { return fence_; }
-        UINT64 FlushValue() const { return flushVal_; }
-
-        // Hand over every GPU object that must outlive the in-flight copy
-        // (upload-heap scratch + this uploader's allocator and command list).
-        void Detach(std::vector<Microsoft::WRL::ComPtr<IUnknown>>& out)
-        {
-            for (auto& s : scratch_) out.push_back(s);
-            scratch_.clear();
-            out.push_back(alloc_);
-            out.push_back(cmd_);
-        }
-
-    private:
-        UINT64 flushVal_ = 0;
-        ID3D12Device* device_ = nullptr;
-        ID3D12CommandQueue* queue_ = nullptr;
-        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc_;
-        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_;
-        Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
-        UINT64 fenceVal_ = 0;
-        HANDLE evt_ = nullptr;
-        bool recording_ = false;
-        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratch_;
-    };
-}
 
 void Renderer::ClearLwWorld()
 {
@@ -1390,6 +1256,27 @@ bool Renderer::CreateM4()
         if (!buildRootSig(rsd, m4DilateRootSig_, L"m4DilateRootSig")) return false;
     }
 
+    // OctetBillboards root sig: CBV b0 (frame) + CBV b1 (work counts) + root SRVs
+    // t0 chunkInfo, t1 palette, t2 blockPos, t3 blockCol, t4 workItems,
+    // t6 blockVis, t7 blockAo. Same root-SRV-by-GVA pattern as the compute path.
+    {
+        D3D12_ROOT_PARAMETER p[9]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0,0}; // b0
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {1,0}; // b1
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor = {0,0}; // chunkInfo
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[3].Descriptor = {1,0}; // palette
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[4].Descriptor = {2,0}; // blockPos
+        p[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[5].Descriptor = {3,0}; // blockCol
+        p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[6].Descriptor = {4,0}; // workItems
+        p[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[7].Descriptor = {6,0}; // blockVis
+        p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[8].Descriptor = {7,0}; // blockAo
+        for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 9;
+        rsd.pParameters = p;
+        if (!buildRootSig(rsd, m4OctetRootSig_, L"m4OctetRootSig")) return false;
+    }
+
     // TAA root sig — CSTiles psmain_taa expects t4 (taaScene), t5 (taaHist),
     // t6 (taaDepth), s0 sampler, b0 CB.
     {
@@ -1531,6 +1418,38 @@ bool Renderer::CreateM4()
                     m4TaaRootSig_.Get(), m4TaaPso_, L"m4TaaPso")) return false;
     if (!buildFsTri(vsTaa.Get(), psPost.Get(), BackBufferFormat(),         true,
                     m4PostRootSig_.Get(), m4PostPso_, L"m4PostPso")) return false;
+
+    // ---- OctetBillboards graphics PSO (depth ON, reverse-Z GREATER + write) ----
+    // PC only: octet shaders aren't pre-compiled to .cso for Xbox yet, and the
+    // octet path isn't wired on Scarlett (DrawLwScene guards on m4OctetPso_).
+#if !defined(VOXELTEST_XBOX)
+    {
+        ComPtr<IDxcBlob> vsOct, psOct;
+        if (!loadShader(L"shaders/m4_octet.hlsl", L"vsmain_octet", L"vs_6_0", vsOct, "vsOct")) return false;
+        if (!loadShader(L"shaders/m4_octet.hlsl", L"psmain_octet", L"ps_6_0", psOct, "psOct")) return false;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = m4OctetRootSig_.Get();
+        pd.VS = { vsOct->GetBufferPointer(), vsOct->GetBufferSize() };
+        pd.PS = { psOct->GetBufferPointer(), psOct->GetBufferSize() };
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.SampleMask = UINT_MAX;
+        pd.SampleDesc.Count = 1;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = BackBufferFormat();
+        pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        for (auto& blend : pd.BlendState.RenderTarget)
+            blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.DepthStencilState.DepthEnable = TRUE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER; // reverse-Z
+        pd.DepthStencilState.StencilEnable = FALSE;
+        if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m4OctetPso_)))) return false;
+        NameObject(m4OctetPso_.Get(), L"m4OctetPso");
+    }
+#endif // !VOXELTEST_XBOX (octet PSO)
 
     // Godray Mark root sig: CBV b0 (frame for gScreenSize), CBV b3 (godray),
     // table SRV t6 (gPostDepth = visDepth2), static linear sampler s0.
@@ -1942,6 +1861,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         }
     }
 
+    // Near/Far ring gating (UI "Close"/"Far" checkboxes). The recursion picks
+    // finer LODs near the camera, so LOD0 is the close ring (nearest, finest)
+    // and coarser LODs form the far ring. Toggling lets each ring be isolated.
+    if (!args.closeEnabled)
+        drawList[0].clear();
+    if (!args.farEnabled)
+        for (int L = 1; L < lw::kLodCount; ++L)
+            drawList[L].clear();
+
     bool anyDraw = false;
     for (int L = 0; L < lw::kLodCount; ++L)
         if (!drawList[L].empty()) { anyDraw = true; break; }
@@ -2160,6 +2088,50 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cbcsAlloc[L] = graphicsMemory_->AllocateConstant(cbcs);
         wlAlloc[L]   = graphicsMemory_->Allocate(perLodWl[L].size() * sizeof(WI));
         std::memcpy(wlAlloc[L].Memory(), perLodWl[L].data(), perLodWl[L].size() * sizeof(WI));
+    }
+
+    // ---- OctetBillboards path ----------------------------------------------
+    // One instanced quad per occupied octet; PS ray-traces the 8 children and
+    // the nearest wins. Renders straight to the backbuffer + main depth (v1, no
+    // TAA/post), replacing the splat pass1/2/dilate/resolve chain.
+    if (args.tech == RenderTech::OctetBillboards && m4OctetPso_)
+    {
+        MICROPROFILE_SCOPEGPUI("LW/OctetBillboards", 0xff40c0ff);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(frameIndex_) * rtvDescSize_;
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        cmdList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        // Depth already cleared to 0 (reverse-Z far) by BeginFrame; GREATER keeps
+        // the nearest octet.
+        D3D12_VIEWPORT vpr{ 0, 0, (float)width_, (float)height_, 0.0f, 1.0f };
+        D3D12_RECT     scr{ 0, 0, (LONG)width_, (LONG)height_ };
+        cmdList_->RSSetViewports(1, &vpr);
+        cmdList_->RSSetScissorRects(1, &scr);
+        cmdList_->SetGraphicsRootSignature(m4OctetRootSig_.Get());
+        cmdList_->SetPipelineState(m4OctetPso_.Get());
+        cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        cmdList_->SetGraphicsRootConstantBufferView(0, cbfAlloc.GpuAddress());
+        // v1: close ring only (LOD0). Drawing every LOD's octets as billboards is
+        // a massive-overdraw bomb (millions of octets × screen coverage). Far ring
+        // belongs on the splat path; hybrid composite is the next step.
+        for (int L = 0; L < 1; ++L)
+        {
+            if (perLodWl[L].empty() || perLodTotal[L] == 0) continue;
+            const LwGpu& g = lwGpu_[L];
+            if (!g.chunkInfoSb || !g.paletteSb || !g.blockPosSb || !g.blockColSb) continue;
+            cmdList_->SetGraphicsRootConstantBufferView(1, cbcsAlloc[L].GpuAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(3, g.paletteSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(4, g.blockPosSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(5, g.blockColSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(6, wlAlloc[L].GpuAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(7, g.blockVisSb ? g.blockVisSb->GetGPUVirtualAddress()
+                                                                        : g.blockPosSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(8, g.blockAoSb ? g.blockAoSb->GetGPUVirtualAddress()
+                                                                       : g.blockPosSb->GetGPUVirtualAddress());
+            cmdList_->DrawInstanced(4, perLodTotal[L], 0, 0);
+        }
+        return;
     }
 
     // ---- Bind heap + descriptor handle helpers ----
