@@ -1898,23 +1898,16 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     std::vector<DrawItem> drawList[lw::kLodCount];
     // OctetBillboards close ring: only the nearest LOD0 clusters billboard, so
     // overdraw + instance count stay bounded (the splat covers the rest of LOD0).
-    std::vector<DrawItem> octetDrawList;
-    // Octet-vs-splat selection by SCREEN SIZE of the closest voxel in the cluster:
-    // if a voxel projects to fewer than (dilate radius * 2) pixels the splat point
-    // cloud resolves it fine and cheaper, so use SplatCS; bigger than that and the
-    // splat leaves holes / looks blocky → octet billboard ray-traces the cubes.
-    const float octetMinVoxelPx = (float)args.splatRadius * 2.0f;
-    // DIAGNOSTIC: flip to false to disable the octet pass entirely (splat-only).
-    // If the GPU still hangs on movement with this off → the hang is in the
-    // splat/streaming/retirement path, NOT the octet.
-    const bool kOctetEnabled = true;
-    // When octet billboards are the close-ring tech, the near LOD0 clusters render
-    // via octet ONLY — they must NOT also go to the splat list, or the close ring
-    // draws twice (splat point-cloud + octet cubes overlapping).
-    // OctetGeo shares the close-ring worklist; only the draw PSO/topology differ.
-    const bool useOctetGeo = (args.tech == RenderTech::OctetGeo) && m4OctetGeoPso_;
-    const bool useOctet = kOctetEnabled && m4OctetPso_
-                       && ((args.tech == RenderTech::OctetBillboards) || useOctetGeo);
+    // Three LOD0 techs chosen per cluster by the closest voxel's SCREEN SIZE
+    // (pixels-per-voxel): >= geoMinPx → OctetGeo, else >= bbMinPx → OctetBillboards,
+    // else → SplatCS. Each is independently toggleable (viz which pixels it draws).
+    // OctetGeo only wins where its threshold is the higher one — if geoMinPx <
+    // bbMinPx the billboard band always covers it, so OctetGeo never runs.
+    std::vector<DrawItem> octetDrawList[2]; // [0]=billboard [1]=geo
+    // Billboard kicks in below the splat's effective resolution (dilate radius * 2);
+    // geoMinPx (UI) is where OctetGeo takes over from the billboard.
+    const float bbMinPx  = (float)args.splatRadius * 2.0f;
+    const float geoMinPx = args.geoMinPx;
 
     // Recursive lambda via Y-combinator pattern — avoids std::function's
     // type-erased indirect call (was ~0.4ms CPU per frame on busy LOD0).
@@ -1952,22 +1945,27 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
         if (desNearC >= L || !childLoaded || L == 0)
         {
-            // Octet only when this cluster's closest voxel is big on screen
-            // (>= dilate*2 px). focalScale*voxelSize/dist == pixels per voxel.
+            // pixels-per-voxel of the closest voxel = focalPx * voxelSize / dist.
+            // Classify by size only (enables gate at draw time so disabled techs
+            // leave visible holes). Geo wins only when geoMinPx is the higher band.
             const float voxelPx = focalPx * lodScaleF / std::max(distNearC, 1e-3f);
-            if (L == 0 && useOctet && voxelPx >= octetMinVoxelPx)
+            if (L == 0 && geoMinPx >= bbMinPx && voxelPx >= geoMinPx)
             {
-                octetDrawList.push_back({chunkSlot,
-                                         rc.clusterBlockFirst[clSlot],
-                                         rc.clusterBlockCount[clSlot],
-                                         distNearC});
+                octetDrawList[1].push_back({chunkSlot,
+                                            rc.clusterBlockFirst[clSlot],
+                                            rc.clusterBlockCount[clSlot], distNearC}); // geo
+            }
+            else if (L == 0 && voxelPx >= bbMinPx)
+            {
+                octetDrawList[0].push_back({chunkSlot,
+                                            rc.clusterBlockFirst[clSlot],
+                                            rc.clusterBlockCount[clSlot], distNearC}); // billboard
             }
             else
             {
                 drawList[L].push_back({chunkSlot,
                                        rc.clusterBlockFirst[clSlot],
-                                       rc.clusterBlockCount[clSlot],
-                                       0.0f});
+                                       rc.clusterBlockCount[clSlot], 0.0f}); // splat
             }
             return;
         }
@@ -2003,19 +2001,14 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         }
     }
 
-    // Near/Far ring gating (UI "Close"/"Far" checkboxes). The recursion picks
-    // finer LODs near the camera, so LOD0 is the close ring (nearest, finest)
-    // and coarser LODs form the far ring. Toggling lets each ring be isolated.
-    if (!args.closeEnabled)
-    {
-        drawList[0].clear();
-        octetDrawList.clear();
-    }
-    if (!args.farEnabled)
-        for (int L = 1; L < lw::kLodCount; ++L)
-            drawList[L].clear();
+    // Per-tech enable toggles — disabling a tech leaves its clusters undrawn so you
+    // can see exactly which pixels each tech owns.
+    if (!args.enableSplat)
+        for (int L = 0; L < lw::kLodCount; ++L) drawList[L].clear();
+    if (!args.enableBillboard || !m4OctetPso_)    octetDrawList[0].clear();
+    if (!args.enableGeo       || !m4OctetGeoPso_) octetDrawList[1].clear();
 
-    bool anyDraw = !octetDrawList.empty(); // octet-only views must still render
+    bool anyDraw = !octetDrawList[0].empty() || !octetDrawList[1].empty();
     for (int L = 0; L < lw::kLodCount; ++L)
         if (!drawList[L].empty()) { anyDraw = true; break; }
     if (!anyDraw) return;
@@ -2068,41 +2061,37 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         }
     }
 
-    // Octet close-ring worklist (LOD0 near band). Sorted FRONT-TO-BACK by cluster
-    // near-distance so the closest clusters rasterise first and write their
-    // conservative-near depth — HW early-Z then rejects octets occluded behind
-    // them before their PS runs. (No slot-coalesce: depth order scatters slots, and
-    // the per-cluster WI count is tiny relative to the instance/overdraw win.)
-    std::vector<WI> octetWl;
-    uint32_t octetTotal = 0;
-    if (!octetDrawList.empty())
+    // Octet worklists (one per tech). Sorted FRONT-TO-BACK by cluster near-distance
+    // so the closest clusters rasterise first and write their conservative-near
+    // depth — HW early-Z then rejects octets occluded behind them before their PS
+    // runs. (No slot-coalesce: depth order scatters slots, and the per-cluster WI
+    // count is tiny relative to the instance/overdraw win.)
+    std::vector<WI> octetWl[2];
+    uint32_t octetTotal[2] = {};
+    for (int t = 0; t < 2; ++t)
     {
-        auto& dl = octetDrawList;
+        auto& dl = octetDrawList[t];
+        if (dl.empty()) continue;
         std::sort(dl.begin(), dl.end(),
-                  [](const DrawItem& a, const DrawItem& b) {
-                      return a.nearDist < b.nearDist;
-                  });
+                  [](const DrawItem& a, const DrawItem& b) { return a.nearDist < b.nearDist; });
         const lw::LODWorld& lwL = lwWorld_.lods[0];
-        octetWl.reserve(dl.size());
+        octetWl[t].reserve(dl.size());
         for (const DrawItem& it : dl) {
             if (it.blockCount == 0) continue;
             const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
-            octetWl.push_back({ rc.slotIdx, rc.blockBase + it.blockFirst, it.blockCount, octetTotal });
-            octetTotal += it.blockCount;
+            octetWl[t].push_back({ rc.slotIdx, rc.blockBase + it.blockFirst, it.blockCount, octetTotal[t] });
+            octetTotal[t] += it.blockCount;
         }
-    }
-    // Safety cap: never hand DrawInstanced a runaway instance count (a corrupt /
-    // garbage worklist would otherwise spin the GPU into a TDR). 10M octets ≈ way
-    // more than any sane close ring; if we hit it something is wrong upstream.
-    {
+        // Safety cap: never hand DrawInstanced a runaway instance count (corrupt
+        // worklist would spin the GPU into a TDR). 10M octets ≈ absurd.
         const uint32_t kOctetMaxInstances = 10u * 1000u * 1000u;
-        if (octetTotal > kOctetMaxInstances)
+        if (octetTotal[t] > kOctetMaxInstances)
         {
-            std::printf("[octet] ASSERT octetTotal=%u exceeds cap %u (items=%zu) — skipping octet draw\n",
-                        octetTotal, kOctetMaxInstances, octetWl.size());
+            std::printf("[octet] ASSERT total=%u exceeds cap %u (tech %d) — skipping\n",
+                        octetTotal[t], kOctetMaxInstances, t);
             std::fflush(stdout);
-            assert(octetTotal <= kOctetMaxInstances && "octet instance count runaway");
-            octetTotal = 0; // skip the draw this frame
+            assert(octetTotal[t] <= kOctetMaxInstances && "octet instance count runaway");
+            octetTotal[t] = 0;
         }
     }
 
@@ -2284,26 +2273,26 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         std::memcpy(wlAlloc[L].Memory(), perLodWl[L].data(), perLodWl[L].size() * sizeof(WI));
     }
 
-    // OctetBillboards composite the LOD0 close ring on top of the splat output
-    // (visColor2/visDepth2) after the dilate — see the sub-pass below.
-    const bool octetClose = useOctet; // (kOctetEnabled gated)
-
-    // Octet worklist + CB allocations (near LOD0 band only).
-    DirectX::GraphicsResource octetCbAlloc, octetWlAlloc;
-    if (octetClose && octetTotal > 0 && !octetWl.empty())
+    // Octet worklist + CB allocations, per tech (composite on top of the splat
+    // output visColor2/visDepth2 after the dilate — see the sub-pass below).
+    DirectX::GraphicsResource octetCbAlloc[2], octetWlAlloc[2];
+    for (int t = 0; t < 2; ++t)
     {
+        if (octetTotal[t] == 0 || octetWl[t].empty()) continue;
         CBLwCs cbcs{};
         cbcs.vwSize[0] = visTexW_;
         cbcs.vwSize[1] = visTexH_;
-        cbcs.pointCount = octetTotal;
-        cbcs.numItems   = (uint32_t)octetWl.size();
+        cbcs.pointCount = octetTotal[t];
+        cbcs.numItems   = (uint32_t)octetWl[t].size();
         cbcs.lodIdx     = 0;
         cbcs.splatRadius = 0;
         cbcs._pad[0]     = lwGpu_[0].blockAoSb ? (lwGpu_[0].blockCount * 8u) : 0u;  // gAoCount: clamp root-SRV read
-        octetCbAlloc = graphicsMemory_->AllocateConstant(cbcs);
-        octetWlAlloc = graphicsMemory_->Allocate(octetWl.size() * sizeof(WI));
-        std::memcpy(octetWlAlloc.Memory(), octetWl.data(), octetWl.size() * sizeof(WI));
+        octetCbAlloc[t] = graphicsMemory_->AllocateConstant(cbcs);
+        octetWlAlloc[t] = graphicsMemory_->Allocate(octetWl[t].size() * sizeof(WI));
+        std::memcpy(octetWlAlloc[t].Memory(), octetWl[t].data(), octetWl[t].size() * sizeof(WI));
     }
+    const bool octetAny = (octetTotal[0] > 0 && !octetWl[0].empty())
+                       || (octetTotal[1] > 0 && !octetWl[1].empty());
 
     // ---- Bind heap + descriptor handle helpers ----
     ID3D12DescriptorHeap* heaps[] = { m4TexHeap_.Get() };
@@ -2451,12 +2440,11 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     // an HW depth buffer for octet-vs-octet occlusion. PS discards on miss so the
     // splat result shows through; close octets (nearest ring) overwrite where hit.
     bool octetRan = false;
-    if (octetClose && octetTotal > 0 && !octetWl.empty())
+    if (octetAny)
     {
         const LwGpu& g = lwGpu_[0];
         if (g.chunkInfoSb && g.paletteSb && g.blockPosSb && g.blockColSb)
         {
-            MICROPROFILE_SCOPEGPUI("LW/OctetBillboards", 0xff40c0ff);
             octetRan = true;
             // visColor2 + visDepth2: UAV → RENDER_TARGET.
             D3D12_RESOURCE_BARRIER tb[2]{};
@@ -2482,23 +2470,37 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             cmdList_->RSSetViewports(1, &vpr);
             cmdList_->RSSetScissorRects(1, &scr);
             cmdList_->SetGraphicsRootSignature(m4OctetRootSig_.Get());
-            cmdList_->SetPipelineState(useOctetGeo ? m4OctetGeoPso_.Get() : m4OctetPso_.Get());
-            cmdList_->IASetPrimitiveTopology(useOctetGeo ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
-                                                         : D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            // Shared SRV binds (same root sig for both octet PSOs).
             cmdList_->SetGraphicsRootConstantBufferView(0, cbfAlloc.GpuAddress());
-            cmdList_->SetGraphicsRootConstantBufferView(1, octetCbAlloc.GpuAddress());
             cmdList_->SetGraphicsRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
             cmdList_->SetGraphicsRootShaderResourceView(3, g.paletteSb->GetGPUVirtualAddress());
             cmdList_->SetGraphicsRootShaderResourceView(4, g.blockPosSb->GetGPUVirtualAddress());
             cmdList_->SetGraphicsRootShaderResourceView(5, g.blockColSb->GetGPUVirtualAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(6, octetWlAlloc.GpuAddress());
             cmdList_->SetGraphicsRootShaderResourceView(7, g.blockVisSb ? g.blockVisSb->GetGPUVirtualAddress()
                                                                         : g.blockPosSb->GetGPUVirtualAddress());
             cmdList_->SetGraphicsRootShaderResourceView(8, g.blockAoSb ? g.blockAoSb->GetGPUVirtualAddress()
                                                                        : g.blockPosSb->GetGPUVirtualAddress());
-            // OctetGeo: 144 verts/instance (8 voxels * 3 faces * 2 tris * 3 verts).
-            // OctetBillboards: 4-vert tri-strip quad.
-            cmdList_->DrawInstanced(useOctetGeo ? 144u : 4u, octetTotal, 0, 0);
+            // Draw both octet techs into the same MRT, each with its own GPU marker.
+            // Both front-to-back for early-Z. t=0 billboards (4-vert strip), t=1 geo
+            // (144 verts/instance = 8 voxels * 3 faces * 2 tris * 3 verts).
+            if (octetTotal[0] > 0 && !octetWl[0].empty())
+            {
+                MICROPROFILE_SCOPEGPUI("LW/OctetBillboards", 0xff40c0ff);
+                cmdList_->SetPipelineState(m4OctetPso_.Get());
+                cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                cmdList_->SetGraphicsRootConstantBufferView(1, octetCbAlloc[0].GpuAddress());
+                cmdList_->SetGraphicsRootShaderResourceView(6, octetWlAlloc[0].GpuAddress());
+                cmdList_->DrawInstanced(4u, octetTotal[0], 0, 0);
+            }
+            if (octetTotal[1] > 0 && !octetWl[1].empty())
+            {
+                MICROPROFILE_SCOPEGPUI("LW/OctetGeo", 0xff40ffc0);
+                cmdList_->SetPipelineState(m4OctetGeoPso_.Get());
+                cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                cmdList_->SetGraphicsRootConstantBufferView(1, octetCbAlloc[1].GpuAddress());
+                cmdList_->SetGraphicsRootShaderResourceView(6, octetWlAlloc[1].GpuAddress());
+                cmdList_->DrawInstanced(144u, octetTotal[1], 0, 0);
+            }
             // Left in RENDER_TARGET; the barrier below takes them → PIXEL_SRV.
         }
     }

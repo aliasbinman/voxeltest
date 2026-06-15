@@ -720,5 +720,7 @@ float4 psmain_blit(VOut i) : SV_Target
     c = c * gExposure;
     const float a = 2.51, ta = 0.03, tc = 2.43, td = 0.59, te = 0.14;
     c = saturate((c * (a * c + ta)) / (c * (tc * c + td) + te));
+    c.r = 1.0;
+    
     return float4(c, 1.0);
 }

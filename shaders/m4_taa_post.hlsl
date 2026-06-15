@@ -294,6 +294,7 @@ float4 psmain_post(VTaaOut i) : SV_Target
 
     
     c = c * gExposure;
+ //   c = 1.0 - exp2(-c);
     //const float a = 2.51, ta = 0.03, tc = 2.43, td = 0.59, te = 0.14;
     //c = saturate((c * (a * c + ta)) / (c * (tc * c + td) + te));
     return float4(c, 1.0);

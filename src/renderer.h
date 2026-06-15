@@ -62,10 +62,15 @@ struct DrawSceneParams
 {
     ShadingMode mode = ShadingMode::Lit;
     int gridSize = 1;
-    RenderTech tech    = RenderTech::PointCS_Block;
+    RenderTech tech    = RenderTech::PointCS_Block; // (legacy; LOD0 tech now size-driven)
     RenderTech techFar = RenderTech::PointCS_Block;
-    bool closeEnabled = true;
-    bool farEnabled   = true;
+    // Per-tech enables (independent so each tech's pixels can be isolated). The
+    // billboard kicks in at splatRadius*2 px (splat's effective resolution); geoMinPx
+    // is where OctetGeo takes over. geoMinPx < splatRadius*2 ⇒ Geo never used.
+    bool  enableSplat     = true;
+    bool  enableBillboard = true;
+    bool  enableGeo       = true;
+    float geoMinPx        = 8.0f;
     PointLighting pointLight = PointLighting::Complex;
     PointLod pointLod = PointLod::Auto;
     float pointLodScale = 1.0f;

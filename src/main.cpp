@@ -129,10 +129,12 @@ struct AppState
     Renderer renderer;
     Camera camera;
     ShadingMode mode = ShadingMode::Lit;
-    RenderTech tech    = RenderTech::OctetBillboards; // close-ring tech
-    RenderTech techFar = RenderTech::PointCS_Block;   // far-ring tech
-    bool closeEnabled = true;
-    bool farEnabled   = true;
+    RenderTech tech    = RenderTech::OctetBillboards; // legacy (LOD0 tech now size-driven)
+    RenderTech techFar = RenderTech::PointCS_Block;
+    bool  enableSplat     = true;
+    bool  enableBillboard = true;
+    bool  enableGeo       = true;
+    float geoMinPx        = 8.0f;
     float sunPitchDeg = 10.0f;
     float sunYawDeg = 63.0f;
     float sunIntensityEV = 0.0f; // log2 stops; linear = 2^EV
@@ -1070,39 +1072,23 @@ void FrameControlsWindow()
             }
         }
     }
-    // Tech pulldowns â€” only PointCS_Block wired today; others reserved for
-    // future octet-based revivals. Close/Far checkboxes gate each ring.
-    struct TechEntry { const char* name; RenderTech val; };
-    static const TechEntry kTechList[] = {
-        {"PointCS_Block",   RenderTech::PointCS_Block},
-        {"OctetBillboards", RenderTech::OctetBillboards},
-        {"OctetGeo",        RenderTech::OctetGeo},
-        {"PolyAxis",        RenderTech::PolyAxis},
-        {"Splat",           RenderTech::Splat},
-    };
-    const int kTechCount = (int)(sizeof(kTechList) / sizeof(kTechList[0]));
-    auto techIdxFrom = [&](RenderTech v) -> int {
-        for (int k = 0; k < kTechCount; ++k)
-            if (kTechList[k].val == v) return k;
-        return 0;
-    };
+    // LOD0 tech chosen per cluster by the closest voxel's screen size:
+    //   voxel >= geoMinPx          → OctetGeo
+    //   voxel >= splatRadius*2     → OctetBillboards
+    //   else                       → SplatCS
+    // Each tech has an independent enable so you can isolate which pixels it draws.
     {
-        const char* techNames[16];
-        for (int k = 0; k < kTechCount; ++k) techNames[k] = kTechList[k].name;
-        int tt = techIdxFrom(g_app.tech);
-        ImGui::PushItemWidth(180.0f);
-        if (ImGui::Combo("##TechClose", &tt, techNames, kTechCount, kTechCount))
-            g_app.tech = kTechList[tt].val;
+        const float bbPx = (float)g_app.splatRadius * 2.0f;
+        ImGui::TextUnformatted("LOD0 tech (by voxel px size):");
+        ImGui::Checkbox("Splat", &g_app.enableSplat);
+        ImGui::SameLine(); ImGui::Checkbox("Billboard##en", &g_app.enableBillboard);
+        ImGui::SameLine(); ImGui::Checkbox("Geo##en", &g_app.enableGeo);
+        ImGui::PushItemWidth(120.0f);
+        ImGui::DragFloat("Geo kicks in (px)", &g_app.geoMinPx, 0.1f, 0.0f, 256.0f, "%.1f");
         ImGui::PopItemWidth();
-        ImGui::SameLine();
-        ImGui::Checkbox("Close", &g_app.closeEnabled);
-        int tf = techIdxFrom(g_app.techFar);
-        ImGui::PushItemWidth(180.0f);
-        if (ImGui::Combo("##TechFar", &tf, techNames, kTechCount, kTechCount))
-            g_app.techFar = kTechList[tf].val;
-        ImGui::PopItemWidth();
-        ImGui::SameLine();
-        ImGui::Checkbox("Far", &g_app.farEnabled);
+        ImGui::TextDisabled("Billboard kicks in at %.1f px (splatRadius*2)", bbPx);
+        if (g_app.geoMinPx < bbPx)
+            ImGui::TextDisabled("(Geo < Billboard -> Geo disabled)");
     }
 
     ImGui::Separator();
@@ -1820,8 +1806,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.gridSize = g_app.gridSize;
             ps.tech = g_app.tech;
             ps.techFar = g_app.techFar;
-            ps.closeEnabled = g_app.closeEnabled;
-            ps.farEnabled = g_app.farEnabled;
+            ps.enableSplat     = g_app.enableSplat;
+            ps.enableBillboard = g_app.enableBillboard;
+            ps.enableGeo       = g_app.enableGeo;
+            ps.geoMinPx        = g_app.geoMinPx;
             ps.pointLight = g_app.pointLight;
             ps.pointLod = g_app.pointLod;
             ps.pointLodScale = g_app.pointLodScale;

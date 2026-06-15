@@ -93,9 +93,12 @@ float3 ClusterTint(uint t)
 // ---- ACES filmic tonemap with exposure pre-multiply. ----
 float3 Tonemap(float3 x)
 {
-    x = x * gExposure;
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+    x = x * gExposure * 10 ;
+    return 1.0 - exp(-x );
+    
+    
+  //  const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  //  return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
 // ============================================================

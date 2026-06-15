@@ -342,6 +342,215 @@ static void DecodeBlockStates(const std::vector<uint64_t>& longs, int palLen,
     }
 }
 
+// Pre-1.13 ("flattening") legacy numeric block ID -> modern block name. Data/Add
+// nibbles (variants like wool colour, log type) are ignored — base block only.
+// Returns nullptr for air / non-solid decoration (skipped). Unknown solids -> stone.
+static const char* LegacyIdName(int id)
+{
+    switch (id) {
+    case 0:   return nullptr;            // air
+    case 1:   return "stone";
+    case 2:   return "grass_block";
+    case 3:   return "dirt";
+    case 4:   return "cobblestone";
+    case 5:   return "oak_planks";
+    case 7:   return "stone";            // bedrock
+    case 8: case 9:   return "water";
+    case 10: case 11: return "lava";
+    case 12:  return "sand";
+    case 13:  return "gravel";
+    case 14:  return "gold_ore";
+    case 15:  return "iron_ore";
+    case 16:  return "coal_ore";
+    case 17:  return "oak_log";
+    case 18:  return "oak_leaves";
+    case 19:  return "stone";            // sponge
+    case 20:  return "glass";
+    case 21:  return "lapis_ore";
+    case 22:  return "lapis_block";
+    case 24:  return "sandstone";
+    case 35:  return "white_wool";
+    case 41:  return "gold_block";
+    case 42:  return "iron_block";
+    case 43:  return "stone_slab";       // double stone slab
+    case 44:  return "stone_slab";
+    case 45:  return "bricks";
+    case 47:  return "oak_planks";       // bookshelf
+    case 48:  return "mossy_cobblestone";
+    case 49:  return "obsidian";
+    case 52:  return "stone";            // spawner
+    case 53:  return "oak_stairs";
+    case 54: case 58: return "oak_planks"; // chest / crafting table
+    case 56:  return "diamond_ore";
+    case 57:  return "diamond_block";
+    case 60:  return "farmland";
+    case 61: case 62: return "stone";    // furnace
+    case 73: case 74: return "redstone_ore";
+    case 78:  return "snow";
+    case 79:  return "ice";
+    case 80:  return "snow_block";
+    case 81:  return "cactus";
+    case 82:  return "clay";
+    case 83:  return "sugar_cane";
+    case 84:  return "oak_planks";       // jukebox
+    case 85:  return "oak_fence";
+    case 86: case 91: return "pumpkin";
+    case 87:  return "netherrack";
+    case 88:  return "soul_sand";
+    case 89:  return "glowstone";
+    case 95:  return "glass";            // stained glass
+    case 97:  return "stone";            // monster egg
+    case 98:  return "stone_bricks";
+    case 101: return "iron_block";       // iron bars
+    case 102: return "glass_pane";
+    case 103: return "melon";
+    case 108: return "bricks";           // brick stairs
+    case 109: return "stone_bricks";     // stone brick stairs
+    case 110: return "grass_block";      // mycelium
+    case 112: return "nether_bricks";
+    case 114: return "nether_bricks";    // nether brick stairs
+    case 121: return "end_stone";
+    case 123: case 124: return "glowstone"; // redstone lamp
+    case 125: return "oak_planks";       // double wood slab
+    case 126: return "oak_slab";
+    case 128: return "sandstone";        // sandstone stairs
+    case 129: return "emerald_ore";
+    case 133: return "emerald_block";
+    case 134: return "spruce_log";       // spruce stairs (approx)
+    case 135: return "birch_planks";
+    case 136: return "jungle_planks";
+    case 139: return "cobblestone";      // cobblestone wall
+    case 152: return "redstone_block";
+    case 155: return "diorite";          // quartz block (white-ish)
+    case 156: return "diorite";          // quartz stairs
+    case 159: return "white_terracotta"; // stained hardened clay
+    case 161: return "acacia_leaves";    // leaves2 (acacia/dark oak)
+    case 162: return "acacia_log";       // log2
+    case 168: return "prismarine";
+    case 169: return "sea_lantern";
+    case 172: return "terracotta";       // hardened clay
+    case 174: return "packed_ice";
+    case 179: return "red_sandstone";
+    case 180: return "red_sandstone";    // red sandstone stairs
+    case 181: case 182: return "red_sandstone";
+    case 201: case 206: return "end_stone_bricks"; // purpur / end brick (approx)
+    // Non-solid decoration → skip (air).
+    case 6: case 27: case 28: case 31: case 32: case 37: case 38: case 39:
+    case 40: case 50: case 51: case 55: case 59: case 63: case 64: case 65:
+    case 66: case 68: case 69: case 70: case 75: case 76: case 77: case 90:
+    case 104: case 105: case 106: case 115: case 131: case 132: case 141:
+    case 142: case 143: case 147: case 148: case 171:
+        return nullptr;
+    default:  return "stone";            // unknown solid → keep as stone
+    }
+}
+
+// Pre-1.16 (DataVersion < 2529) packing: indices SPAN across 64-bit long
+// boundaries (no per-long padding). Used by the old Level>Sections>BlockStates path.
+static void DecodeBlockStatesSpanning(const std::vector<uint64_t>& longs, int palLen,
+                                      std::vector<uint16_t>& out)
+{
+    out.assign(4096, 0);
+    if (palLen <= 1) return;                       // single-block section (no array)
+    int bits = 4;
+    while ((1 << bits) < palLen) ++bits;
+    uint64_t mask = (1ull << bits) - 1ull;
+    long long need = (long long)4096 * bits;
+    if ((long long)longs.size() * 64 < need) return; // malformed
+    for (int i = 0; i < 4096; ++i) {
+        long long bitpos = (long long)i * bits;
+        int li  = (int)(bitpos >> 6);
+        int off = (int)(bitpos & 63);
+        uint64_t v = longs[li] >> off;
+        if (off + bits > 64) v |= longs[li + 1] << (64 - off);
+        out[i] = (uint16_t)(v & mask);
+    }
+}
+
+// Parse one pre-1.18 section compound. Two sub-formats:
+//   1.13–1.17: Palette(list<compound>) + BlockStates(LongArray, spanning).
+//   pre-1.13 : Blocks(ByteArray 4096) + Add(ByteArray 2048 nibbles, opt) + Data(opt).
+static void ParseOldSection(R& r, std::vector<SectionData>& outSecs)
+{
+    SectionData sd;
+    bool haveY = false;
+    std::vector<uint64_t> dataLongs;
+    std::vector<uint8_t> blocks, addNib;
+    int palLen = 0;
+    while (r.ok) {
+        uint8_t tt = r.u8();
+        if (tt == T_END) break;
+        std::string sn = r.str();
+        if (tt == T_BYTE && sn == "Y") { sd.y = r.i8(); haveY = true; }
+        else if (tt == T_LIST && sn == "Palette") {
+            uint8_t plt = r.u8();
+            int32_t pn = r.i32();
+            if (plt != T_COMPOUND) { for (int j = 0; j < pn && r.ok; ++j) SkipPayload(r, plt); }
+            else {
+                palLen = pn;
+                sd.palette.reserve(pn);
+                for (int j = 0; j < pn && r.ok; ++j) {
+                    std::string blockName;
+                    while (r.ok) {
+                        uint8_t pt = r.u8();
+                        if (pt == T_END) break;
+                        std::string pName = r.str();
+                        if (pt == T_STRING && pName == "Name") blockName = r.str();
+                        else SkipPayload(r, pt);
+                    }
+                    sd.palette.push_back(blockName);
+                }
+            }
+        }
+        else if (tt == T_LONGARR && sn == "BlockStates") {
+            int32_t dn = r.i32();
+            dataLongs.resize((size_t)std::max(0, dn));
+            for (int32_t j = 0; j < dn && r.ok; ++j) dataLongs[j] = r.u64();
+        }
+        else if (tt == T_BYTEARR && sn == "Blocks") {
+            int32_t dn = r.i32(); dn = std::max(0, dn);
+            blocks.resize((size_t)dn);
+            for (int32_t j = 0; j < dn && r.ok; ++j) blocks[j] = r.u8();
+        }
+        else if (tt == T_BYTEARR && sn == "Add") {
+            int32_t dn = r.i32(); dn = std::max(0, dn);
+            addNib.resize((size_t)dn);
+            for (int32_t j = 0; j < dn && r.ok; ++j) addNib[j] = r.u8();
+        }
+        else SkipPayload(r, tt);
+    }
+
+    if (!blocks.empty()) {
+        // Legacy numeric IDs → build a local name palette + indices.
+        sd.indices.assign(4096, 0);
+        std::unordered_map<int, uint16_t> idToLocal;
+        sd.palette.push_back("air"); // local 0 = skipped by the name matcher
+        auto nib = [&](const std::vector<uint8_t>& a, int i) -> int {
+            if ((size_t)(i >> 1) >= a.size()) return 0;
+            return (i & 1) ? (a[i >> 1] >> 4) : (a[i >> 1] & 0xF);
+        };
+        for (int i = 0; i < 4096 && i < (int)blocks.size(); ++i) {
+            int id = blocks[i] | (nib(addNib, i) << 8);
+            const char* nm = LegacyIdName(id);
+            if (!nm) { sd.indices[i] = 0; continue; }     // air
+            auto it = idToLocal.find(id);
+            uint16_t li;
+            if (it == idToLocal.end()) {
+                li = (uint16_t)sd.palette.size();
+                sd.palette.push_back(nm);
+                idToLocal.emplace(id, li);
+            } else li = it->second;
+            sd.indices[i] = li;
+        }
+    } else {
+        if (palLen <= 1) sd.indices.assign(4096, 0);     // single-block (no BlockStates)
+        else             DecodeBlockStatesSpanning(dataLongs, palLen, sd.indices);
+    }
+
+    if (haveY && !sd.palette.empty())
+        outSecs.push_back(std::move(sd));
+}
+
 // Parse one chunk's NBT payload. Extract sections into `outSecs`.
 // Returns false on parse error.
 static bool ParseChunkNbt(const uint8_t* nbt, size_t nbtLen,
@@ -353,12 +562,28 @@ static bool ParseChunkNbt(const uint8_t* nbt, size_t nbtLen,
     if (rootT != T_COMPOUND) return false;
     (void)r.str(); // root name (usually "")
 
-    // Walk root compound; find "sections" list.
+    // Walk root compound; find "sections" list (1.18+) or "Level" wrapper (pre-1.18).
     while (r.ok) {
         uint8_t t = r.u8();
         if (t == T_END) break;
         std::string name = r.str();
-        if (t == T_LIST && name == "sections") {
+        if (t == T_COMPOUND && name == "Level") {
+            // Pre-1.18: Level > Sections (capital) with Palette/BlockStates siblings.
+            while (r.ok) {
+                uint8_t lt = r.u8();
+                if (lt == T_END) break;
+                std::string ln = r.str();
+                if (lt == T_LIST && ln == "Sections") {
+                    uint8_t st = r.u8();
+                    int32_t n = r.i32();
+                    if (st != T_COMPOUND) { for (int i = 0; i < n && r.ok; ++i) SkipPayload(r, st); }
+                    else { for (int i = 0; i < n && r.ok; ++i) ParseOldSection(r, outSecs); }
+                } else {
+                    SkipPayload(r, lt);
+                }
+            }
+        }
+        else if (t == T_LIST && name == "sections") {
             uint8_t lt = r.u8();
             int32_t n = r.i32();
             if (lt != T_COMPOUND) { for (int i = 0; i < n && r.ok; ++i) SkipPayload(r, lt); continue; }
@@ -424,11 +649,44 @@ static bool ParseChunkNbt(const uint8_t* nbt, size_t nbtLen,
     return r.ok;
 }
 
+// Heuristic colour for an unknown block name (modded packs like WesterosCraft use
+// thousands of custom blocks). Substring-match common materials so the geometry is
+// kept (coloured roughly) instead of culled. Most-specific keywords first.
+static bool FallbackColor(const char* s, uint32_t& outRgb)
+{
+    struct KW { const char* k; uint32_t rgb; };
+    static const KW kw[] = {
+        {"deepslate",0x4C4C4C}, {"cobble",0x707070}, {"sandstone",0xDBCEA4},
+        {"red_sand",0xA85024},  {"sand",0xDED4AD},   {"stone_brick",0x7A7A7A},
+        {"stonebrick",0x7A7A7A},{"nether_brick",0x2D161A}, {"brick",0x96503A},
+        {"thatch",0xA9881A},    {"hay",0xA9881A},     {"straw",0xC9A227},
+        {"dark_oak",0x432B12},  {"spruce",0x735232},  {"birch",0xC2A572},
+        {"jungle",0xAB825E},    {"acacia",0xAB5D33},  {"mangrove",0x753D2D},
+        {"oak",0xB18A55},       {"plank",0xB18A55},   {"firewood",0x6E572B},
+        {"bark",0x5B4327},      {"log",0x6E572B},     {"wood",0x6E572B},
+        {"leaves",0x3F7E2F},    {"leaf",0x3F7E2F},    {"foliage",0x3F7E2F},
+        {"grass",0x507A32},     {"moss",0x596F2C},    {"fern",0x4A6A2A},
+        {"mud",0x3A2E26},       {"bog",0x4A4030},     {"dirt",0x866043},
+        {"soil",0x5C3F1B},      {"gravel",0x837F7E},  {"rock",0x808080},
+        {"clay",0x985E43},      {"terracotta",0x985E43}, {"marble",0xDADAD3},
+        {"snow",0xF9FAFA},      {"ice",0x9FCFFB},     {"water",0x3F76E4},
+        {"glass",0xA7D3F0},     {"thin_",0x6E572B},
+        {"wool",0xE9ECEC},      {"cloth",0xE9ECEC},   {"carpet",0xC8C8C8},
+        {"leather",0x8A5A33},   {"fur",0xB7A07A},     {"wattle",0x9A7B4F},
+        {"iron",0xDADADA},      {"gold",0xFCEE4B},    {"copper",0xB87333},
+        {"fence",0x9A7B4F},     {"slab",0x9A8A6A},    {"stair",0x9A8A6A},
+        {"sandstones",0xDBCEA4},{"stone",0x808080},
+    };
+    for (const auto& e : kw) if (strstr(s, e.k)) { outRgb = e.rgb; return true; }
+    return false;
+}
+
 // ---------- block name → output palette index ----------
 struct GlobalPal
 {
     std::unordered_map<std::string, int16_t> nameToIdx;
     std::vector<uint32_t> rgb;            // 0xRRGGBB
+    std::vector<std::string> unknown;     // names that matched nothing (skipped)
     int16_t Get(const std::string& fullName)
     {
         // strip "minecraft:" prefix
@@ -445,8 +703,20 @@ struct GlobalPal
                 return idx;
             }
         }
-        nameToIdx.emplace(s, (int16_t)-1);   // unknown → skip
-        return -1;
+        // Skip only true air variants (not "stairs"/"chair" — exact components).
+        if (!strcmp(s, "air") || strstr(s, "cave_air") || strstr(s, "void_air") ||
+            strstr(s, "barrier") || strstr(s, "structure_void") || strstr(s, "light")) {
+            nameToIdx.emplace(s, (int16_t)-1);
+            return -1;
+        }
+        // Unknown solid (modded etc.) → keyword fallback colour so geo is kept.
+        uint32_t fb = 0x808080;
+        FallbackColor(s, fb);
+        int16_t idx = (int16_t)rgb.size();
+        rgb.push_back(fb);
+        nameToIdx.emplace(s, idx);
+        unknown.push_back(s);                // still logged so we can add real colours
+        return idx;
     }
 };
 
@@ -1171,5 +1441,10 @@ int main(int argc, char** argv)
 
     printf("[mca2vox] wrote %s  chunks=%zu  voxels=%zu  palette=%zu\n",
            outPath, chunks.size(), totalVoxels, pal.rgb.size());
+    if (!pal.unknown.empty()) {
+        printf("[mca2vox] %zu unknown block names mapped via keyword fallback colour:\n",
+               pal.unknown.size());
+        for (const auto& n : pal.unknown) printf("    %s\n", n.c_str());
+    }
     return 0;
 }
