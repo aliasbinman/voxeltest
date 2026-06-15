@@ -3,62 +3,12 @@
 //   0 = reference: reconstruct world pos from depth, project with gPrevViewProj
 #define USE_BURNOUT_REPROJECT 1
 
-// m4_taa_post.hlsl — verbatim port of CSTiles postfx.hlsl psmain_taa + psmain_post.
-// Same cbPerFrame layout as m4_lw.hlsl so all compiles read matching offsets.
+// m4_taa_post.hlsl — TAA resolve + post (godray/sky/tonemap). cbPerFrame (b0) is
+// the shared layout from m4_frame.hlsli so all passes read matching offsets.
 // Godray + shadow CB / SRVs bound to zeroed dummies — corresponding shader
 // branches early-out on gGodrayStrength<=0 / gShadowEnable<0.5.
 
-cbuffer cbPerFrame : register(b0)
-{
-    row_major float4x4 gViewProj;
-    float3   gCamPos;
-    float    gMode;
-    float3   gLightDir;
-    float    gAmbient;
-    float3   gPointNormal;
-    float    _pad0;
-    row_major float4x4 gInvViewProj;
-    float2   gScreenSize;
-    float2   _pad1;
-    float3   gCamRight;
-    float    _pad3;
-    float3   gCamUp;
-    float    _pad4;
-    float3   gCamForward;
-    float    gTanHalfFovY;
-    float3   gFogColor;
-    float    gFogDensity;
-    float    gHeightFogDensity;
-    float    gHeightFogFalloff;
-    float    gHeightFogStart;
-    float    _padHF;
-    float3   gSceneOrigin;
-    float    gNearZ;
-    float3   gSceneSpan;
-    float    _pad6;
-    row_major float4x4 gPrevViewProj;
-    float2   gJitter;
-    float2   _pad7;
-    row_major float4x4 gSunViewProj;
-    float    gShadowBias;
-    float    gShadowMapSize;
-    float    gShadowEnable;
-    float    gSunIntensity;
-    float    gExposure;
-    float    gRoughness;
-    float    gColorizeClusters;
-    float    gGridSize;
-    float2   gInvScreenSize;
-    float    gAspect;
-    float    gInvAspect;
-    float    gAspectTanFov;
-    float3   _padPC;
-    // Burnout Paradise reproject matrix rows (HScreen-UV). Mvel = Mh1_to_h0 - I.
-    float4   gReprojMx;
-    float4   gReprojMy;
-    float4   gReprojMw;
-    float4   _padReproj;
-};
+#include "m4_frame.hlsli"   // cbPerFrame (b0)
 
 // ---- TAA bindings (match CSTiles postfx.hlsl) ----
 Texture2D<float4> gTaaScene  : register(t4);

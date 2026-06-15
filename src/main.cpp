@@ -114,7 +114,7 @@ void SetCwdToProjectRoot()
     SetCurrentDirectoryW(exePath);
     for (int i = 0; i < 8; ++i)
     {
-        if (GetFileAttributesW(L"shaders\\voxel.hlsl") != INVALID_FILE_ATTRIBUTES)
+        if (GetFileAttributesW(L"shaders\\m4_lw.hlsl") != INVALID_FILE_ATTRIBUTES)
             return;
         SetCurrentDirectoryW(L"..");
     }

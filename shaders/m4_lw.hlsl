@@ -33,89 +33,9 @@
 //   t0  DepthSrv (Texture2D<uint>)
 //   t1  ColorSrv (Texture2D<uint>, post-dilate visColor2)
 
-// CSTiles cbPerFrame byte layout — identical to postfx.hlsl. Same offsets so
-// shaders ported from CSTiles compile + read correct fields.
-cbuffer cbPerFrame : register(b0)
-{
-    row_major float4x4 gViewProj;     //   0
-    float3   gCamPos;                  //  64
-    float    gMode;                    //  76
-    float3   gLightDir;                //  80
-    float    gAmbient;                 //  92
-    float3   gPointNormal;             //  96
-    float    _pad0;                    // 108
-    row_major float4x4 gInvViewProj;   // 112
-    float2   gScreenSize;              // 176
-    float2   _pad1;                    // 184
-    float3   gCamRight;                // 192
-    float    _pad3;                    // 204
-    float3   gCamUp;                   // 208
-    float    _pad4;                    // 220
-    float3   gCamForward;              // 224
-    float    gTanHalfFovY;             // 236
-    float3   gFogColor;                // 240
-    float    gFogDensity;              // 252
-    float    gHeightFogDensity;        // 256
-    float    gHeightFogFalloff;        // 260
-    float    gHeightFogStart;          // 264
-    float    _padHF;                   // 268
-    float3   gSceneOrigin;             // 272
-    float    gNearZ;                   // 284
-    float3   gSceneSpan;               // 288
-    float    _pad6;                    // 300
-    row_major float4x4 gPrevViewProj;  // 304
-    float2   gJitter;                  // 368
-    float2   _pad7;                    // 376
-    row_major float4x4 gSunViewProj;   // 384
-    float    gShadowBias;              // 448
-    float    gShadowMapSize;           // 452
-    float    gShadowEnable;            // 456
-    float    gSunIntensity;            // 460
-    float    gExposure;                // 464
-    float    gRoughness;               // 468
-    float    gColorizeClusters;        // 472
-    float    gGridSize;                // 476
-    float2   gInvScreenSize;           // 480
-    float    gAspect;                  // 488
-    float    gInvAspect;               // 492
-    float    gAspectTanFov;            // 496
-    float    gAoStrength;              // 500  baked AO darkening (0..1)
-    float2   _padPC;                   // 504..512
-    // Burnout Paradise reproject matrix rows (HScreen-UV). Mvel = Mh1_to_h0 - I.
-    float4   gReprojMx;                // 512  (mxx, mxy, mxz, mxw)
-    float4   gReprojMy;                // 528  (myx, myy, myz, myw)
-    float4   gReprojMw;                // 544  (mwx, mwy, mwz, mww)
-    float4   _padReproj;               // 560..576
-};
-
-cbuffer CBLwCS : register(b1)
-{
-    uint2 gVwSize;
-    uint  gLwPointCount;
-    uint  gLwNumWorkItems;
-    uint  gLwLodIdx;
-    int   gSplatRadius;     // 0 = single pixel; N writes (2N+1)x(2N+1).
-    uint2 _padCs;
-};
-
-struct LwChunkInfo
-{
-    float3 worldOrigin;
-    float  lodScale;
-    uint   poolBase;
-    uint   paletteBase;
-    uint2  _padCI;
-};
-
-StructuredBuffer<LwChunkInfo> gLwChunkInfos : register(t0);
-StructuredBuffer<uint>        gLwPalette    : register(t1);
-StructuredBuffer<uint>        gLwBlockPos   : register(t2);
-StructuredBuffer<uint2>       gLwBlockCol   : register(t3);
-StructuredBuffer<uint4>       gLwWorkItems  : register(t4);
-Texture2D<uint>               gLwDepthSrv   : register(t5);
-StructuredBuffer<uint2>       gLwBlockVis   : register(t6);
-// Baked per-voxel AO, 1 uint/voxel (low 24 bits = 6 faces * 4-bit), 8/block.
-StructuredBuffer<uint>        gLwBlockAo    : register(t7);
+// Per-frame CB, LW structured buffers (t0-t7), LookupItem, ambient cube + fog —
+// all shared with the octet techs.
+#include "m4_common.hlsli"
 
 RWTexture2D<uint>             gLwVisUav     : register(u0);
 // Per-face AO (low 24 bits = 6 faces * 4-bit) written at the splat winner pixel.
@@ -129,20 +49,6 @@ static const float kLinDepthScale = kLinDepthMaxF / kLinDepthFar;
 uint EncodeLinDepth(float viewZ)
 {
     return (uint)clamp(viewZ * kLinDepthScale, 0.0, kLinDepthMaxF);
-}
-
-// gid -> work item via binary search over the cumulative firstThread (.w).
-uint4 LookupItem(uint gid)
-{
-    uint lo = 0u;
-    uint hi = gLwNumWorkItems;
-    while (lo + 1u < hi)
-    {
-        uint mid = (lo + hi) >> 1u;
-        if (gLwWorkItems[mid].w <= gid) lo = mid;
-        else                            hi = mid;
-    }
-    return gLwWorkItems[lo];
 }
 
 // ============================================================
@@ -327,54 +233,6 @@ float3 PixelWorldDir(float2 pixCenter, float2 invScreen)
     return normalize(gCamRight * v.x + gCamUp * v.y + gCamForward * v.z);
 }
 
-// ApplyFog — verbatim port from CSTiles shading.hlsli.
-float3 ApplyFog(float3 color, float3 wpos)
-{
-    float3 d = wpos - gCamPos;
-    float dist = length(d);
-    float optical = gFogDensity * dist;
-    float3 rd = (dist > 1e-4) ? d / dist : float3(0,0,1);
-    if (gHeightFogDensity > 0.0 && dist > 1e-4) {
-        float b  = gHeightFogFalloff;
-        float c  = gHeightFogDensity;
-        float ey = exp(-(gCamPos.y - gHeightFogStart) * b);
-        float t;
-        if (abs(rd.y) > 1e-4)
-            t = c * ey * (1.0 - exp(-dist * rd.y * b)) / rd.y;
-        else
-            t = c * ey * dist;
-        optical += max(t, 0.0);
-    }
-    if (optical <= 0.0)
-        return color;
-    float3 sunDir  = normalize(gLightDir);
-    float  sunAmt  = pow(saturate(dot(rd, sunDir)), 8.0);
-    float3 sunTint = float3(1.10, 0.85, 0.55);
-    float3 fogCol  = lerp(gFogColor, sunTint, sunAmt);
-    return lerp(fogCol, color, exp(-optical));
-}
-
-// Ambient cube — warm/cool per axis face. Sampled triplanar from the surface
-// normal so each cube face picks up a different indirect tint instead of one
-// flat scalar.
-static const float3 kAmbientCube[6] = {
-    float3(0.85, 0.65, 0.45),  // +X warm
-    float3(0.40, 0.50, 0.65),  // -X cool
-    float3(0.85, 1.00, 1.20),  // +Y sky
-    float3(0.18, 0.14, 0.10),  // -Y ground
-    float3(0.65, 0.65, 0.55),  // +Z
-    float3(0.40, 0.45, 0.55),  // -Z
-};
-float3 AmbientCube(float3 n)
-{
-    float3 an = abs(n);
-    float t = max(an.x + an.y + an.z, 1e-5);
-    float3 amb = an.x * (n.x > 0.0 ? kAmbientCube[0] : kAmbientCube[1])
-               + an.y * (n.y > 0.0 ? kAmbientCube[2] : kAmbientCube[3])
-               + an.z * (n.z > 0.0 ? kAmbientCube[4] : kAmbientCube[5]);
-    return amb / t;
-}
-
 float3 SkyDome(float3 rd)
 {
     float  t = saturate(rd.y * 0.5 + 0.5);
@@ -516,14 +374,8 @@ void csmain_dilate(uint3 dt : SV_DispatchThreadID)
         (float)((bestPck >>  8) & 0xFFu) / 255.0,
         (float)((bestPck >> 16) & 0xFFu) / 255.0);
 
-    const float3 kFaceN[6] = {
-        float3( 1,0,0), float3(-1,0,0),
-        float3(0, 1,0), float3(0,-1,0),
-        float3(0,0, 1), float3(0,0,-1),
-    };
-
     float  NdotL;
-    float3 Nshade;
+    float3 Nshade;       // kFaceN comes from m4_common.hlsli
 #if USE_HIT_FACE
     // --- Mode 1: per-pixel hit-face (sharp) ---
     if (haveHit)

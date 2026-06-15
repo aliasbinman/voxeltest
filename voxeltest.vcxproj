@@ -278,6 +278,7 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
 
   <!-- =================== Headers =================== -->
   <ItemGroup>
+    <ClInclude Include="src\asset_version.h" />
     <ClInclude Include="src\camera.h" />
     <ClInclude Include="src\lodworld.h" />
     <ClInclude Include="src\renderer.h" />
@@ -286,13 +287,12 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
 
   <!-- =================== Shader source files (display only) =================== -->
   <ItemGroup>
+    <None Include="shaders\m4_common.hlsli" />
+    <None Include="shaders\m4_frame.hlsli" />
     <None Include="shaders\m4_lw.hlsl" />
     <None Include="shaders\m4_octet.hlsl" />
+    <None Include="shaders\m4_octetgeo.hlsl" />
     <None Include="shaders\m4_taa_post.hlsl" />
-    <None Include="shaders\voxel.hlsl" />
-    <None Include="shaders\lodworld.hlsl" />
-    <None Include="shaders\postfx.hlsl" />
-    <None Include="shaders\shading.hlsli" />
     <None Include="voxeltest.txt" />
   </ItemGroup>
 
@@ -372,6 +372,16 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
     <ShaderEntry Include="m4_octet.hlsl_psmain_octet">
       <Source>shaders\m4_octet.hlsl</Source>
       <Entry>psmain_octet</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_octetgeo.hlsl_vsmain_octetgeo">
+      <Source>shaders\m4_octetgeo.hlsl</Source>
+      <Entry>vsmain_octetgeo</Entry>
+      <Profile>vs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_octetgeo.hlsl_psmain_octetgeo">
+      <Source>shaders\m4_octetgeo.hlsl</Source>
+      <Entry>psmain_octetgeo</Entry>
       <Profile>ps_6_0</Profile>
     </ShaderEntry>
   </ItemGroup>

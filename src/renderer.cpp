@@ -993,6 +993,8 @@ static uint64_t LatestShaderMtime()
         L"shaders/m4_taa_post.hlsl",
         L"shaders/m4_octet.hlsl",
         L"shaders/m4_octetgeo.hlsl",
+        L"shaders/m4_common.hlsli",  // shared includes — touch → recompile all
+        L"shaders/m4_frame.hlsli",
     };
     uint64_t mx = 0;
     for (auto* p : paths)
