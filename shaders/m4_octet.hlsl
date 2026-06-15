@@ -165,6 +165,7 @@ struct VOut
     nointerpolation uint   palBase  : TEXCOORD4; // palette atlas base
 };
 
+
 // One instanced quad (triangle strip, 4 verts) per octet.
 VOut vsmain_octet(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 {
@@ -185,6 +186,7 @@ VOut vsmain_octet(uint vid : SV_VertexID, uint iid : SV_InstanceID)
         return o;
     }
 
+    
     uint bi    = blockBase + (iid - first);
     uint pack0 = gLwBlockPos[bi];
     uint bx = (pack0 >>  0) & 0xFFu;
@@ -197,15 +199,17 @@ VOut vsmain_octet(uint vid : SV_VertexID, uint iid : SV_InstanceID)
     float3 omin = ci.worldOrigin + float3(bx * 2u, by * 2u, bz * 2u) * vs;
     float  esz  = vs * 2.0; // octet spans 2 voxels per axis
 
-    // ---- Cheap billboard: project the octet CENTER once, expand the quad by the
-    // octet's screen-space bounding-sphere radius. ~8x cheaper than projecting all
-    // 8 corners + min/max bbox (1 matrix-mul + 1 divide).
+    // ---- Robust billboard: the quad MUST fully enclose the octet's screen
+    // silhouette, else its own edge pixels (ray misses the AABB) discard to black —
+    // an axis-aligned quad can't tightly bound a rotated box, so use the bounding
+    // sphere (radius = box half-diagonal sqrt(3)*vs), which always contains it.
+    // Size at the sphere's NEAREST depth (cc.w - R) so perspective never clips it.
     float3 center = omin + vs;        // octet centre (spans 2*vs → half = vs)
     float  R      = vs * 1.7320508;   // bounding-sphere radius = box half-diagonal
 
     float4 cc = mul(float4(center, 1.0), gViewProj);
     // cc.w == view-space Z (reverse-Z proj). Cull if the octet crosses/behind the
-    // near plane — the radius approximation is unstable there; the splat covers it.
+    // near plane — the projection is unstable there; the splat covers it.
     // (Also kills the fullscreen-straddle GPU-hang case.)
     if (cc.w - R <= gNearZ)
     {
@@ -214,24 +218,17 @@ VOut vsmain_octet(uint vid : SV_VertexID, uint iid : SV_InstanceID)
         return o;
     }
 
-    float2 cn    = cc.xy / cc.w;               // centre in NDC
-    float  ndcRy = R / (cc.w * gTanHalfFovY);  // projected sphere radius (NDC, y)
-    float  ndcRx = ndcRy / gAspect;            // NDC radius (x)
-
-    // Screen-size cull: tiny octets stay on the splat point-cloud (overdraw bound).
-    if (max(ndcRx * gScreenSize.x, ndcRy * gScreenSize.y) < 8.0)
-    {
-        o.pos = float4(2.0, 2.0, 0.0, 1.0);
-        o.octMin = omin; o.vsize = vs; o.occ = 0u; o.blockIdx = 0u; o.palBase = 0u;
-        return o;
-    }
+    float2 cn    = cc.xy / cc.w;                          // centre in NDC (centre depth)
+    float  wNear = cc.w - R;                              // sphere nearest depth
+    float  ndcRy = R / (wNear * gTanHalfFovY);            // sphere radius (NDC y)
+    float  ndcRx = ndcRy / gAspect;                       // sphere radius (NDC x)
 
     float2 ext = float2(ndcRx, ndcRy) + gInvScreenSize; // + half-pixel pad
     float2 corner = float2((vid & 1u) ? cn.x + ext.x : cn.x - ext.x,
                            (vid & 2u) ? cn.y + ext.y : cn.y - ext.y);
-    // Conservative nearest reverse-Z (centre distance minus radius) for HW early-Z;
+    // Conservative nearest reverse-Z (sphere nearest depth) for HW early-Z;
     // cc.z == nearZ for this projection.
-    float maxRz = cc.z / (cc.w - R);
+    float maxRz = cc.z / wNear;
 
     o.pos      = float4(corner, maxRz, 1.0);
     o.octMin   = omin;
@@ -273,10 +270,17 @@ POut psmain_octet(VOut i)
     float bestT = 1e30;
     int   bestC = -1;
     uint  bestFace = 0;
+    
+  //  const float3 Corner[8] = {         
+  //      float3(0, 0, 0), float3(1, 0, 0), float3(0, 1, 0), float3(1, 1, 0),
+  //      float3(0, 0, 1), float3(1, 0, 1), float3(0, 1, 1), float3(1, 1, 1),
+  //  };
     [unroll]
     for (uint c = 0u; c < 8u; ++c)
     {
-        if (((occ >> c) & 1u) == 0u) continue;
+        if (((occ >> c) & 1u) == 0u) 
+            continue;
+        
         float3 cmin = i.octMin + vs * float3(c & 1u, (c >> 1) & 1u, (c >> 2) & 1u);
         float3 cmax = cmin + vs;
         float3 t0 = (cmin - ro) * invRd;
@@ -285,11 +289,14 @@ POut psmain_octet(VOut i)
         float3 tbg = max(t0, t1);
         float tN = max(max(tsm.x, tsm.y), tsm.z);
         float tF = min(min(tbg.x, tbg.y), tbg.z);
-        if (tF < max(tN, 0.0)) continue;        // miss
+        if (tF < max(tN, 0.0)) 
+            continue;        // miss
         float tHit = max(tN, 0.0);
-        if (tHit >= bestT) continue;
+        if (tHit >= bestT) 
+            continue;
         bestT = tHit;
         bestC = (int)c;
+        
         // Entry face = axis that produced tN.
         if      (tN == tsm.x) bestFace = (rd.x > 0.0) ? 1u : 0u;
         else if (tN == tsm.y) bestFace = (rd.y > 0.0) ? 3u : 2u;

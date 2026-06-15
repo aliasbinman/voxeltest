@@ -992,6 +992,7 @@ static uint64_t LatestShaderMtime()
         L"shaders/m4_lw.hlsl",
         L"shaders/m4_taa_post.hlsl",
         L"shaders/m4_octet.hlsl",
+        L"shaders/m4_octetgeo.hlsl",
     };
     uint64_t mx = 0;
     for (auto* p : paths)
@@ -1065,9 +1066,11 @@ bool Renderer::RecompileShaders()
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_post",        L"ps_6_0", psPost,"psPost")) return false;
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_godray_mark", L"ps_6_0", psGrMark, "psGrMark")) return false;
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_godray_blur", L"ps_6_0", psGrBlur, "psGrBlur")) return false;
-    ComPtr<IDxcBlob> vsOct, psOct;
+    ComPtr<IDxcBlob> vsOct, psOct, vsGeo, psGeo;
     if (!comp(L"shaders/m4_octet.hlsl",     L"vsmain_octet",       L"vs_6_0", vsOct, "vsOct")) return false;
     if (!comp(L"shaders/m4_octet.hlsl",     L"psmain_octet",       L"ps_6_0", psOct, "psOct")) return false;
+    if (!comp(L"shaders/m4_octetgeo.hlsl",  L"vsmain_octetgeo",    L"vs_6_0", vsGeo, "vsGeo")) return false;
+    if (!comp(L"shaders/m4_octetgeo.hlsl",  L"psmain_octetgeo",    L"ps_6_0", psGeo, "psGeo")) return false;
 
     // Wait for GPU idle before swapping PSOs — old PSOs may still be in flight.
     WaitForGpu();
@@ -1103,7 +1106,7 @@ bool Renderer::RecompileShaders()
         return SUCCEEDED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&outNew)));
     };
 
-    ComPtr<ID3D12PipelineState> p1, p2, pd, prs, ptaa, ppost, pgm, pgb;
+    ComPtr<ID3D12PipelineState> p1, p2, pd, prs, ptaa, ppost, pgm, pgb, pgeo;
     if (!buildCs(m4Pass1RootSig_.Get(),  cs1.Get(),      p1))   return false;
     if (!buildCs(m4Pass2RootSig_.Get(),  cs2.Get(),      p2))   return false;
     if (!buildCs(m4DilateRootSig_.Get(), csDilate.Get(), pd))   return false;
@@ -1136,6 +1139,10 @@ bool Renderer::RecompileShaders()
         od.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
         od.DepthStencilState.StencilEnable = FALSE;
         if (FAILED(device_->CreateGraphicsPipelineState(&od, IID_PPV_ARGS(&poct)))) return false;
+        // OctetGeo: same desc, swap shaders.
+        od.VS = { vsGeo->GetBufferPointer(), vsGeo->GetBufferSize() };
+        od.PS = { psGeo->GetBufferPointer(), psGeo->GetBufferSize() };
+        if (FAILED(device_->CreateGraphicsPipelineState(&od, IID_PPV_ARGS(&pgeo)))) return false;
     }
 
     m4Pass1Pso_       = p1;
@@ -1147,6 +1154,7 @@ bool Renderer::RecompileShaders()
     m4GodrayMarkPso_  = pgm;
     m4GodrayBlurPso_  = pgb;
     m4OctetPso_       = poct;
+    m4OctetGeoPso_    = pgeo;
     return true;
 }
 
@@ -1525,6 +1533,16 @@ bool Renderer::CreateM4()
         pd.DepthStencilState.StencilEnable = FALSE;
         if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m4OctetPso_)))) return false;
         NameObject(m4OctetPso_.Get(), L"m4OctetPso");
+
+        // OctetGeo PSO: same root sig / RTV / depth, just different shaders +
+        // triangle-list topology (real geometry, no per-pixel ray).
+        ComPtr<IDxcBlob> vsGeo, psGeo;
+        if (!loadShader(L"shaders/m4_octetgeo.hlsl", L"vsmain_octetgeo", L"vs_6_0", vsGeo, "vsGeo")) return false;
+        if (!loadShader(L"shaders/m4_octetgeo.hlsl", L"psmain_octetgeo", L"ps_6_0", psGeo, "psGeo")) return false;
+        pd.VS = { vsGeo->GetBufferPointer(), vsGeo->GetBufferSize() };
+        pd.PS = { psGeo->GetBufferPointer(), psGeo->GetBufferSize() };
+        if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m4OctetGeoPso_)))) return false;
+        NameObject(m4OctetGeoPso_.Get(), L"m4OctetGeoPso");
     }
 
     // Godray Mark root sig: CBV b0 (frame for gScreenSize), CBV b3 (godray),
@@ -1875,15 +1893,17 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     };
 
     // ---- Per-LOD draw lists. Walker = port of CSTiles per-cluster recursion.
-    struct DrawItem { uint32_t slot, blockFirst, blockCount; };
+    // nearDist used only by the octet path (front-to-back sort for early-Z).
+    struct DrawItem { uint32_t slot, blockFirst, blockCount; float nearDist; };
     std::vector<DrawItem> drawList[lw::kLodCount];
     // OctetBillboards close ring: only the nearest LOD0 clusters billboard, so
     // overdraw + instance count stay bounded (the splat covers the rest of LOD0).
     std::vector<DrawItem> octetDrawList;
-    // Close-ring radius. The in-VS size cull (<8px) already drops octets beyond
-    // ~focalPx/4 world units; this band just caps how many LOD0 octets the VS
-    // even processes. Generous enough to show the close ring at normal distance.
-    const float octetNearDist = 320.0f; // world units
+    // Octet-vs-splat selection by SCREEN SIZE of the closest voxel in the cluster:
+    // if a voxel projects to fewer than (dilate radius * 2) pixels the splat point
+    // cloud resolves it fine and cheaper, so use SplatCS; bigger than that and the
+    // splat leaves holes / looks blocky → octet billboard ray-traces the cubes.
+    const float octetMinVoxelPx = (float)args.splatRadius * 2.0f;
     // DIAGNOSTIC: flip to false to disable the octet pass entirely (splat-only).
     // If the GPU still hangs on movement with this off → the hang is in the
     // splat/streaming/retirement path, NOT the octet.
@@ -1891,8 +1911,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     // When octet billboards are the close-ring tech, the near LOD0 clusters render
     // via octet ONLY — they must NOT also go to the splat list, or the close ring
     // draws twice (splat point-cloud + octet cubes overlapping).
-    const bool useOctet = kOctetEnabled
-                       && (args.tech == RenderTech::OctetBillboards) && m4OctetPso_;
+    // OctetGeo shares the close-ring worklist; only the draw PSO/topology differ.
+    const bool useOctetGeo = (args.tech == RenderTech::OctetGeo) && m4OctetGeoPso_;
+    const bool useOctet = kOctetEnabled && m4OctetPso_
+                       && ((args.tech == RenderTech::OctetBillboards) || useOctetGeo);
 
     // Recursive lambda via Y-combinator pattern — avoids std::function's
     // type-erased indirect call (was ~0.4ms CPU per frame on busy LOD0).
@@ -1930,18 +1952,22 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
         if (desNearC >= L || !childLoaded || L == 0)
         {
-            // Near LOD0 cluster + octet tech → octet list ONLY (splat skips it).
-            if (L == 0 && useOctet && distNearC < octetNearDist)
+            // Octet only when this cluster's closest voxel is big on screen
+            // (>= dilate*2 px). focalScale*voxelSize/dist == pixels per voxel.
+            const float voxelPx = focalPx * lodScaleF / std::max(distNearC, 1e-3f);
+            if (L == 0 && useOctet && voxelPx >= octetMinVoxelPx)
             {
                 octetDrawList.push_back({chunkSlot,
                                          rc.clusterBlockFirst[clSlot],
-                                         rc.clusterBlockCount[clSlot]});
+                                         rc.clusterBlockCount[clSlot],
+                                         distNearC});
             }
             else
             {
                 drawList[L].push_back({chunkSlot,
                                        rc.clusterBlockFirst[clSlot],
-                                       rc.clusterBlockCount[clSlot]});
+                                       rc.clusterBlockCount[clSlot],
+                                       0.0f});
             }
             return;
         }
@@ -2042,7 +2068,11 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         }
     }
 
-    // Octet close-ring worklist (LOD0 near band) — same coalesce as a LOD list.
+    // Octet close-ring worklist (LOD0 near band). Sorted FRONT-TO-BACK by cluster
+    // near-distance so the closest clusters rasterise first and write their
+    // conservative-near depth — HW early-Z then rejects octets occluded behind
+    // them before their PS runs. (No slot-coalesce: depth order scatters slots, and
+    // the per-cluster WI count is tiny relative to the instance/overdraw win.)
     std::vector<WI> octetWl;
     uint32_t octetTotal = 0;
     if (!octetDrawList.empty())
@@ -2050,18 +2080,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         auto& dl = octetDrawList;
         std::sort(dl.begin(), dl.end(),
                   [](const DrawItem& a, const DrawItem& b) {
-                      if (a.slot != b.slot) return a.slot < b.slot;
-                      return a.blockFirst < b.blockFirst;
+                      return a.nearDist < b.nearDist;
                   });
-        size_t w = 0;
-        for (size_t r = 0; r < dl.size(); ++r) {
-            if (w > 0 && dl[w-1].slot == dl[r].slot &&
-                dl[w-1].blockFirst + dl[w-1].blockCount == dl[r].blockFirst)
-                dl[w-1].blockCount += dl[r].blockCount;
-            else
-                dl[w++] = dl[r];
-        }
-        dl.resize(w);
         const lw::LODWorld& lwL = lwWorld_.lods[0];
         octetWl.reserve(dl.size());
         for (const DrawItem& it : dl) {
@@ -2462,8 +2482,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             cmdList_->RSSetViewports(1, &vpr);
             cmdList_->RSSetScissorRects(1, &scr);
             cmdList_->SetGraphicsRootSignature(m4OctetRootSig_.Get());
-            cmdList_->SetPipelineState(m4OctetPso_.Get());
-            cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            cmdList_->SetPipelineState(useOctetGeo ? m4OctetGeoPso_.Get() : m4OctetPso_.Get());
+            cmdList_->IASetPrimitiveTopology(useOctetGeo ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+                                                         : D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             cmdList_->SetGraphicsRootConstantBufferView(0, cbfAlloc.GpuAddress());
             cmdList_->SetGraphicsRootConstantBufferView(1, octetCbAlloc.GpuAddress());
             cmdList_->SetGraphicsRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
@@ -2475,7 +2496,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
                                                                         : g.blockPosSb->GetGPUVirtualAddress());
             cmdList_->SetGraphicsRootShaderResourceView(8, g.blockAoSb ? g.blockAoSb->GetGPUVirtualAddress()
                                                                        : g.blockPosSb->GetGPUVirtualAddress());
-            cmdList_->DrawInstanced(4, octetTotal, 0, 0);
+            // OctetGeo: 144 verts/instance (8 voxels * 3 faces * 2 tris * 3 verts).
+            // OctetBillboards: 4-vert tri-strip quad.
+            cmdList_->DrawInstanced(useOctetGeo ? 144u : 4u, octetTotal, 0, 0);
             // Left in RENDER_TARGET; the barrier below takes them → PIXEL_SRV.
         }
     }

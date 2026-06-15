@@ -1076,6 +1076,7 @@ void FrameControlsWindow()
     static const TechEntry kTechList[] = {
         {"PointCS_Block",   RenderTech::PointCS_Block},
         {"OctetBillboards", RenderTech::OctetBillboards},
+        {"OctetGeo",        RenderTech::OctetGeo},
         {"PolyAxis",        RenderTech::PolyAxis},
         {"Splat",           RenderTech::Splat},
     };

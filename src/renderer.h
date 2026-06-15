@@ -52,6 +52,7 @@ enum class RenderTech : int
     OctetBillboards  = 1,
     PolyAxis         = 2,
     Splat            = 3,
+    OctetGeo         = 4,   // real tris: 3 front faces per occupied child voxel
 };
 
 enum class PointLighting : int { Simple = 0, Complex = 1 };
@@ -366,6 +367,7 @@ private:
     ComPtr<ID3D12RootSignature>       m4GodrayBlurRootSig_;
     ComPtr<ID3D12RootSignature>       m4OctetRootSig_;   // OctetBillboards graphics
     ComPtr<ID3D12PipelineState>       m4OctetPso_;
+    ComPtr<ID3D12PipelineState>       m4OctetGeoPso_;    // OctetGeo (real tris), same rootsig
     ComPtr<ID3D12PipelineState>       m4Pass1Pso_;
     ComPtr<ID3D12PipelineState>       m4Pass2Pso_;
     ComPtr<ID3D12PipelineState>       m4DilatePso_;
