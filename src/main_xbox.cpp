@@ -36,7 +36,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int)
 
     lw::World world;
     std::string err;
-    const char* lwPath = "kingslanding_sky.lw";
+    const char* lwPath = "kingslanding25.lw";
     bool haveWorld = false;
     if (!lw::LoadWorld(lwPath, world, err))
     {
@@ -62,6 +62,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int)
     // initial values (not DrawSceneParams struct defaults — PC tunes a bunch
     // of fog/godray/sun fields at AppState init time).
     DrawSceneParams ps{};
+    ps.tech             = RenderTech::OctetBillboards; // close ring via octet billboards
     ps.splatRadius      = 1;
     ps.taa              = true;
     ps.fogColor[0]      = 0.55f;

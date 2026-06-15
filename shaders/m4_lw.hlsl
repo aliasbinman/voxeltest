@@ -152,7 +152,8 @@ uint4 LookupItem(uint gid)
 void csmain_pass1_depth(uint3 dt : SV_DispatchThreadID)
 {
     uint gid = dt.x;
-    if (gid >= gLwPointCount) return;
+    if (gid >= gLwPointCount) 
+        return;
     uint4 item = LookupItem(gid);
     uint slot        = item.x;
     uint blockBase   = item.y;
@@ -171,7 +172,8 @@ void csmain_pass1_depth(uint3 dt : SV_DispatchThreadID)
     [unroll]
     for (uint i = 0; i < 8; ++i)
     {
-        if (((occ >> i) & 1u) == 0u) continue;
+        if (((occ >> i) & 1u) == 0u) 
+            continue;
         uint lx = (i >> 0) & 1u;
         uint ly = (i >> 1) & 1u;
         uint lz = (i >> 2) & 1u;
@@ -182,7 +184,7 @@ void csmain_pass1_depth(uint3 dt : SV_DispatchThreadID)
         float3 world = ci.worldOrigin + local * ci.lodScale;
 
         float4 clip = mul(float4(world, 1.0), gViewProj);
-        if (clip.w <= 0.0) continue;
+        if (clip.z <= 0.0) continue;
         float3 ndc = clip.xyz / clip.w;
         ndc.xy += gJitter;
         if (ndc.x < -1.0 || ndc.x > 1.0 ||
@@ -208,7 +210,8 @@ void csmain_pass1_depth(uint3 dt : SV_DispatchThreadID)
 void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
 {
     uint gid = dt.x;
-    if (gid >= gLwPointCount) return;
+    if (gid >= gLwPointCount) 
+        return;
     uint4 item = LookupItem(gid);
     uint slot        = item.x;
     uint blockBase   = item.y;
@@ -242,7 +245,8 @@ void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
         float3 world = ci.worldOrigin + local * ci.lodScale;
 
         float4 clip = mul(float4(world, 1.0), gViewProj);
-        if (clip.w <= 0.0) continue;
+        if (clip.z <= 0.0) 
+            continue;
         float3 ndc = clip.xyz / clip.w;
         ndc.xy += gJitter;
         if (ndc.x < -1.0 || ndc.x > 1.0 ||

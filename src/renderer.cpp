@@ -277,6 +277,18 @@ bool Renderer::CreateDeviceAndSwap(HWND hwnd, int adapterIdx)
         {
             dbg->EnableDebugLayer();
             dxgiFlags |= DXGI_CREATE_FACTORY_DEBUG;
+            // NOTE: GPU-based validation left OFF — the removal is DEVICE_HUNG
+            // (TDR timeout), not a fault, and GBV's 10-100x slowdown would itself
+            // trip TDR and confound the timing. Re-enable to hunt OOB/bad-state.
+        }
+        // DRED: capture auto-breadcrumbs + page-fault VA so a device removal
+        // tells us exactly which op / address faulted.
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred))))
+        {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            std::printf("[d3d12] DRED breadcrumbs + page-fault tracking ENABLED\n");
         }
     }
 #endif
@@ -312,7 +324,9 @@ bool Renderer::CreateDeviceAndSwap(HWND hwnd, int adapterIdx)
         if (SUCCEEDED(device_.As(&iq)))
         {
             iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-            iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
+            // ERROR break OFF for now: let DEVICE_HUNG flow to BeginFrame's DRED
+            // dump (which op/allocation faulted) instead of breaking immediately.
+            iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
         }
     }
 #endif
@@ -487,6 +501,40 @@ void Renderer::BeginFrame(float clear[4], bool skipClear, bool /*skipDsvClear*/)
         if (!printed)
         {
             std::printf("[gpu] DEVICE REMOVED reason=0x%08X\n", (unsigned)removed);
+#if defined(_DEBUG) && !defined(VOXELTEST_XBOX)
+            // DRED: which op/address faulted.
+            ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+            if (SUCCEEDED(device_.As(&dred)))
+            {
+                D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+                if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)))
+                {
+                    std::printf("[dred] --- auto breadcrumbs (last GPU ops) ---\n");
+                    const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode;
+                    int guard = 0;
+                    while (n && guard++ < 32)
+                    {
+                        UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+                        std::printf("[dred] cmdlist '%ls' op %u/%u\n",
+                                    n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"?",
+                                    done, n->BreadcrumbCount);
+                        n = n->pNext;
+                    }
+                }
+                D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+                if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)))
+                {
+                    std::printf("[dred] PAGE FAULT VA = 0x%llx\n",
+                                (unsigned long long)pf.PageFaultVA);
+                    for (const D3D12_DRED_ALLOCATION_NODE* a = pf.pHeadExistingAllocationNode; a; a = a->pNext)
+                        std::printf("[dred]   existing alloc: '%ls' type %d\n",
+                                    a->ObjectNameW ? a->ObjectNameW : L"?", (int)a->AllocationType);
+                    for (const D3D12_DRED_ALLOCATION_NODE* a = pf.pHeadRecentFreedAllocationNode; a; a = a->pNext)
+                        std::printf("[dred]   RECENTLY FREED: '%ls' type %d\n",
+                                    a->ObjectNameW ? a->ObjectNameW : L"?", (int)a->AllocationType);
+                }
+            }
+#endif
             std::fflush(stdout);
             printed = true;
         }
@@ -943,6 +991,7 @@ static uint64_t LatestShaderMtime()
     const wchar_t* paths[] = {
         L"shaders/m4_lw.hlsl",
         L"shaders/m4_taa_post.hlsl",
+        L"shaders/m4_octet.hlsl",
     };
     uint64_t mx = 0;
     for (auto* p : paths)
@@ -1016,6 +1065,9 @@ bool Renderer::RecompileShaders()
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_post",        L"ps_6_0", psPost,"psPost")) return false;
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_godray_mark", L"ps_6_0", psGrMark, "psGrMark")) return false;
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"psmain_godray_blur", L"ps_6_0", psGrBlur, "psGrBlur")) return false;
+    ComPtr<IDxcBlob> vsOct, psOct;
+    if (!comp(L"shaders/m4_octet.hlsl",     L"vsmain_octet",       L"vs_6_0", vsOct, "vsOct")) return false;
+    if (!comp(L"shaders/m4_octet.hlsl",     L"psmain_octet",       L"ps_6_0", psOct, "psOct")) return false;
 
     // Wait for GPU idle before swapping PSOs — old PSOs may still be in flight.
     WaitForGpu();
@@ -1061,6 +1113,31 @@ bool Renderer::RecompileShaders()
     if (!buildGfx(vsTaa.Get(), psGrMark.Get(),DXGI_FORMAT_R8_UNORM,    false, m4GodrayMarkRootSig_.Get(), pgm)) return false;
     if (!buildGfx(vsTaa.Get(), psGrBlur.Get(),DXGI_FORMAT_R8_UNORM,    false, m4GodrayBlurRootSig_.Get(), pgb)) return false;
 
+    // Octet PSO: depth ON (reverse-Z GREATER+write), 2 RTVs (R32_UINT + R32_FLOAT).
+    ComPtr<ID3D12PipelineState> poct;
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC od{};
+        od.pRootSignature = m4OctetRootSig_.Get();
+        od.VS = { vsOct->GetBufferPointer(), vsOct->GetBufferSize() };
+        od.PS = { psOct->GetBufferPointer(), psOct->GetBufferSize() };
+        od.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        od.SampleMask = UINT_MAX;
+        od.SampleDesc.Count = 1;
+        od.NumRenderTargets = 2;
+        od.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
+        od.RTVFormats[1] = DXGI_FORMAT_R32_FLOAT;
+        od.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        od.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        od.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        od.RasterizerState.DepthClipEnable = TRUE;
+        for (auto& bl : od.BlendState.RenderTarget) bl.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        od.DepthStencilState.DepthEnable = TRUE;
+        od.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        od.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+        od.DepthStencilState.StencilEnable = FALSE;
+        if (FAILED(device_->CreateGraphicsPipelineState(&od, IID_PPV_ARGS(&poct)))) return false;
+    }
+
     m4Pass1Pso_       = p1;
     m4Pass2Pso_       = p2;
     m4DilatePso_      = pd;
@@ -1069,6 +1146,7 @@ bool Renderer::RecompileShaders()
     m4PostPso_        = ppost;
     m4GodrayMarkPso_  = pgm;
     m4GodrayBlurPso_  = pgb;
+    m4OctetPso_       = poct;
     return true;
 }
 
@@ -1420,9 +1498,7 @@ bool Renderer::CreateM4()
                     m4PostRootSig_.Get(), m4PostPso_, L"m4PostPso")) return false;
 
     // ---- OctetBillboards graphics PSO (depth ON, reverse-Z GREATER + write) ----
-    // PC only: octet shaders aren't pre-compiled to .cso for Xbox yet, and the
-    // octet path isn't wired on Scarlett (DrawLwScene guards on m4OctetPso_).
-#if !defined(VOXELTEST_XBOX)
+    // Shaders precompiled to .cso for Xbox (see <ShaderEntry> in voxeltest.vcxproj).
     {
         ComPtr<IDxcBlob> vsOct, psOct;
         if (!loadShader(L"shaders/m4_octet.hlsl", L"vsmain_octet", L"vs_6_0", vsOct, "vsOct")) return false;
@@ -1434,8 +1510,9 @@ bool Renderer::CreateM4()
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.SampleMask = UINT_MAX;
         pd.SampleDesc.Count = 1;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = BackBufferFormat();
+        pd.NumRenderTargets = 2;
+        pd.RTVFormats[0] = DXGI_FORMAT_R32_UINT;  // visColor2 (packed color)
+        pd.RTVFormats[1] = DXGI_FORMAT_R32_FLOAT; // visDepth2 (gNearZ/viewZ)
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -1449,7 +1526,6 @@ bool Renderer::CreateM4()
         if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m4OctetPso_)))) return false;
         NameObject(m4OctetPso_.Get(), L"m4OctetPso");
     }
-#endif // !VOXELTEST_XBOX (octet PSO)
 
     // Godray Mark root sig: CBV b0 (frame for gScreenSize), CBV b3 (godray),
     // table SRV t6 (gPostDepth = visDepth2), static linear sampler s0.
@@ -1505,9 +1581,10 @@ bool Renderer::CreateM4()
     if (!buildFsTri(vsTaa.Get(), psGrBlur.Get(), DXGI_FORMAT_R8_UNORM, false,
                     m4GodrayBlurRootSig_.Get(), m4GodrayBlurPso_, L"m4GodrayBlurPso")) return false;
 
-    // RTV heap: 0,1=taaHist 2=taaScene 3=godrayMark 4,5=godrayBlur[1,2].
+    // RTV heap: 0,1=taaHist 2=taaScene 3=godrayMark 4,5=godrayBlur[1,2]
+    //           6=visColor2 7=visDepth2 (octet composite RTVs).
     D3D12_DESCRIPTOR_HEAP_DESC rh{};
-    rh.NumDescriptors = 6;
+    rh.NumDescriptors = 8;
     rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     ThrowIfFailed(device_->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&taaRtvHeap_)),
                   "taa RTV heap");
@@ -1541,7 +1618,10 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rd.MipLevels = 1;
         rd.Format = DXGI_FORMAT_R32_UINT;
         rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        // RENDER_TARGET too: visColor2 is RTV-written by the OctetBillboards pass
+        // (composited over the dilate output). Harmless capability on the others.
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                 | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
@@ -1582,7 +1662,8 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rd.DepthOrArraySize = 1; rd.MipLevels = 1;
         rd.Format = DXGI_FORMAT_R32_FLOAT;
         rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                 | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET; // octet RTV write
         if (FAILED(device_->CreateCommittedResource(
                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
@@ -1697,7 +1778,16 @@ bool Renderer::CreateVisTextures(uint32_t w, uint32_t h)
         rtvGr.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         device_->CreateRenderTargetView(godrayTex_[0].Get(), &rtvGr, h); h.ptr += taaRtvDescSize_;
         device_->CreateRenderTargetView(godrayTex_[1].Get(), &rtvGr, h); h.ptr += taaRtvDescSize_;
-        device_->CreateRenderTargetView(godrayTex_[2].Get(), &rtvGr, h);
+        device_->CreateRenderTargetView(godrayTex_[2].Get(), &rtvGr, h); h.ptr += taaRtvDescSize_;
+        // Octet composite RTVs: 6=visColor2 (R32_UINT), 7=visDepth2 (R32_FLOAT).
+        D3D12_RENDER_TARGET_VIEW_DESC rtvU{};
+        rtvU.Format = DXGI_FORMAT_R32_UINT;
+        rtvU.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        device_->CreateRenderTargetView(visColor2Tex_.Get(), &rtvU, h); h.ptr += taaRtvDescSize_;
+        D3D12_RENDER_TARGET_VIEW_DESC rtvDf{};
+        rtvDf.Format = DXGI_FORMAT_R32_FLOAT;
+        rtvDf.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        device_->CreateRenderTargetView(visDepth2Tex_.Get(), &rtvDf, h);
     }
 
     // Imgui debug previews — reserve 2 slots in imguiSrvHeap_ for godray
@@ -1787,6 +1877,22 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     // ---- Per-LOD draw lists. Walker = port of CSTiles per-cluster recursion.
     struct DrawItem { uint32_t slot, blockFirst, blockCount; };
     std::vector<DrawItem> drawList[lw::kLodCount];
+    // OctetBillboards close ring: only the nearest LOD0 clusters billboard, so
+    // overdraw + instance count stay bounded (the splat covers the rest of LOD0).
+    std::vector<DrawItem> octetDrawList;
+    // Close-ring radius. The in-VS size cull (<8px) already drops octets beyond
+    // ~focalPx/4 world units; this band just caps how many LOD0 octets the VS
+    // even processes. Generous enough to show the close ring at normal distance.
+    const float octetNearDist = 320.0f; // world units
+    // DIAGNOSTIC: flip to false to disable the octet pass entirely (splat-only).
+    // If the GPU still hangs on movement with this off → the hang is in the
+    // splat/streaming/retirement path, NOT the octet.
+    const bool kOctetEnabled = true;
+    // When octet billboards are the close-ring tech, the near LOD0 clusters render
+    // via octet ONLY — they must NOT also go to the splat list, or the close ring
+    // draws twice (splat point-cloud + octet cubes overlapping).
+    const bool useOctet = kOctetEnabled
+                       && (args.tech == RenderTech::OctetBillboards) && m4OctetPso_;
 
     // Recursive lambda via Y-combinator pattern — avoids std::function's
     // type-erased indirect call (was ~0.4ms CPU per frame on busy LOD0).
@@ -1824,9 +1930,19 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
         if (desNearC >= L || !childLoaded || L == 0)
         {
-            drawList[L].push_back({chunkSlot,
-                                   rc.clusterBlockFirst[clSlot],
-                                   rc.clusterBlockCount[clSlot]});
+            // Near LOD0 cluster + octet tech → octet list ONLY (splat skips it).
+            if (L == 0 && useOctet && distNearC < octetNearDist)
+            {
+                octetDrawList.push_back({chunkSlot,
+                                         rc.clusterBlockFirst[clSlot],
+                                         rc.clusterBlockCount[clSlot]});
+            }
+            else
+            {
+                drawList[L].push_back({chunkSlot,
+                                       rc.clusterBlockFirst[clSlot],
+                                       rc.clusterBlockCount[clSlot]});
+            }
             return;
         }
 
@@ -1865,12 +1981,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     // finer LODs near the camera, so LOD0 is the close ring (nearest, finest)
     // and coarser LODs form the far ring. Toggling lets each ring be isolated.
     if (!args.closeEnabled)
+    {
         drawList[0].clear();
+        octetDrawList.clear();
+    }
     if (!args.farEnabled)
         for (int L = 1; L < lw::kLodCount; ++L)
             drawList[L].clear();
 
-    bool anyDraw = false;
+    bool anyDraw = !octetDrawList.empty(); // octet-only views must still render
     for (int L = 0; L < lw::kLodCount; ++L)
         if (!drawList[L].empty()) { anyDraw = true; break; }
     if (!anyDraw) return;
@@ -1910,6 +2029,61 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             cumul += it.blockCount;
         }
         perLodTotal[L] = cumul;
+        // Same runaway guard as the octet path — a corrupt chunk's blockCount
+        // would balloon the splat dispatch and TDR. 50M blocks ≈ absurd.
+        const uint32_t kLodMaxBlocks = 50u * 1000u * 1000u;
+        if (perLodTotal[L] > kLodMaxBlocks)
+        {
+            std::printf("[splat] ASSERT LOD%d total=%u exceeds cap %u (items=%zu)\n",
+                        L, perLodTotal[L], kLodMaxBlocks, wl.size());
+            std::fflush(stdout);
+            assert(perLodTotal[L] <= kLodMaxBlocks && "splat block count runaway");
+            wl.clear(); perLodTotal[L] = 0;
+        }
+    }
+
+    // Octet close-ring worklist (LOD0 near band) — same coalesce as a LOD list.
+    std::vector<WI> octetWl;
+    uint32_t octetTotal = 0;
+    if (!octetDrawList.empty())
+    {
+        auto& dl = octetDrawList;
+        std::sort(dl.begin(), dl.end(),
+                  [](const DrawItem& a, const DrawItem& b) {
+                      if (a.slot != b.slot) return a.slot < b.slot;
+                      return a.blockFirst < b.blockFirst;
+                  });
+        size_t w = 0;
+        for (size_t r = 0; r < dl.size(); ++r) {
+            if (w > 0 && dl[w-1].slot == dl[r].slot &&
+                dl[w-1].blockFirst + dl[w-1].blockCount == dl[r].blockFirst)
+                dl[w-1].blockCount += dl[r].blockCount;
+            else
+                dl[w++] = dl[r];
+        }
+        dl.resize(w);
+        const lw::LODWorld& lwL = lwWorld_.lods[0];
+        octetWl.reserve(dl.size());
+        for (const DrawItem& it : dl) {
+            if (it.blockCount == 0) continue;
+            const lw::RuntimeChunk& rc = lwL.chunks[it.slot];
+            octetWl.push_back({ rc.slotIdx, rc.blockBase + it.blockFirst, it.blockCount, octetTotal });
+            octetTotal += it.blockCount;
+        }
+    }
+    // Safety cap: never hand DrawInstanced a runaway instance count (a corrupt /
+    // garbage worklist would otherwise spin the GPU into a TDR). 10M octets ≈ way
+    // more than any sane close ring; if we hit it something is wrong upstream.
+    {
+        const uint32_t kOctetMaxInstances = 10u * 1000u * 1000u;
+        if (octetTotal > kOctetMaxInstances)
+        {
+            std::printf("[octet] ASSERT octetTotal=%u exceeds cap %u (items=%zu) — skipping octet draw\n",
+                        octetTotal, kOctetMaxInstances, octetWl.size());
+            std::fflush(stdout);
+            assert(octetTotal <= kOctetMaxInstances && "octet instance count runaway");
+            octetTotal = 0; // skip the draw this frame
+        }
     }
 
     // ---- CB layouts (must match m4_lw.hlsl) ----
@@ -2090,48 +2264,25 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         std::memcpy(wlAlloc[L].Memory(), perLodWl[L].data(), perLodWl[L].size() * sizeof(WI));
     }
 
-    // ---- OctetBillboards path ----------------------------------------------
-    // One instanced quad per occupied octet; PS ray-traces the 8 children and
-    // the nearest wins. Renders straight to the backbuffer + main depth (v1, no
-    // TAA/post), replacing the splat pass1/2/dilate/resolve chain.
-    if (args.tech == RenderTech::OctetBillboards && m4OctetPso_)
+    // OctetBillboards composite the LOD0 close ring on top of the splat output
+    // (visColor2/visDepth2) after the dilate — see the sub-pass below.
+    const bool octetClose = useOctet; // (kOctetEnabled gated)
+
+    // Octet worklist + CB allocations (near LOD0 band only).
+    DirectX::GraphicsResource octetCbAlloc, octetWlAlloc;
+    if (octetClose && octetTotal > 0 && !octetWl.empty())
     {
-        MICROPROFILE_SCOPEGPUI("LW/OctetBillboards", 0xff40c0ff);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += SIZE_T(frameIndex_) * rtvDescSize_;
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
-        cmdList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        // Depth already cleared to 0 (reverse-Z far) by BeginFrame; GREATER keeps
-        // the nearest octet.
-        D3D12_VIEWPORT vpr{ 0, 0, (float)width_, (float)height_, 0.0f, 1.0f };
-        D3D12_RECT     scr{ 0, 0, (LONG)width_, (LONG)height_ };
-        cmdList_->RSSetViewports(1, &vpr);
-        cmdList_->RSSetScissorRects(1, &scr);
-        cmdList_->SetGraphicsRootSignature(m4OctetRootSig_.Get());
-        cmdList_->SetPipelineState(m4OctetPso_.Get());
-        cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        cmdList_->SetGraphicsRootConstantBufferView(0, cbfAlloc.GpuAddress());
-        // v1: close ring only (LOD0). Drawing every LOD's octets as billboards is
-        // a massive-overdraw bomb (millions of octets × screen coverage). Far ring
-        // belongs on the splat path; hybrid composite is the next step.
-        for (int L = 0; L < 1; ++L)
-        {
-            if (perLodWl[L].empty() || perLodTotal[L] == 0) continue;
-            const LwGpu& g = lwGpu_[L];
-            if (!g.chunkInfoSb || !g.paletteSb || !g.blockPosSb || !g.blockColSb) continue;
-            cmdList_->SetGraphicsRootConstantBufferView(1, cbcsAlloc[L].GpuAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(3, g.paletteSb->GetGPUVirtualAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(4, g.blockPosSb->GetGPUVirtualAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(5, g.blockColSb->GetGPUVirtualAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(6, wlAlloc[L].GpuAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(7, g.blockVisSb ? g.blockVisSb->GetGPUVirtualAddress()
-                                                                        : g.blockPosSb->GetGPUVirtualAddress());
-            cmdList_->SetGraphicsRootShaderResourceView(8, g.blockAoSb ? g.blockAoSb->GetGPUVirtualAddress()
-                                                                       : g.blockPosSb->GetGPUVirtualAddress());
-            cmdList_->DrawInstanced(4, perLodTotal[L], 0, 0);
-        }
-        return;
+        CBLwCs cbcs{};
+        cbcs.vwSize[0] = visTexW_;
+        cbcs.vwSize[1] = visTexH_;
+        cbcs.pointCount = octetTotal;
+        cbcs.numItems   = (uint32_t)octetWl.size();
+        cbcs.lodIdx     = 0;
+        cbcs.splatRadius = 0;
+        cbcs._pad[0]     = lwGpu_[0].blockAoSb ? (lwGpu_[0].blockCount * 8u) : 0u;  // gAoCount: clamp root-SRV read
+        octetCbAlloc = graphicsMemory_->AllocateConstant(cbcs);
+        octetWlAlloc = graphicsMemory_->Allocate(octetWl.size() * sizeof(WI));
+        std::memcpy(octetWlAlloc.Memory(), octetWl.data(), octetWl.size() * sizeof(WI));
     }
 
     // ---- Bind heap + descriptor handle helpers ----
@@ -2275,9 +2426,65 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cmdList_->Dispatch(gx, gy, 1);
     }
 
-    // Post-dilate: visDepth back to UAV (next frame's pass1 needs it); dilated
-    // outputs UAV → PIXEL_SRV for resolve.
+    // ---- OctetBillboards composite (LOD0 close ring) -----------------------
+    // Renders the near octets over the dilate's visColor2/visDepth2 (MRT) using
+    // an HW depth buffer for octet-vs-octet occlusion. PS discards on miss so the
+    // splat result shows through; close octets (nearest ring) overwrite where hit.
+    bool octetRan = false;
+    if (octetClose && octetTotal > 0 && !octetWl.empty())
     {
+        const LwGpu& g = lwGpu_[0];
+        if (g.chunkInfoSb && g.paletteSb && g.blockPosSb && g.blockColSb)
+        {
+            MICROPROFILE_SCOPEGPUI("LW/OctetBillboards", 0xff40c0ff);
+            octetRan = true;
+            // visColor2 + visDepth2: UAV → RENDER_TARGET.
+            D3D12_RESOURCE_BARRIER tb[2]{};
+            for (int k = 0; k < 2; ++k) {
+                tb[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb[k].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                tb[k].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                tb[k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            tb[0].Transition.pResource = visColor2Tex_.Get();
+            tb[1].Transition.pResource = visDepth2Tex_.Get();
+            cmdList_->ResourceBarrier(2, tb);
+
+            auto rtvStart = taaRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2];
+            rtvs[0] = rtvStart; rtvs[0].ptr += SIZE_T(6) * taaRtvDescSize_; // visColor2
+            rtvs[1] = rtvStart; rtvs[1].ptr += SIZE_T(7) * taaRtvDescSize_; // visDepth2
+            D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+            cmdList_->OMSetRenderTargets(2, rtvs, FALSE, &dsv);
+            cmdList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr); // reverse-Z far
+            D3D12_VIEWPORT vpr{ 0, 0, (float)visTexW_, (float)visTexH_, 0.0f, 1.0f };
+            D3D12_RECT     scr{ 0, 0, (LONG)visTexW_, (LONG)visTexH_ };
+            cmdList_->RSSetViewports(1, &vpr);
+            cmdList_->RSSetScissorRects(1, &scr);
+            cmdList_->SetGraphicsRootSignature(m4OctetRootSig_.Get());
+            cmdList_->SetPipelineState(m4OctetPso_.Get());
+            cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            cmdList_->SetGraphicsRootConstantBufferView(0, cbfAlloc.GpuAddress());
+            cmdList_->SetGraphicsRootConstantBufferView(1, octetCbAlloc.GpuAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(2, g.chunkInfoSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(3, g.paletteSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(4, g.blockPosSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(5, g.blockColSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(6, octetWlAlloc.GpuAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(7, g.blockVisSb ? g.blockVisSb->GetGPUVirtualAddress()
+                                                                        : g.blockPosSb->GetGPUVirtualAddress());
+            cmdList_->SetGraphicsRootShaderResourceView(8, g.blockAoSb ? g.blockAoSb->GetGPUVirtualAddress()
+                                                                       : g.blockPosSb->GetGPUVirtualAddress());
+            cmdList_->DrawInstanced(4, octetTotal, 0, 0);
+            // Left in RENDER_TARGET; the barrier below takes them → PIXEL_SRV.
+        }
+    }
+
+    // Post-dilate: visDepth back to UAV (next frame's pass1 needs it); dilated
+    // outputs (UAV, or RENDER_TARGET if octet composited) → PIXEL_SRV for resolve.
+    {
+        const D3D12_RESOURCE_STATES c2Before = octetRan
+            ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         D3D12_RESOURCE_BARRIER b[4]{};
         b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b[0].Transition.pResource = visDepthTex_.Get();
@@ -2286,12 +2493,12 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b[1].Transition.pResource = visColor2Tex_.Get();
-        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[1].Transition.StateBefore = c2Before;
         b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b[2].Transition.pResource = visDepth2Tex_.Get();
-        b[2].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[2].Transition.StateBefore = c2Before;
         b[2].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         // visAo NON_PIXEL_SRV → UAV for next frame's pass2 write.

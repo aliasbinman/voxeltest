@@ -772,6 +772,24 @@ VSOutOctet vsmain_octet_billboard(uint vid : SV_VertexID)
     uint blockIdx  = vid / 6u;
     uint cornerIdx = vid % 6u;
 
+        // === DEBUG: bypass ALL VS math/buffer reads — emit a tiny fixed quad far in
+    // the frustum. Rules out /0 / NaN in projection producing a degenerate or
+    // infinite primitive (a known GPU-hang cause). occ=0 → PS discards.
+    {
+        float2 dbgMin = float2(0.40, 0.40);
+        float2 dbgMax = float2(0.45, 0.45);
+        float2 c = float2((vid & 1u) ? dbgMax.x : dbgMin.x,
+                          (vid & 2u) ? dbgMax.y : dbgMin.y);
+        o.pos = float4(c, 0.01, 1.0); // far depth (reverse-Z small)
+        o.octMin = 0.0;
+        o.vsize = 1.0;
+        o.occ = 0u;
+        o.blockIdx = 0u;
+        o.palBase = 0u;
+        return o;
+    }
+    
+    
     // Mapping cornerIdx → quad corner index (0..3): 0,1,2, 0,2,3.
     // 0=(mnx,mny) 1=(mxx,mny) 2=(mxx,mxy) 3=(mnx,mxy).
     static const uint kCornerMap[6] = {0u, 1u, 2u, 0u, 2u, 3u};

@@ -4514,7 +4514,9 @@ uint32_t MicroProfileGpuFlipD3D12()
 		uint32_t nPendingFrameStart = nPendingFrameIndex * nFrameQueries;
 		uint32_t nPendingFrameCount = GPU.nSubmitted[nPendingFrameIndex];
 
-		
+		if (nPendingFrameCount)
+		{
+			void* pData = 0;
 			D3D12_RANGE Range = { nPendingFrameStart * sizeof(uint64_t), (nPendingFrameStart + nPendingFrameCount) * sizeof(uint64_t) };
 
 			HRESULT hr = GPU.pBuffer->Map(0, &Range, &pData);

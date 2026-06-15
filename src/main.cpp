@@ -1491,6 +1491,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             auto onLod = [](void* user, int L)
             {
                 lw::World* tls = (lw::World*)user;
+                // Heavy GPU upload prep (staging build, memcpy, resource create,
+                // command-list record) runs HERE on the loader thread so the main
+                // render thread never stalls. Read the THREAD-LOCAL world (nothing
+                // else touches it) — NOT the shared pendingLwWorld, which main can
+                // reset concurrently (race → use-after-free in PrepareLwLod).
+                g_app.renderer.PrepareLwLod(*tls, L);
                 {
                     std::lock_guard<std::mutex> lk(g_app.lodMu[L]);
                     g_app.pendingLwWorld.worldAabbMin[0] = tls->worldAabbMin[0];
@@ -1501,11 +1507,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                     g_app.pendingLwWorld.worldAabbMax[2] = tls->worldAabbMax[2];
                     g_app.pendingLwWorld.lods[L] = std::move(tls->lods[L]);
                 }
-                // Heavy GPU upload prep (staging build, memcpy, resource create,
-                // command-list record) runs HERE on the loader thread so the main
-                // render thread never stalls. Main only executes the recorded copy
-                // (CommitLwLod). lods[L] is owned by the loader until commit.
-                g_app.renderer.PrepareLwLod(g_app.pendingLwWorld, L);
                 g_app.lodReadyFlag[L].store(0);
             };
             bool ok = lw::LoadWorldStreaming(voxPath.c_str(), tlsWorld, err,

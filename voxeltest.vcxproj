@@ -287,6 +287,7 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
   <!-- =================== Shader source files (display only) =================== -->
   <ItemGroup>
     <None Include="shaders\m4_lw.hlsl" />
+    <None Include="shaders\m4_octet.hlsl" />
     <None Include="shaders\m4_taa_post.hlsl" />
     <None Include="shaders\voxel.hlsl" />
     <None Include="shaders\lodworld.hlsl" />
@@ -302,7 +303,7 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
     <CopyFileToFolders Include="xbox_assets\LargeLogo.png" />
     <CopyFileToFolders Include="xbox_assets\StoreLogo.png" />
     <CopyFileToFolders Include="xbox_assets\SplashScreen.png" />
-    <CopyFileToFolders Include="assets\kingslanding_sky.lw">
+    <CopyFileToFolders Include="assets\kingslanding25.lw">
       <DestinationFolders>$(OutDir)</DestinationFolders>
     </CopyFileToFolders>
     <MGCCompile Include="MicrosoftGameConfig.mgc" />
@@ -361,6 +362,16 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
     <ShaderEntry Include="m4_taa_post.hlsl_psmain_godray_blur">
       <Source>shaders\m4_taa_post.hlsl</Source>
       <Entry>psmain_godray_blur</Entry>
+      <Profile>ps_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_octet.hlsl_vsmain_octet">
+      <Source>shaders\m4_octet.hlsl</Source>
+      <Entry>vsmain_octet</Entry>
+      <Profile>vs_6_0</Profile>
+    </ShaderEntry>
+    <ShaderEntry Include="m4_octet.hlsl_psmain_octet">
+      <Source>shaders\m4_octet.hlsl</Source>
+      <Entry>psmain_octet</Entry>
       <Profile>ps_6_0</Profile>
     </ShaderEntry>
   </ItemGroup>
