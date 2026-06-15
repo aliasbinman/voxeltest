@@ -1061,6 +1061,8 @@ bool Renderer::RecompileShaders()
     if (!comp(L"shaders/m4_lw.hlsl",        L"csmain_pass1_depth", L"cs_6_0", cs1, "cs1")) return false;
     if (!comp(L"shaders/m4_lw.hlsl",        L"csmain_pass2_color", L"cs_6_0", cs2, "cs2")) return false;
     if (!comp(L"shaders/m4_lw.hlsl",        L"csmain_dilate",      L"cs_6_0", csDilate, "csDilate")) return false;
+    ComPtr<IDxcBlob> csDilateSw;
+    if (!comp(L"shaders/m4_lw.hlsl",        L"csmain_dilate_swizzle", L"cs_6_0", csDilateSw, "csDilateSw")) return false;
     if (!comp(L"shaders/m4_lw.hlsl",        L"vsmain_resolve",     L"vs_6_0", vsR,   "vsR")) return false;
     if (!comp(L"shaders/m4_lw.hlsl",        L"psmain_resolve",     L"ps_6_0", psR,   "psR")) return false;
     if (!comp(L"shaders/m4_taa_post.hlsl",  L"vsmain_taa",         L"vs_6_0", vsTaa, "vsTaa")) return false;
@@ -1108,10 +1110,11 @@ bool Renderer::RecompileShaders()
         return SUCCEEDED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&outNew)));
     };
 
-    ComPtr<ID3D12PipelineState> p1, p2, pd, prs, ptaa, ppost, pgm, pgb, pgeo;
+    ComPtr<ID3D12PipelineState> p1, p2, pd, pdsw, prs, ptaa, ppost, pgm, pgb, pgeo;
     if (!buildCs(m4Pass1RootSig_.Get(),  cs1.Get(),      p1))   return false;
     if (!buildCs(m4Pass2RootSig_.Get(),  cs2.Get(),      p2))   return false;
     if (!buildCs(m4DilateRootSig_.Get(), csDilate.Get(), pd))   return false;
+    if (!buildCs(m4DilateRootSig_.Get(), csDilateSw.Get(), pdsw)) return false;
     if (!buildGfx(vsR.Get(),   psR.Get(),  DXGI_FORMAT_R11G11B10_FLOAT, false, m4ResolveRootSig_.Get(), prs))   return false;
     if (!buildGfx(vsTaa.Get(), psTaa.Get(),DXGI_FORMAT_R11G11B10_FLOAT, false, m4TaaRootSig_.Get(),     ptaa))  return false;
     if (!buildGfx(vsTaa.Get(), psPost.Get(),BackBufferFormat(),         true,  m4PostRootSig_.Get(),    ppost)) return false;
@@ -1150,6 +1153,7 @@ bool Renderer::RecompileShaders()
     m4Pass1Pso_       = p1;
     m4Pass2Pso_       = p2;
     m4DilatePso_      = pd;
+    m4DilateSwizzlePso_ = pdsw;
     m4ResolvePso_     = prs;
     m4TaaPso_         = ptaa;
     m4PostPso_        = ppost;
@@ -1328,7 +1332,7 @@ bool Renderer::CreateM4()
         aoSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         aoSrvRange.NumDescriptors = 1;
         aoSrvRange.BaseShaderRegister = 2;  // t2 = visAo
-        D3D12_ROOT_PARAMETER p[5]{};
+        D3D12_ROOT_PARAMETER p[6]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor = {0, 0};
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor = {1, 0};
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -1337,9 +1341,12 @@ bool Renderer::CreateM4()
         p[3].DescriptorTable = {1, &uavRange};
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[4].DescriptorTable = {1, &aoSrvRange}; // t2 = visAo splat texture
+        // b2 = per-dispatch base group column (swizzle dilate; 0 otherwise).
+        p[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p[5].Constants = {2, 0, 1}; // register b2, space 0, 1 value
         for (auto& x : p) x.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 5;
+        rsd.NumParameters = 6;
         rsd.pParameters = p;
         if (!buildRootSig(rsd, m4DilateRootSig_, L"m4DilateRootSig")) return false;
     }
@@ -1462,6 +1469,8 @@ bool Renderer::CreateM4()
     if (!loadShader(L"shaders/m4_lw.hlsl",       L"csmain_pass1_depth", L"cs_6_0", cs1,      "cs1")) return false;
     if (!loadShader(L"shaders/m4_lw.hlsl",       L"csmain_pass2_color", L"cs_6_0", cs2,      "cs2")) return false;
     if (!loadShader(L"shaders/m4_lw.hlsl",       L"csmain_dilate",      L"cs_6_0", csDilate, "csDilate")) return false;
+    ComPtr<IDxcBlob> csDilateSw;
+    if (!loadShader(L"shaders/m4_lw.hlsl",       L"csmain_dilate_swizzle", L"cs_6_0", csDilateSw, "csDilateSw")) return false;
     if (!loadShader(L"shaders/m4_lw.hlsl",       L"vsmain_resolve",     L"vs_6_0", vsR,      "vsR")) return false;
     if (!loadShader(L"shaders/m4_lw.hlsl",       L"psmain_resolve",     L"ps_6_0", psR,      "psR")) return false;
     if (!loadShader(L"shaders/m4_taa_post.hlsl", L"vsmain_taa",         L"vs_6_0", vsTaa,    "vsTaa")) return false;
@@ -1473,6 +1482,7 @@ bool Renderer::CreateM4()
     if (!buildComputePso(m4Pass1RootSig_.Get(), cs1.Get(), m4Pass1Pso_, L"m4Pass1Pso")) return false;
     if (!buildComputePso(m4Pass2RootSig_.Get(), cs2.Get(), m4Pass2Pso_, L"m4Pass2Pso")) return false;
     if (!buildComputePso(m4DilateRootSig_.Get(), csDilate.Get(), m4DilatePso_, L"m4DilatePso")) return false;
+    if (!buildComputePso(m4DilateRootSig_.Get(), csDilateSw.Get(), m4DilateSwizzlePso_, L"m4DilateSwizzlePso")) return false;
 
     // Fullscreen-triangle PSO builder. Takes vs + ps + RT format + rootsig.
     auto buildFsTri = [&](IDxcBlob* vs, IDxcBlob* ps, DXGI_FORMAT rt, bool useDsv,
@@ -2270,6 +2280,7 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         // (well, more), but our LOD selection already trades screen-pixels-per-
         // voxel for LOD index. So one global radius is fine for M4c.
         cbcs.splatRadius = std::max(0, args.splatRadius);
+        cbcs._pad[1]     = (uint32_t)std::max(0, args.tileCS); // gTileCS (dilate swizzle)
         cbcsAlloc[L] = graphicsMemory_->AllocateConstant(cbcs);
         wlAlloc[L]   = graphicsMemory_->Allocate(perLodWl[L].size() * sizeof(WI));
         std::memcpy(wlAlloc[L].Memory(), perLodWl[L].data(), perLodWl[L].size() * sizeof(WI));
@@ -2423,7 +2434,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     {
         MICROPROFILE_SCOPEGPUI("LW/Dilate", 0xffd0a0c0);
         cmdList_->SetComputeRootSignature(m4DilateRootSig_.Get());
-        cmdList_->SetPipelineState(m4DilatePso_.Get());
+        // tileCS != 0 → thread-group-ID swizzle variant for L2 locality.
+        cmdList_->SetPipelineState((args.tileCS != 0 && m4DilateSwizzlePso_)
+                                   ? m4DilateSwizzlePso_.Get() : m4DilatePso_.Get());
         D3D12_GPU_VIRTUAL_ADDRESS csCb = 0;
         for (int L = 0; L < lw::kLodCount; ++L)
             if (!perLodWl[L].empty()) { csCb = cbcsAlloc[L].GpuAddress(); break; }
@@ -2434,7 +2447,28 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cmdList_->SetComputeRootDescriptorTable(4, gpu(15));                  // t2 = visAo
         UINT gx = (visTexW_ + 7) / 8;
         UINT gy = (visTexH_ + 7) / 8;
-        cmdList_->Dispatch(gx, gy, 1);
+        if (args.tileCS != 0 && m4DilateSwizzlePso_)
+        {
+            // Tile width in the Z dim, two EXACT dispatches (no over-range groups):
+            //   main slabs cover [0, full*tileW); remainder covers the leftover cols.
+            UINT tileW = (UINT)args.tileCS;
+            UINT full  = gx / tileW;          // whole slabs
+            UINT rem   = gx % tileW;          // leftover columns
+            if (full > 0)
+            {
+                cmdList_->SetComputeRoot32BitConstant(5, 0u, 0);          // base column = 0
+                cmdList_->Dispatch(tileW, gy, full);
+            }
+            if (rem > 0)
+            {
+                cmdList_->SetComputeRoot32BitConstant(5, full * tileW, 0); // base = full*tileW
+                cmdList_->Dispatch(rem, gy, 1);
+            }
+        }
+        else
+        {
+            cmdList_->Dispatch(gx, gy, 1);
+        }
     }
 
     // ---- OctetBillboards composite (LOD0 close ring) -----------------------

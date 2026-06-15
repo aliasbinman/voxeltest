@@ -104,22 +104,22 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="shaders\m4_common.hlsli">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="shaders\m4_frame.hlsli">
+      <Filter>shaders</Filter>
+    </None>
     <None Include="shaders\m4_lw.hlsl">
       <Filter>shaders</Filter>
     </None>
+    <None Include="shaders\m4_octet.hlsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="shaders\m4_octetgeo.hlsl">
+      <Filter>shaders</Filter>
+    </None>
     <None Include="shaders\m4_taa_post.hlsl">
-      <Filter>shaders</Filter>
-    </None>
-    <None Include="shaders\voxel.hlsl">
-      <Filter>shaders</Filter>
-    </None>
-    <None Include="shaders\lodworld.hlsl">
-      <Filter>shaders</Filter>
-    </None>
-    <None Include="shaders\postfx.hlsl">
-      <Filter>shaders</Filter>
-    </None>
-    <None Include="shaders\shading.hlsli">
       <Filter>shaders</Filter>
     </None>
   </ItemGroup>

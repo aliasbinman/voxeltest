@@ -20,7 +20,7 @@ cbuffer CBLwCS : register(b1)
     uint  gLwLodIdx;
     int   gSplatRadius;    // 0 = single pixel; N writes (2N+1)x(2N+1).
     uint  gAoCount;        // gLwBlockAo element count (blockCount*8); 0 = no AO buffer
-    uint  _padCs;
+    uint  gTileCS;         // thread-group swizzle tile width (0 = off / linear)
 };
 
 struct LwChunkInfo

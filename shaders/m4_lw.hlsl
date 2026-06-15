@@ -254,259 +254,167 @@ float3 SkyDome(float3 rd)
 // Pick nearest hit; output that color. Eliminates the "constant-color square"
 // artifact of nearest-neighbor dilate by giving each output pixel its own
 // geometrically-correct color.
-[numthreads(8, 8, 1)]
-void csmain_dilate(uint3 dt : SV_DispatchThreadID)
+// Shared dilate body — `pix` is the output pixel (raw dispatch or swizzled).
+void DilateAt(int2 pix)
 {
-    int2 pix = int2(dt.xy);
     int W = (int)gVwSize.x;
     int H = (int)gVwSize.y;
     if (pix.x >= W || pix.y >= H) return;
 
     float3 ro = gCamPos;
     float2 invScreen = float2(1.0 / (float)W, 1.0 / (float)H);
-    float3 rd = PixelWorldDir(float2(pix) + 0.5, invScreen);
-    float3 invRd = 1.0 / rd;
+    int    R = max(1, gSplatRadius);
 
-    int  R     = max(1, gSplatRadius);
-
-    // Two candidates:
-    //   bestHit  = AABB hit on an exposed face (sharp per-pixel face shading)
-    //   fallback = nearest-depth valid neighbor center (triplanar splat shading
-    //              for pixels where no exposed-face AABB hit reaches us — small
-    //              distant voxels where the surface sub-sample misses)
-    float bestT       = 1e30;
-    uint  bestPck     = 0;
-    uint  bestFace    = 0;
-    int2  bestSp      = pix;   // source pixel of bestPck (for AO lookup)
-    bool  haveHit     = false;
-    float fbBestD     = 1e30;
-    uint  fbPck       = 0;
-    float3 fbCenter   = float3(0, 0, 0);
-    bool  haveFb      = false;
-
-    [loop] for (int dy = -R; dy <= R; ++dy) {
-    [loop] for (int dx = -R; dx <= R; ++dx) {
-        int2 sp = pix + int2(dx, dy);
-        if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
-        uint c = gDilateColorIn.Load(int3(sp, 0));
-        if (c == 0) continue;
-        uint d = gDilateDepthSrv.Load(int3(sp, 0));
-        if (d == 0xFFFFFFFFu) continue;
-
-        float viewZ = (float)d / kLinDepthScale;
-        float2 uvN  = (float2(sp) + 0.5) * invScreen;
-        float ndcX = uvN.x * 2.0 - 1.0;
-        float ndcY = 1.0 - uvN.y * 2.0;
-        float vx = ndcX * gAspect * gTanHalfFovY * viewZ;
-        float vy = ndcY * gTanHalfFovY * viewZ;
-        float3 worldN = ro + gCamRight * vx + gCamUp * vy + gCamForward * viewZ;
-
-        // Derive LOD from depth so AABB matches actual voxel size. CPU LOD
-        // selection uses focalPx*(2^L)/dist >= 1/lodScale; reverse:
-        //   2^L ≈ viewZ * thresh / focalPx
-        // For thresh=1 (default lodScale=1): L ≈ log2(viewZ / focalPx).
-        float focalPx = gScreenSize.y * 0.5 / gTanHalfFovY;
-        float Lf = log2(max(viewZ / focalPx, 1.0));
-        int lodIdx = (int)clamp(floor(Lf), 0.0, 4.0);
-        float S = (float)(1u << lodIdx);
-
-        // Track nearest-depth fallback for triplanar splat lighting.
-        if (viewZ < fbBestD) {
-            fbBestD  = viewZ;
-            fbPck    = c;
-            float3 vmin0 = floor(worldN / S) * S;
-            fbCenter = vmin0 + S * 0.5;
-            haveFb = true;
+    // Source select: if THIS pixel is itself a splat hit, use it directly — no
+    // search (the old ray-AABB reconstruction could miss a pixel's own splat).
+    // Otherwise expand square rings outward; the FIRST ring containing any hit
+    // wins, and within that ring the nearest-depth hit is taken.
+    uint  pck   = 0;
+    int2  srcSp = pix;
+    float viewZ = 0.0;
+    bool  found = false;
+    {
+        uint c0 = gDilateColorIn.Load(int3(pix, 0));
+        uint d0 = gDilateDepthSrv.Load(int3(pix, 0));
+        if (c0 != 0u && d0 != 0xFFFFFFFFu) {
+            pck = c0; srcSp = pix; viewZ = (float)d0 / kLinDepthScale; found = true;
+        } else {
+            float bestD = 1e30;
+            [loop] for (int r = 1; r <= R && !found; ++r) {
+                bool ringHit = false;
+                [loop] for (int dy = -r; dy <= r; ++dy)
+                [loop] for (int dx = -r; dx <= r; ++dx) {
+                    if (max(abs(dx), abs(dy)) != r) continue;   // ring perimeter only
+                    int2 sp = pix + int2(dx, dy);
+                    if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
+                    uint c = gDilateColorIn.Load(int3(sp, 0));
+                    if (c == 0u) continue;
+                    uint d = gDilateDepthSrv.Load(int3(sp, 0));
+                    if (d == 0xFFFFFFFFu) continue;
+                    float vz = (float)d / kLinDepthScale;
+                    if (vz < bestD) { bestD = vz; pck = c; srcSp = sp; }
+                    ringHit = true;
+                }
+                if (ringHit) { found = true; viewZ = bestD; }
+            }
         }
-
-        float3 vmin = floor(worldN / S) * S;
-        float3 vmax = vmin + S;
-        float3 t0v = (vmin - ro) * invRd;
-        float3 t1v = (vmax - ro) * invRd;
-        float3 tmn = min(t0v, t1v);
-        float3 tmx = max(t0v, t1v);
-        float tNear = max(max(tmn.x, tmn.y), tmn.z);
-        float tFar  = min(min(tmx.x, tmx.y), tmx.z);
-        if (tFar < 0.0 || tNear > tFar) continue;
-        float tHit = max(tNear, 0.0);
-
-        uint face;
-        if (tNear == tmn.x)      face = (rd.x > 0.0) ? 1u : 0u;
-        else if (tNear == tmn.y) face = (rd.y > 0.0) ? 3u : 2u;
-        else                     face = (rd.z > 0.0) ? 5u : 4u;
-
-        // visMask face rejection disabled — until pass2 encodes lodIdx, the
-        // shader-derived LOD can put the AABB on a sub-cell of the real voxel,
-        // making ray-entry face unreliable vs the voxel's true visMask.
-        if (tHit < bestT) {
-            bestT    = tHit;
-            bestPck  = c;
-            bestFace = face;
-            bestSp   = sp;
-            haveHit  = true;
-        }
-    }}
-
-    if (!haveHit) {
-        // No ray-AABB hit at this pixel → sky. Write 0 color AND 0 depth so
-        // TAA / post both treat this pixel as sky (no reprojection from fake
-        // depth that would bleed neighbor color into history).
+    }
+    if (!found) {
         gDilateColorOut[pix] = 0;
         gDilateDepthOut[pix] = 0.0;
         return;
     }
 
-    // Depth in CSTiles form: d = gNearZ / viewZ. psmain_taa reads as
-    // Texture2D<float> and recovers viewZ = gNearZ / d.
-    float viewZOut;
-    if (haveHit) {
-        float3 hitPos = ro + rd * bestT;
-        viewZOut = max(0.001, dot(hitPos - gCamPos, gCamForward));
-    } else {
-        viewZOut = fbBestD;
-    }
-    gDilateDepthOut[pix] = gNearZ / max(viewZOut, 1e-4);
+    // Reconstruct the chosen voxel's centre from (srcSp, viewZ) for triplanar
+    // shading. LOD (voxel size S) derived from depth, same as pass2's selection.
+    int2  aoSp = srcSp;
+    float2 uvN  = (float2(srcSp) + 0.5) * invScreen;
+    float ndcX = uvN.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uvN.y * 2.0;
+    float vx = ndcX * gAspect * gTanHalfFovY * viewZ;
+    float vy = ndcY * gTanHalfFovY * viewZ;
+    float3 worldN = ro + gCamRight * vx + gCamUp * vy + gCamForward * viewZ;
+    float focalPx = gScreenSize.y * 0.5 / gTanHalfFovY;
+    int   lodIdx = (int)clamp(floor(log2(max(viewZ / focalPx, 1.0))), 0.0, 4.0);
+    float S = (float)(1u << lodIdx);
+    float3 centerW = floor(worldN / S) * S + S * 0.5;
 
-    // Decode raw albedo + visMask.
-    uint mask = (bestPck >> 24) & 0x3Fu;
+    gDilateDepthOut[pix] = gNearZ / max(viewZ, 1e-4);
+
+    // Decode raw albedo + visMask; triplanar normal from camera→centre direction,
+    // visMask-gated and weighted by projected face area (vdir.axis²).
+    uint mask = (pck >> 24) & 0x3Fu;
     float3 albedo = float3(
-        (float)( bestPck        & 0xFFu) / 255.0,
-        (float)((bestPck >>  8) & 0xFFu) / 255.0,
-        (float)((bestPck >> 16) & 0xFFu) / 255.0);
+        (float)( pck        & 0xFFu) / 255.0,
+        (float)((pck >>  8) & 0xFFu) / 255.0,
+        (float)((pck >> 16) & 0xFFu) / 255.0);
 
-    float  NdotL;
-    float3 Nshade;       // kFaceN comes from m4_common.hlsli
-#if USE_HIT_FACE
-    // --- Mode 1: per-pixel hit-face (sharp) ---
-    if (haveHit)
-    {
-        Nshade = kFaceN[bestFace];
-        NdotL  = max(0.0, dot(Nshade, gLightDir));
-    }
-    else
-    {
-        // No hit → triplanar fallback against fb neighbor's center.
-        float3 vdir = normalize(gCamPos - fbCenter);
-        uint fb0 = (vdir.x >= 0.0) ? 0u : 1u;
-        uint fb1 = (vdir.y >= 0.0) ? 2u : 3u;
-        uint fb2 = (vdir.z >= 0.0) ? 4u : 5u;
-        float w0 = ((mask >> fb0) & 1u) ? vdir.x * vdir.x : 0.0;
-        float w1 = ((mask >> fb1) & 1u) ? vdir.y * vdir.y : 0.0;
-        float w2 = ((mask >> fb2) & 1u) ? vdir.z * vdir.z : 0.0;
-        float wsum = max(1e-4, w0 + w1 + w2);
-        w0 /= wsum; w1 /= wsum; w2 /= wsum;
-        float3 N0 = float3(sign(vdir.x), 0, 0);
-        float3 N1 = float3(0, sign(vdir.y), 0);
-        float3 N2 = float3(0, 0, sign(vdir.z));
-        Nshade = normalize(w0 * N0 + w1 * N1 + w2 * N2);
-        NdotL  = w0 * max(0.0, dot(N0, gLightDir))
-               + w1 * max(0.0, dot(N1, gLightDir))
-               + w2 * max(0.0, dot(N2, gLightDir));
-    }
-#else
-    // --- Mode 0: triplanar visMask-weighted (smooth, always used) ---
-    // Pick voxel center: AABB-hit position if we got one, else fallback
-    // neighbor center. Same triplanar formula either way.
-    float3 centerW = haveHit ? floor((ro + rd * bestT) / 1.0) + 0.5
-                              : fbCenter;
     float3 vdir = normalize(gCamPos - centerW);
-    uint fb0 = (vdir.x >= 0.0) ? 0u : 1u;
-    uint fb1 = (vdir.y >= 0.0) ? 2u : 3u;
-    uint fb2 = (vdir.z >= 0.0) ? 4u : 5u;
-    float w0 = ((mask >> fb0) & 1u) ? vdir.x * vdir.x : 0.0;
-    float w1 = ((mask >> fb1) & 1u) ? vdir.y * vdir.y : 0.0;
-    float w2 = ((mask >> fb2) & 1u) ? vdir.z * vdir.z : 0.0;
+    uint f0 = (vdir.x >= 0.0) ? 0u : 1u;
+    uint f1 = (vdir.y >= 0.0) ? 2u : 3u;
+    uint f2 = (vdir.z >= 0.0) ? 4u : 5u;
+    float w0 = ((mask >> f0) & 1u) ? vdir.x * vdir.x : 0.0;
+    float w1 = ((mask >> f1) & 1u) ? vdir.y * vdir.y : 0.0;
+    float w2 = ((mask >> f2) & 1u) ? vdir.z * vdir.z : 0.0;
     float wsum = max(1e-4, w0 + w1 + w2);
     w0 /= wsum; w1 /= wsum; w2 /= wsum;
     float3 N0 = float3(sign(vdir.x), 0, 0);
     float3 N1 = float3(0, sign(vdir.y), 0);
     float3 N2 = float3(0, 0, sign(vdir.z));
-    Nshade = normalize(w0 * N0 + w1 * N1 + w2 * N2);
-    NdotL  = w0 * max(0.0, dot(N0, gLightDir))
-           + w1 * max(0.0, dot(N1, gLightDir))
-           + w2 * max(0.0, dot(N2, gLightDir));
-#endif
+    float3 Nshade = normalize(w0 * N0 + w1 * N1 + w2 * N2);
+    float  NdotL  = w0 * max(0.0, dot(N0, gLightDir))
+                  + w1 * max(0.0, dot(N1, gLightDir))
+                  + w2 * max(0.0, dot(N2, gLightDir));
+    uint   domFace = (w0 >= w1 && w0 >= w2) ? f0 : (w1 >= w2 ? f1 : f2);
 
     float3 lit;
     if ((int)gMode == 2)
     {
         const float3 kFaceColor[6] = {
-            float3(1.0, 0.2, 0.2),
-            float3(1.0, 0.2, 1.0),
-            float3(0.2, 1.0, 0.2),
-            float3(1.0, 0.5, 0.1),
-            float3(0.2, 0.4, 1.0),
-            float3(0.2, 1.0, 1.0),
+            float3(1.0, 0.2, 0.2), float3(1.0, 0.2, 1.0),
+            float3(0.2, 1.0, 0.2), float3(1.0, 0.5, 0.1),
+            float3(0.2, 0.4, 1.0), float3(0.2, 1.0, 1.0),
         };
-        // Hit path: per-pixel face color. Fallback path: gray (triplanar).
-        lit = haveHit ? kFaceColor[bestFace] : float3(0.5, 0.5, 0.5);
+        lit = kFaceColor[domFace];           // dominant triplanar face
     }
     else if ((int)gMode == 3)
     {
-        // AO viz: low 24 bits of bestPck carry 6 faces * 4-bit baked AO. Index
-        // by the true ray-AABB hit face (view-independent). Fallback pixels
-        // (no hit) average visible faces so they stay stable under camera move.
-        uint aoW = bestPck & 0x00FFFFFFu;
-        float ao;
-        if (haveHit)
-        {
-            ao = (float)((aoW >> (bestFace * 4u)) & 0xFu) * (1.0 / 15.0);
+        // AO viz: average the visible faces' baked AO (low 24 bits of pck) — stable
+        // under camera move (no per-pixel face now).
+        uint aoW = pck & 0x00FFFFFFu;
+        float s = 0.0; uint n = 0u;
+        [unroll]
+        for (uint f = 0u; f < 6u; ++f) {
+            if (((mask >> f) & 1u) == 0u) continue;
+            s += (float)((aoW >> (f * 4u)) & 0xFu) * (1.0 / 15.0); ++n;
         }
-        else
-        {
-            float s = 0.0; uint n = 0u;
-            [unroll]
-            for (uint f = 0u; f < 6u; ++f)
-            {
-                if (((mask >> f) & 1u) == 0u) continue;
-                s += (float)((aoW >> (f * 4u)) & 0xFu) * (1.0 / 15.0);
-                ++n;
-            }
-            ao = (n > 0u) ? (s / (float)n) : 1.0;
-        }
+        float ao = (n > 0u) ? (s / (float)n) : 1.0;
         lit = float3(ao, ao, ao);
     }
     else
     {
-        // Per-face baked AO from the splat winner pixel, indexed by the true hit
-        // face (same data the AO-viz shows). Attenuates ambient/indirect only —
-        // direct sun stays full so lit faces aren't muddied.
-        uint  aoPck = gDilateAoIn.Load(int3(bestSp, 0));
-        float ao;
-        if (haveHit)
-        {
-            ao = (float)((aoPck >> (bestFace * 4u)) & 0xFu) * (1.0 / 15.0);
+        // Per-face baked AO from the source pixel, averaged over visible faces.
+        uint  aoPck = gDilateAoIn.Load(int3(aoSp, 0));
+        float s = 0.0; uint n = 0u;
+        [unroll]
+        for (uint f = 0u; f < 6u; ++f) {
+            if (((mask >> f) & 1u) == 0u) continue;
+            s += (float)((aoPck >> (f * 4u)) & 0xFu) * (1.0 / 15.0); ++n;
         }
-        else
-        {
-            float s = 0.0; uint n = 0u;
-            [unroll]
-            for (uint f = 0u; f < 6u; ++f)
-            {
-                if (((mask >> f) & 1u) == 0u) continue;
-                s += (float)((aoPck >> (f * 4u)) & 0xFu) * (1.0 / 15.0);
-                ++n;
-            }
-            ao = (n > 0u) ? (s / (float)n) : 1.0;
-        }
+        float ao = (n > 0u) ? (s / (float)n) : 1.0;
         float3 sunCol = float3(1.0, 0.95, 0.85) * (gSunIntensity * 3.0);
         float3 amb    = AmbientCube(Nshade) * gAmbient;
-        float3 light  = amb + NdotL * sunCol;
-        lit = albedo * light;
-        // AO darkens the whole result (ambient + direct). No sun-shadow pass in
-        // this path, so baked AO doubles as contact shadow. gAoStrength = 0..1.
-        lit *= lerp(1.0, ao, gAoStrength);
-        // Fog applied in world space — distance + height-based attenuation
-        // matching CSTiles ApplyFog. Hit pixels use ray-AABB hit position;
-        // fallback pixels use fbCenter (close enough — neighbor's voxel).
-        float3 wposShade = haveHit ? (ro + rd * bestT) : fbCenter;
-        lit = ApplyFog(lit, wposShade);
+        lit = albedo * (amb + NdotL * sunCol);
+        lit *= lerp(1.0, ao, gAoStrength);   // baked AO doubles as contact shadow
+        lit = ApplyFog(lit, centerW);
     }
 
     uint rR = (uint)clamp(lit.r * 255.0, 0.0, 255.0);
     uint rG = (uint)clamp(lit.g * 255.0, 0.0, 255.0);
     uint rB = (uint)clamp(lit.b * 255.0, 0.0, 255.0);
     gDilateColorOut[pix] = 0xFF000000u | (rB << 16) | (rG << 8) | rR;
+}
+
+// Linear dispatch: pixel = SV_DispatchThreadID.
+[numthreads(8, 8, 1)]
+void csmain_dilate(uint3 dt : SV_DispatchThreadID)
+{
+    DilateAt(int2(dt.xy));
+}
+
+// Per-dispatch base group column (root constant b2). The CPU issues two EXACT
+// dispatches so no group is ever out of the X range:
+//   main:      Dispatch(gTileCS, gridY, gridX / gTileCS),  gColumnBase = 0
+//   remainder: Dispatch(gridX % gTileCS, gridY, 1),        gColumnBase = full*tileW
+// Groups scheduled together cover a gTileCS-wide vertical strip (L2-friendly).
+cbuffer CBDilateBase : register(b2) { uint gColumnBase; }
+
+[numthreads(8, 8, 1)]
+void csmain_dilate_swizzle(uint3 GTid : SV_GroupThreadID, uint3 GId : SV_GroupID)
+{
+    uint column = gColumnBase + GId.x + GId.z * gTileCS;  // real group column
+    uint2 pix   = uint2(column * 8u, GId.y * 8u) + GTid.xy;
+    DilateAt(int2(pix));
 }
 
 // ============================================================

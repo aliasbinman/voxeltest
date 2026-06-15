@@ -329,6 +329,11 @@ xcopy /Y /Q "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxil.dll" "$(OutDi
       <Entry>csmain_dilate</Entry>
       <Profile>cs_6_0</Profile>
     </ShaderEntry>
+    <ShaderEntry Include="m4_lw.hlsl_csmain_dilate_swizzle">
+      <Source>shaders\m4_lw.hlsl</Source>
+      <Entry>csmain_dilate_swizzle</Entry>
+      <Profile>cs_6_0</Profile>
+    </ShaderEntry>
     <ShaderEntry Include="m4_lw.hlsl_vsmain_resolve">
       <Source>shaders\m4_lw.hlsl</Source>
       <Entry>vsmain_resolve</Entry>

@@ -71,6 +71,7 @@ struct DrawSceneParams
     bool  enableBillboard = true;
     bool  enableGeo       = true;
     float geoMinPx        = 8.0f;
+    int   tileCS          = 0;   // dilate thread-group swizzle tile width (0 = off)
     PointLighting pointLight = PointLighting::Complex;
     PointLod pointLod = PointLod::Auto;
     float pointLodScale = 1.0f;
@@ -376,6 +377,7 @@ private:
     ComPtr<ID3D12PipelineState>       m4Pass1Pso_;
     ComPtr<ID3D12PipelineState>       m4Pass2Pso_;
     ComPtr<ID3D12PipelineState>       m4DilatePso_;
+    ComPtr<ID3D12PipelineState>       m4DilateSwizzlePso_; // L2-locality group swizzle
     ComPtr<ID3D12PipelineState>       m4ResolvePso_;
     ComPtr<ID3D12PipelineState>       m4TaaPso_;
     ComPtr<ID3D12PipelineState>       m4PostPso_;

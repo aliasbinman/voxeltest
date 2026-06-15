@@ -135,6 +135,7 @@ struct AppState
     bool  enableBillboard = true;
     bool  enableGeo       = true;
     float geoMinPx        = 8.0f;
+    int   tileCS          = 0;   // dilate group-swizzle tile width (0 = off)
     float sunPitchDeg = 10.0f;
     float sunYawDeg = 63.0f;
     float sunIntensityEV = 0.0f; // log2 stops; linear = 2^EV
@@ -1262,6 +1263,14 @@ void FrameControlsWindow()
             ImGui::EndGroup();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Opts"))
+        {
+            ImGui::TextUnformatted("Dilate compute (full-screen pass):");
+            ImGui::SliderInt("tileCS", &g_app.tileCS, 0, 128);
+            ImGui::TextDisabled("0 = linear dispatch. >0 = NVIDIA thread-group-ID");
+            ImGui::TextDisabled("swizzle (L2 locality), tile width in 8x8 groups.");
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
 
@@ -1810,6 +1819,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.enableBillboard = g_app.enableBillboard;
             ps.enableGeo       = g_app.enableGeo;
             ps.geoMinPx        = g_app.geoMinPx;
+            ps.tileCS          = g_app.tileCS;
             ps.pointLight = g_app.pointLight;
             ps.pointLod = g_app.pointLod;
             ps.pointLodScale = g_app.pointLodScale;
