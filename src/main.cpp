@@ -134,6 +134,7 @@ struct AppState
     bool  enableSplat     = true;
     bool  enableBillboard = true;
     bool  enableGeo       = true;
+    bool  splatOnlyDebug  = false;
     float geoMinPx        = 8.0f;
     int   tileCS          = 0;   // dilate group-swizzle tile width (0 = off)
     float sunPitchDeg = 10.0f;
@@ -159,9 +160,9 @@ struct AppState
     bool splatDilate2Pass = false;
     int splatRadius = 1; // CS dilation half-window in pixels
     int fogMode = 1;     // 0 = off, 1 = depth (drives effFogDensity gating)
-    float fogDensity = 0.0004f;
+    float fogDensity = 0.00025f;
     float fogColor[3] = {0.55f, 0.60f, 0.70f};
-    float heightFogDensity = 4.5f;  // 0 = off
+    float heightFogDensity = 3.5f;  // 0 = off
     float heightFogFalloff = 0.05f; // exp falloff per unit height
     float heightFogStart = -6.5f;   // world Y of fog ground plane
     float godrayStrength = 0.55f;
@@ -1087,6 +1088,7 @@ void FrameControlsWindow()
         ImGui::PushItemWidth(120.0f);
         ImGui::DragFloat("Geo kicks in (px)", &g_app.geoMinPx, 0.1f, 0.0f, 256.0f, "%.1f");
         ImGui::PopItemWidth();
+        ImGui::Checkbox("DEBUG: splat-only (skip billboard/geo, debug dilate)", &g_app.splatOnlyDebug);
         ImGui::TextDisabled("Billboard kicks in at %.1f px (splatRadius*2)", bbPx);
         if (g_app.geoMinPx < bbPx)
             ImGui::TextDisabled("(Geo < Billboard -> Geo disabled)");
@@ -1818,6 +1820,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ps.enableSplat     = g_app.enableSplat;
             ps.enableBillboard = g_app.enableBillboard;
             ps.enableGeo       = g_app.enableGeo;
+            ps.splatOnlyDebug  = g_app.splatOnlyDebug;
             ps.geoMinPx        = g_app.geoMinPx;
             ps.tileCS          = g_app.tileCS;
             ps.pointLight = g_app.pointLight;

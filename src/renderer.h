@@ -70,6 +70,7 @@ struct DrawSceneParams
     bool  enableSplat     = true;
     bool  enableBillboard = true;
     bool  enableGeo       = true;
+    bool  splatOnlyDebug  = false; // force all clusters to splat path (debug dilate)
     float geoMinPx        = 8.0f;
     int   tileCS          = 0;   // dilate thread-group swizzle tile width (0 = off)
     PointLighting pointLight = PointLighting::Complex;

@@ -275,7 +275,7 @@ float3 SkyDome(float3 rd)
 // artifact of nearest-neighbor dilate by giving each output pixel its own
 // geometrically-correct color.
 // Shared dilate body — `pix` is the output pixel (raw dispatch or swizzled).
-void DilateAtRef(int2 pix)
+void DilateAt(int2 pix)
 {
     int W = (int)gVwSize.x;
     int H = (int)gVwSize.y;
@@ -355,157 +355,11 @@ void DilateAtRef(int2 pix)
     gDilateDepthOut[pix] = 0.0;
 }
 
-static const int pxPadMax = 3;                          // max supported radius
-static const int groupSz   = 8;
-static const int PadSz     = groupSz + pxPadMax + pxPadMax;   // 14 (fixed stride)
-
-// Window cache: the dilate scans an (8+2R)x(8+2R) neighbourhood per output
-// pixel. The whole 8x8 group only touches one such screen region, so cache it
-// once in LDS. The reconstructed voxel AABB (vmin + size S) for a cell depends
-// ONLY on that cell's screen pos + depth — not on the output pixel — so it's
-// identical for every one of the 64 threads that scan it. We therefore do the
-// expensive reconstruction (log2/floor/divide) ONCE per window cell in the fill
-// and cache the AABB; the inner loop then only runs the cheap RayAabb. Colour is
-// NOT cached: the scan is pure geometry, so we resolve the single winning cell
-// and do ONE texture Load for its (already-lit) colour at the end. Splats are
-// co-located (pass1 depth + pass2 colour hit the same pixel), so valid depth
-// implies a colour — except pass2's grazing back-face skip, guarded by the c!=0
-// fallback. The arrays are sized for Rmax=3 (14x14=196); smaller R uses a
-// centred sub-region at the same fixed stride. Off-screen / empty cells store
-// the d==0xFFFFFFFF sentinel so the scan's skip covers edges with no bounds test.
-groupshared uint   gsDepth[PadSz * PadSz];
-groupshared float3 gsVmin [PadSz * PadSz];   // reconstructed voxel min corner
-groupshared float  gsScale[PadSz * PadSz];   // voxel size S (LOD-derived)
-
-void DilateAt(int2 pix, int2 gtid)
-{
-    int R = max(gSplatRadius, 1);
-    if (R > pxPadMax)
-        return DilateAtRef(pix);                // beyond cache size: scalar path
-
-    int W = (int) gVwSize.x;
-    int H = (int) gVwSize.y;
-
-    float3 ro = gCamPos;
-    float2 invScreen = float2(1.0 / (float) W, 1.0 / (float) H);
-    float  focalPx = gScreenSize.y * 0.5 / gTanHalfFovY;
-
-    // Fill the (8+2R)x(8+2R) LDS window (8x8 group + R px pad each side, stored
-    // at fixed stride PadSz). winOrigin is the top-left screen pixel of the
-    // window; its centre 8x8 is this group's output. For each occupied cell,
-    // reconstruct its voxel AABB ONCE here (shared by all threads that scan it).
-    int  ext = groupSz + R + R;                 // window width this dispatch
-    int2 winOrigin = (pix - gtid) - int2(R, R);
-    int  tid = gtid.y * groupSz + gtid.x;       // 0..63
-    [loop] for (int k = tid; k < ext * ext; k += groupSz * groupSz)
-    {
-        int  lx = k % ext, ly = k / ext;
-        int2 sp = winOrigin + int2(lx, ly);
-        int  slot = ly * PadSz + lx;            // fixed-stride LDS slot
-        uint d = 0xFFFFFFFFu;
-        if (sp.x >= 0 && sp.x < W && sp.y >= 0 && sp.y < H)
-            d = gDilateDepthSrv.Load(int3(sp, 0));
-        gsDepth[slot] = d;
-        if (d != 0xFFFFFFFFu)
-        {
-            float vzN = (float) d / kLinDepthScale;
-            float2 uvN = (float2(sp) + 0.5) * invScreen;
-            float nX = uvN.x * 2.0 - 1.0;
-            float nY = 1.0 - uvN.y * 2.0;
-            float3 worldN = ro + gCamRight * (nX * gAspect * gTanHalfFovY * vzN)
-                          + gCamUp * (nY * gTanHalfFovY * vzN)
-                          + gCamForward * vzN;
-            int   lod = (int) clamp(floor(log2(max(vzN / focalPx, 1.0))), 0.0, 4.0);
-            float S   = (float) (1u << lod);
-            gsScale[slot] = S;
-            gsVmin[slot]  = floor(worldN / S) * S;
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Bounds return AFTER the fill+barrier so no thread skips the sync.
-    if (pix.x >= W || pix.y >= H)
-        return;
-
-    // Every pixel (even one with its own splat) ray-AABBs the whole window incl.
-    // its own voxel (dx=dy=0): a NEARER neighbour voxel along this pixel's ray
-    // can occlude the pixel's own (farther) splat, so we take the closest hit
-    // across all of them. The nearest real hit spreads that voxel's already-lit
-    // colour → tight silhouettes. The scan is depth-only: it just records WHICH
-    // cell wins (its screen pos + view depth). The fixup fallback (ray reaches
-    // nothing → deep gaps) takes the nearest-depth cell. Colour for the winner is
-    // fetched once at the end with a single texture Load — no colour in LDS.
-    float3 rd = PixelWorldDir(float2(pix) + 0.5, invScreen);
-    float3 invRd = 1.0 / rd;
-
-    float bestT = 1e30;
-    int2  raySp = int2(0, 0);
-    float rayViewZ = 0.0;
-    bool  rayHit = false;
-    int2  fixSp = int2(0, 0);
-    uint  bestD = 0xFFFFFFFFu;
-    [loop]
-    for (int dy = -R; dy <= R; ++dy)
-    [loop]
-        for (int dx = -R; dx <= R; ++dx)
-        {
-            // Read the pre-reconstructed AABB from the LDS window. Local index =
-            // (group thread + pad + delta); off-screen cells carry the d sentinel
-            // so this skip also covers screen edges with no per-cell bounds test.
-            int  lidx = (gtid.y + R + dy) * PadSz + (gtid.x + R + dx);
-            uint d = gsDepth[lidx];
-            if (d == 0xFFFFFFFFu)
-                continue;
-
-            int2 sp = pix + int2(dx, dy);
-            // Nearest-depth cell tracked for the fixup fallback.
-            if (d < bestD) { bestD = d; fixSp = sp; }
-
-            // Primary: ray-AABB vs the cached voxel AABB. Cheap — no reconstruct.
-            float3 vmin = gsVmin[lidx];
-            float  S    = gsScale[lidx];
-            float tHit;
-            uint face;
-            if (RayAabb(ro, rd, invRd, vmin, vmin + S, 0x3Fu, tHit, face) && tHit < bestT)
-            {
-                bestT = tHit;
-                raySp = sp;
-                rayViewZ = max(0.001, dot((ro + rd * tHit) - gCamPos, gCamForward));
-                rayHit = true;
-            }
-        }
-
-    // Single colour Load for the winning cell. Guard c!=0: a cell can hold depth
-    // but no colour (pass2 grazing back-face skip) — fall through to the fixup.
-    if (rayHit)                                            // tight: real ray hit
-    {
-        uint c = gDilateColorIn.Load(int3(raySp, 0));
-        if (c != 0u)
-        {
-            gDilateColorOut[pix] = c;
-            gDilateDepthOut[pix] = gNearZ / max(rayViewZ, 1e-4);
-            return;
-        }
-    }
-    if (bestD != 0xFFFFFFFFu)                              // fixup: nearest depth
-    {
-        uint c = gDilateColorIn.Load(int3(fixSp, 0));
-        if (c != 0u)
-        {
-            gDilateColorOut[pix] = c;
-            gDilateDepthOut[pix] = gNearZ / max((float) bestD / kLinDepthScale, 1e-4);
-            return;
-        }
-    }
-    gDilateColorOut[pix] = 0; // true sky
-    gDilateDepthOut[pix] = 0.0;
-}
-
 // Linear dispatch: pixel = SV_DispatchThreadID.
 [numthreads(8, 8, 1)]
-void csmain_dilate(uint3 dt : SV_DispatchThreadID, uint3 gt : SV_GroupThreadID)
+void csmain_dilate(uint3 dt : SV_DispatchThreadID)
 {
-    DilateAt(int2(dt.xy), int2(gt.xy));
+    DilateAt(int2(dt.xy));
 }
 
 // Per-dispatch base group column (root constant b2). The CPU issues two EXACT
@@ -520,7 +374,7 @@ void csmain_dilate_swizzle(uint3 GTid : SV_GroupThreadID, uint3 GId : SV_GroupID
 {
     uint column = gColumnBase + GId.x + GId.z * gTileCS;  // real group column
     uint2 pix   = uint2(column * 8u, GId.y * 8u) + GTid.xy;
-    DilateAt(int2(pix), int2(GTid.xy));
+    DilateAt(int2(pix));
 }
 
 // ============================================================

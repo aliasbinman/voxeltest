@@ -117,6 +117,7 @@ POut psmain_octet(VOut i)
 
     float vs   = i.vsize;
     uint  occ  = i.occ;
+    uint2 visPack = gLwBlockVis[i.blockIdx];   // per-child 6-bit visMask (8 voxels)
 
     float bestT = 1e30;
     int   bestC = -1;
@@ -127,26 +128,20 @@ POut psmain_octet(VOut i)
         if (((occ >> c) & 1u) == 0u)
             continue;
 
+        // Only hit exposed faces — a face occluded by a neighbour voxel isn't a
+        // real surface, so the ray passes through it (avoids rendering internal
+        // faces / faces hidden by an adjacent block).
+        uint vmask = (c < 4u) ? ((visPack.x >> (c * 8u)) & 0x3Fu)
+                              : ((visPack.y >> ((c - 4u) * 8u)) & 0x3Fu);
+        if (vmask == 0u) vmask = 0x3Fu;        // legacy: no mask → all faces visible
+
         float3 cmin = i.octMin + vs * float3(c & 1u, (c >> 1) & 1u, (c >> 2) & 1u);
-        float3 cmax = cmin + vs;
-        float3 t0 = (cmin - ro) * invRd;
-        float3 t1 = (cmax - ro) * invRd;
-        float3 tsm = min(t0, t1);
-        float3 tbg = max(t0, t1);
-        float tN = max(max(tsm.x, tsm.y), tsm.z);
-        float tF = min(min(tbg.x, tbg.y), tbg.z);
-        if (tF < max(tN, 0.0))
-            continue;        // miss
-        float tHit = max(tN, 0.0);
-        if (tHit >= bestT)
-            continue;
+        float  tHit; uint face;
+        if (!RayAabb(ro, rd, invRd, cmin, cmin + vs, vmask, tHit, face)) continue;
+        if (tHit >= bestT) continue;
         bestT = tHit;
         bestC = (int)c;
-
-        // Entry face = axis that produced tN.
-        if      (tN == tsm.x) bestFace = (rd.x > 0.0) ? 1u : 0u;
-        else if (tN == tsm.y) bestFace = (rd.y > 0.0) ? 3u : 2u;
-        else                  bestFace = (rd.z > 0.0) ? 5u : 4u;
+        bestFace = face;
     }
     if (bestC < 0) { discard; }
 

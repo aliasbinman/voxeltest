@@ -1961,7 +1961,15 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
             // Classify by size only (enables gate at draw time so disabled techs
             // leave visible holes). Geo wins only when geoMinPx is the higher band.
             const float voxelPx = focalPx * lodScaleF / std::max(distNearC, 1e-3f);
-            if (L == 0 && geoMinPx >= bbMinPx && voxelPx >= geoMinPx)
+            if (args.splatOnlyDebug)
+            {
+                // Debug: force every cluster (incl. close LOD0) through the splat +
+                // dilate path so the dilate passes can be inspected in isolation.
+                drawList[L].push_back({chunkSlot,
+                                       rc.clusterBlockFirst[clSlot],
+                                       rc.clusterBlockCount[clSlot], 0.0f});
+            }
+            else if (L == 0 && geoMinPx >= bbMinPx && voxelPx >= geoMinPx)
             {
                 octetDrawList[1].push_back({chunkSlot,
                                             rc.clusterBlockFirst[clSlot],

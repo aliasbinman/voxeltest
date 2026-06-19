@@ -61,6 +61,28 @@ static const float3 kFaceN[6] = {
     float3( 0, 0, 1), float3( 0, 0,-1),
 };
 
+// Ray-vs-AABB slab test, visMask-aware. Hit when the exit t is non-negative and
+// >= the entry t AND the entry face is enabled in faceMask (6 bits, kFaceN order
+// 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z) — a face occluded by a neighbour voxel (bit 0)
+// is not a real surface, so the ray passes through it. Pass 0x3Fu for "all faces".
+// Outputs the clamped entry distance (tHit >= 0) and the entry face. invRd = 1/rd.
+bool RayAabb(float3 ro, float3 rd, float3 invRd, float3 vmin, float3 vmax,
+             uint faceMask, out float tHit, out uint face)
+{
+    float3 t0 = (vmin - ro) * invRd;
+    float3 t1 = (vmax - ro) * invRd;
+    float3 tsm = min(t0, t1);
+    float3 tbg = max(t0, t1);
+    float tN = max(max(tsm.x, tsm.y), tsm.z);
+    float tF = min(min(tbg.x, tbg.y), tbg.z);
+    tHit = max(tN, 0.0);
+    if (tF < 0.0 || tN > tF) { face = 0u; return false; }
+    if      (tN == tsm.x) face = (rd.x > 0.0) ? 1u : 0u;
+    else if (tN == tsm.y) face = (rd.y > 0.0) ? 3u : 2u;
+    else                  face = (rd.z > 0.0) ? 5u : 4u;
+    return ((faceMask >> face) & 1u) != 0u;   // occluded entry face → not a hit
+}
+
 // Ambient cube — warm/cool per axis face, triplanar-blended from the normal so
 // each face picks up a different indirect tint instead of one flat scalar.
 static const float3 kAmbientCube[6] = {
