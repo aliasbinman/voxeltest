@@ -309,9 +309,9 @@ void DilateAtRef(int2 pix)
 
         float vzN  = (float)d / kLinDepthScale;          // forward distance
         float S    = (float)(1u << ((c >> 24) & 0x7Fu)); // true voxel world size
-        // +0.5px so adjacent footprints overlap (they'd only just touch at exactly
-        // projPx spacing → integer-rounding seams). Tune up if gaps persist.
-        float half = 0.5 * S * focalPx / max(vzN, 1e-4) + 0.5;
+        // +1px so adjacent footprints overlap (they'd only just touch at exactly
+        // projPx spacing → integer-rounding seams, worst at diagonal corners).
+        float half = 0.5 * S * focalPx / max(vzN, 1e-4) + 1.0;
         if (max(abs(dx), abs(dy)) <= half && d < bestD)
         {
             bestD = d; winCol = c; found = true;
@@ -395,9 +395,9 @@ void DilateAt(int2 pix, int2 gtid)
             float vzN = (float) d / kLinDepthScale;       // forward distance
             uint  L   = (c >> 24) & 0x7Fu;                // LOD tag (lodScale = 1<<L)
             float S   = (float) (1u << L);                // true voxel world size
-            // +0.5px so adjacent footprints overlap (they'd only just touch at
-            // exactly projPx spacing → integer-rounding seams). Tune if needed.
-            gsHalf[slot] = 0.5 * S * focalPx / max(vzN, 1e-4) + 0.5;
+            // +1px so adjacent footprints overlap (they'd only just touch at exactly
+            // projPx spacing → integer-rounding seams, worst at diagonal corners).
+            gsHalf[slot] = 0.5 * S * focalPx / max(vzN, 1e-4) + 1.0;
         }
     }
     GroupMemoryBarrierWithGroupSync();
