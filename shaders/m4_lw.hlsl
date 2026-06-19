@@ -293,7 +293,8 @@ void DilateAtRef(int2 pix)
     // The footprint is centred on the splat pixel (where the voxel really
     // projected), so it can't extend past the voxel's true extent into sky.
     // Among covering voxels the nearest depth wins (occlusion).
-    float  focalPx = gScreenSize.y * 0.5 / gTanHalfFovY;
+    float  focalPx   = gScreenSize.y * 0.5 / gTanHalfFovY;
+    float2 invScreen = float2(1.0 / (float)W, 1.0 / (float)H);
     int    R = max(gSplatRadius, 1);
 
     uint winCol = 0; uint bestD = 0xFFFFFFFFu; bool found = false;
@@ -307,11 +308,15 @@ void DilateAtRef(int2 pix)
         uint d = gDilateDepthSrv.Load(int3(sp, 0));
         if (d == 0xFFFFFFFFu) continue;
 
-        float vzN  = (float)d / kLinDepthScale;          // forward distance
+        float vzN  = (float)d / kLinDepthScale;          // forward distance (view-Z)
         float S    = (float)(1u << ((c >> 24) & 0x7Fu)); // true voxel world size
-        // +1px so adjacent footprints overlap (they'd only just touch at exactly
-        // projPx spacing → integer-rounding seams, worst at diagonal corners).
-        float half = 0.5 * S * focalPx / max(vzN, 1e-4) + 1.0;
+        // Edge stretch 1/cosθ (= unnormalised view-ray length) so the footprint
+        // matches the real splat spacing at screen sides; +1px for rounding seams.
+        float2 uvN = (float2(sp) + 0.5) * invScreen;
+        float3 vdir = float3((uvN.x * 2.0 - 1.0) * gAspect * gTanHalfFovY,
+                             (1.0 - uvN.y * 2.0) * gTanHalfFovY, 1.0);
+        float invCos = length(vdir);
+        float half = 0.5 * S * focalPx * invCos / max(vzN, 1e-4) + 1.0;
         if (max(abs(dx), abs(dy)) <= half && d < bestD)
         {
             bestD = d; winCol = c; found = true;
@@ -358,7 +363,8 @@ void DilateAt(int2 pix, int2 gtid)
 
     int W = (int) gVwSize.x;
     int H = (int) gVwSize.y;
-    float focalPx = gScreenSize.y * 0.5 / gTanHalfFovY;
+    float  focalPx   = gScreenSize.y * 0.5 / gTanHalfFovY;
+    float2 invScreen = float2(1.0 / (float) W, 1.0 / (float) H);
 
     // Fill the (8+2R)x(8+2R) LDS window (8x8 group + R px pad each side, stored at
     // fixed stride PadSz). For each splat cell, cache its colour, view depth and
@@ -392,12 +398,18 @@ void DilateAt(int2 pix, int2 gtid)
         gsColor[slot] = c;
         if (d != 0xFFFFFFFFu)
         {
-            float vzN = (float) d / kLinDepthScale;       // forward distance
+            float vzN = (float) d / kLinDepthScale;       // forward distance (view-Z)
             uint  L   = (c >> 24) & 0x7Fu;                // LOD tag (lodScale = 1<<L)
             float S   = (float) (1u << L);                // true voxel world size
-            // +1px so adjacent footprints overlap (they'd only just touch at exactly
-            // projPx spacing → integer-rounding seams, worst at diagonal corners).
-            gsHalf[slot] = 0.5 * S * focalPx / max(vzN, 1e-4) + 1.0;
+            // Edge stretch: off-axis the flat screen plane magnifies the projection
+            // radially by 1/cosθ = length of the unnormalised view ray. Without it
+            // the footprint underestimates the real splat spacing at screen sides →
+            // gaps there. +1px so adjacent footprints overlap (rounding seams).
+            float2 uvN = (float2(sp) + 0.5) * invScreen;
+            float3 vdir = float3((uvN.x * 2.0 - 1.0) * gAspect * gTanHalfFovY,
+                                 (1.0 - uvN.y * 2.0) * gTanHalfFovY, 1.0);
+            float invCos = length(vdir);                  // 1/cosθ
+            gsHalf[slot] = 0.5 * S * focalPx * invCos / max(vzN, 1e-4) + 1.0;
         }
     }
     GroupMemoryBarrierWithGroupSync();

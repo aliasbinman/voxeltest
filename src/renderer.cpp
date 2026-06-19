@@ -1881,8 +1881,38 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
     float camP[3];
     hlslpp::store(camP, cam.position);
+    float camFwd[3];
+    hlslpp::store(camFwd, cam.forward());
     const float fovRad   = cam.fovDeg * 3.14159265358979f / 180.0f;
     const float focalPx  = (float)height_ / (2.0f * tanf(fovRad * 0.5f));
+    const float nearFwd  = std::max(cam.nearZ, 1e-3f);
+
+    // Conservative on-screen voxel size (px) for a cluster AABB: matches the
+    // dilate's footprint math so the splat path only gets gap-fillable clusters.
+    // projected px = focalPx * voxelSize / viewZ * (1/cosθ). Off-axis the flat
+    // screen plane stretches the projection radially by 1/cosθ (= euclid/forward),
+    // which the old Euclidean-distance estimate ignored → undersized at the screen
+    // sides → splat got too-sparse clusters → gaps. Take nearest view-Z and the
+    // max stretch over the 8 corners (both worst-case → conservative, biases to
+    // octet over a gap).
+    auto clusterVoxelPx = [&](float mnx, float mny, float mnz,
+                              float mxx, float mxy, float mxz, float voxSize) -> float
+    {
+        float vzNear = 1e30f, invCosMax = 1.0f;
+        for (int ci = 0; ci < 8; ++ci)
+        {
+            float cx = (ci & 1) ? mxx : mnx;
+            float cy = (ci & 2) ? mxy : mny;
+            float cz = (ci & 4) ? mxz : mnz;
+            float rx = cx - camP[0], ry = cy - camP[1], rz = cz - camP[2];
+            float fz = rx*camFwd[0] + ry*camFwd[1] + rz*camFwd[2];
+            fz = std::max(fz, nearFwd);
+            float e  = sqrtf(rx*rx + ry*ry + rz*rz);
+            vzNear    = std::min(vzNear, fz);
+            invCosMax = std::max(invCosMax, e / fz);
+        }
+        return focalPx * voxSize * invCosMax / vzNear;
+    };
     const float lodScaleUi = std::max(args.pointLodScale, 0.01f);
     const float thresh   = 1.0f / lodScaleUi;
 
@@ -1957,10 +1987,10 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
 
         if (desNearC >= L || !childLoaded || L == 0)
         {
-            // pixels-per-voxel of the closest voxel = focalPx * voxelSize / dist.
-            // Classify by size only (enables gate at draw time so disabled techs
-            // leave visible holes). Geo wins only when geoMinPx is the higher band.
-            const float voxelPx = focalPx * lodScaleF / std::max(distNearC, 1e-3f);
+            // On-screen voxel size (px), view-Z + edge-stretch corrected so the
+            // splat path only gets clusters the dilate can fill gap-free. Classify
+            // by size only (gate at draw time so disabled techs leave visible holes).
+            const float voxelPx = clusterVoxelPx(mnx, mny, mnz, mxx, mxy, mxz, lodScaleF);
             if (args.splatOnlyDebug)
             {
                 // Debug: force every cluster (incl. close LOD0) through the splat +
