@@ -21,6 +21,9 @@ cbuffer CBLwCS : register(b1)
     int   gSplatRadius;    // 0 = single pixel; N writes (2N+1)x(2N+1).
     uint  gAoCount;        // gLwBlockAo element count (blockCount*8); 0 = no AO buffer
     uint  gTileCS;         // thread-group swizzle tile width (0 = off / linear)
+    float2 gInvVwSize;     // 1/gVwSize — dilate footprint invariant (CPU-precomputed)
+    float gFocalPx;        // gScreenSize.y*0.5/gTanHalfFovY — dilate focal invariant
+    float _padLw;
 };
 
 struct LwChunkInfo
@@ -128,6 +131,29 @@ float3 ApplyFog(float3 color, float3 wpos)
     float3 sunTint = float3(1.10, 0.85, 0.55);
     float3 fogCol  = lerp(gFogColor, sunTint, sunAmt);
     return lerp(fogCol, color, exp(-optical));
+}
+
+// Single-face shading shared by the octet PS and the splat dilate so both techs
+// match exactly. `face` is the ray-AABB hit face (0..5), `ao` its baked AO,
+// `hitW` the world hit point (for fog). gMode 2 = face-colour viz, 3 = AO viz.
+float3 ShadeFace(float3 albedo, uint face, float ao, float3 hitW)
+{
+    if ((int)gMode == 3)
+        return float3(ao, ao, ao);
+    if ((int)gMode == 2)
+    {
+        const float3 kFaceColor[6] = {
+            float3(1.0, 0.2, 0.2), float3(1.0, 0.2, 1.0), float3(0.2, 1.0, 0.2),
+            float3(1.0, 0.5, 0.1), float3(0.2, 0.4, 1.0), float3(0.2, 1.0, 1.0) };
+        return kFaceColor[face];
+    }
+    float3 N      = kFaceN[face];
+    float3 sunCol = float3(1.0, 0.95, 0.85) * (gSunIntensity * 3.0);
+    float  NdotL  = max(0.0, dot(N, gLightDir));
+    float3 amb    = AmbientCube(N) * gAmbient;
+    float3 lit    = albedo * (amb + NdotL * sunCol);
+    lit *= lerp(1.0, ao, gAoStrength);
+    return ApplyFog(lit, hitW);
 }
 
 #endif // M4_COMMON_HLSLI

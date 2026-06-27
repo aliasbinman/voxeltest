@@ -170,70 +170,36 @@ void csmain_pass2_color(uint3 dt : SV_DispatchThreadID)
         const uint kLinDepthSlop = 64u;
         if (myLin > gLwDepthSrv.Load(int3(pix, 0)) + kLinDepthSlop) continue;
 
-        // Light the hit HERE (triplanar from camera→voxel-centre, visMask-gated,
-        // baked AO, fog). The dilate then just spreads the finished colour/depth.
-        uint   colPck = gLwPalette[ci.paletteBase + palIdx];
-        float3 albedo = float3((colPck & 0xFFu), ((colPck >> 8) & 0xFFu),
-                               ((colPck >> 16) & 0xFFu)) / 255.0;
+        // Emit RAW shading inputs — the dilate lights per output pixel using the
+        // actual ray-AABB hit FACE (so each face shades separately instead of one
+        // averaged colour). visColor = albedo + visMask; visAo = per-face AO + LOD.
+        uint colPck = gLwPalette[ci.paletteBase + palIdx];
         uint mask = (i < 4u) ? ((visPack.x >> (i * 8u)) & 0x3Fu)
                               : ((visPack.y >> ((i - 4u) * 8u)) & 0x3Fu);
         if (mask == 0u) mask = 0x3Fu;
+
+        // Cull a splat with no camera-facing visible face (back face only): the
+        // dilate would otherwise light a face pointing away from the camera.
+        float3 vdir = gCamPos - world;
+        bool anyFront = false;
+        [unroll] for (uint f = 0u; f < 6u; ++f)
+            if (((mask >> f) & 1u) && dot(kFaceN[f], vdir) > 0.0) anyFront = true;
+        if (!anyFront) continue;
+
         uint aoFace24 = gLwBlockAo[(blockBase + (gid - firstThread)) * 8u + i] & 0x00FFFFFFu;
-
-        float3 centerW = world;
-        float3 vdir = normalize(gCamPos - centerW);
-        uint f0 = (vdir.x >= 0.0) ? 0u : 1u;
-        uint f1 = (vdir.y >= 0.0) ? 2u : 3u;
-        uint f2 = (vdir.z >= 0.0) ? 4u : 5u;
-        float w0 = ((mask >> f0) & 1u) ? vdir.x * vdir.x : 0.0;
-        float w1 = ((mask >> f1) & 1u) ? vdir.y * vdir.y : 0.0;
-        float w2 = ((mask >> f2) & 1u) ? vdir.z * vdir.z : 0.0;
-        // No camera-facing visible face → back-facing splat (e.g. underside of a
-        // flat +Y-only surface seen grazing). Its normal would be normalize(0)=NaN
-        // → black. Skip it; the dilate fills the pixel from valid neighbours.
-        float ws = w0 + w1 + w2;
-        if (ws <= 0.0) continue;
-        w0 /= ws; w1 /= ws; w2 /= ws;
-        float3 N0 = float3(sign(vdir.x), 0, 0);
-        float3 N1 = float3(0, sign(vdir.y), 0);
-        float3 N2 = float3(0, 0, sign(vdir.z));
-        float3 Nshade = normalize(w0 * N0 + w1 * N1 + w2 * N2);
-        float  NdotL  = w0 * max(0.0, dot(N0, gLightDir))
-                      + w1 * max(0.0, dot(N1, gLightDir))
-                      + w2 * max(0.0, dot(N2, gLightDir));
-        uint   domFace = (w0 >= w1 && w0 >= w2) ? f0 : (w1 >= w2 ? f1 : f2);
-
-        float aos = 0.0; uint aon = 0u;
-        [unroll] for (uint f = 0u; f < 6u; ++f) {
-            if (((mask >> f) & 1u) == 0u) continue;
-            aos += (float)((aoFace24 >> (f * 4u)) & 0xFu) * (1.0 / 15.0); ++aon;
-        }
-        float ao = (aon > 0u) ? (aos / (float)aon) : 1.0;
-
-        float3 lit;
-        if ((int)gMode == 3) lit = float3(ao, ao, ao);
-        else if ((int)gMode == 2) {
-            const float3 kFaceColor[6] = {
-                float3(1.0,0.2,0.2), float3(1.0,0.2,1.0), float3(0.2,1.0,0.2),
-                float3(1.0,0.5,0.1), float3(0.2,0.4,1.0), float3(0.2,1.0,1.0) };
-            lit = kFaceColor[domFace];
-        } else {
-            float3 sunCol = float3(1.0, 0.95, 0.85) * (gSunIntensity * 3.0);
-            float3 amb    = AmbientCube(Nshade) * gAmbient;
-            lit = albedo * (amb + NdotL * sunCol);
-            lit *= lerp(1.0, ao, gAoStrength);
-            lit = ApplyFog(lit, centerW);
-        }
-        uint R8 = (uint)clamp(lit.r * 255.0, 0.0, 255.0);
-        uint G8 = (uint)clamp(lit.g * 255.0, 0.0, 255.0);
-        uint B8 = (uint)clamp(lit.b * 255.0, 0.0, 255.0);
-        // Alpha byte carries this voxel's LOD exponent L (lodScale == 1<<L) so the
-        // dilate uses the TRUE voxel size instead of guessing it from depth — a
-        // depth-guessed size can overshoot and bleed the cube's silhouette into
-        // sky. Marker bit 7 keeps argb != 0 so resolve's sky test still works.
         uint L = firstbithigh((uint)ci.lodScale);   // lodScale is a power of two
-        uint aTag = 0x80u | (L & 0x7Fu);
-        gLwVisUav[pix] = (aTag << 24) | (B8 << 16) | (G8 << 8) | R8; // lit + LOD tag
+
+        // visColor packs everything the dilate needs for COVERAGE + shading in one
+        // reliable texture: albedo 7-7-6 (bits 0-19), visMask (20-25), LOD (26-29),
+        // marker (30-31, keeps argb != 0). LOD lives here (not visAo) because the
+        // footprint size depends on it and must always be correct. visAo carries
+        // only the cosmetic per-face AO value.
+        uint r7 = (colPck        & 0xFFu) >> 1;       // 8->7
+        uint g7 = ((colPck >> 8) & 0xFFu) >> 1;       // 8->7
+        uint b6 = ((colPck >> 16) & 0xFFu) >> 2;      // 8->6
+        uint alb = r7 | (g7 << 7) | (b6 << 14);       // 20-bit albedo
+        gLwVisUav[pix] = (3u << 30) | (L << 26) | (mask << 20) | alb;
+        gLwAoUav[pix]  = aoFace24;                     // per-face AO (6 * 4-bit)
     }
 }
 
@@ -275,58 +241,163 @@ float3 SkyDome(float3 rd)
 }
 
 // Port of CSTiles csmain_splat — for each output pixel, scan NxN neighbors.
-// Each neighbor with color = represents a voxel center reconstructable from
-// its linear depth + screen coords. Ray-AABB against snapped LOD-grid voxel.
-// Pick nearest hit; output that color. Eliminates the "constant-color square"
-// artifact of nearest-neighbor dilate by giving each output pixel its own
-// geometrically-correct color.
-// Shared dilate body — `pix` is the output pixel (raw dispatch or swizzled).
+// Footprint coverage (no bleed) + PER-FACE lighting. The splat stores raw albedo
+// + visMask (visColor) and per-face AO + LOD (visAo). Coverage is decided by the
+// projected footprint, then the WINNING voxel is reconstructed and ray-AABB'd by
+// THIS pixel's ray to find the hit face, so each face shades separately (matches
+// the octet PS via ShadeFace) instead of one averaged colour per voxel.
+
+// Projected half-size in px of a voxel: 0.5 * S * focalPx / viewZ * (1/cosθ).
+// The 1/cosθ edge stretch (unnormalised view-ray length) makes the footprint
+// match real splat spacing at the screen sides; +1px closes rounding seams.
+float DilateHalfPx(int2 sp, float S, float vzN, float focalPx, float2 invScreen)
+{
+    float2 uvN = (float2(sp) + 0.5) * invScreen;
+    float3 vd  = float3((uvN.x * 2.0 - 1.0) * gAspect * gTanHalfFovY,
+                        (1.0 - uvN.y * 2.0) * gTanHalfFovY, 1.0);
+    return 0.5 * S * focalPx * length(vd) / max(vzN, 1e-4) + 1.0;
+}
+
+// Shade the winning splat for output `pix`: reconstruct its voxel, ray-AABB for
+// the hit face, light that face. c = albedo+visMask, aoPck = per-face AO + LOD,
+// d = view depth, winSp = winner splat pixel. Returns packed lit colour + viewZ.
+uint ShadeDilateWinner(int2 winSp, uint c, uint aoPck, uint d,
+                       float3 ro, float3 rd, float3 invRd, float2 invScreen,
+                       out float outViewZ)
+{
+    float  vzN    = (float)d / kLinDepthScale;
+    uint   mask   = (c >> 20) & 0x3Fu;
+    float3 albedo = float3((c & 0x7Fu) / 127.0, ((c >> 7) & 0x7Fu) / 127.0,
+                           ((c >> 14) & 0x3Fu) / 63.0);          // 7-7-6
+    float  S      = (float)(1u << ((c >> 26) & 0xFu));           // LOD from colour
+
+    // Voxel from winner splat pixel + its depth, snapped to the LOD grid. (Used
+    // only for the FACE; coverage already came from the footprint, so a sub-pixel
+    // snap error can't bleed — at worst it picks a slightly different face.)
+    float2 uvN = (float2(winSp) + 0.5) * invScreen;
+    float3 center = ro + gCamRight * ((uvN.x * 2.0 - 1.0) * gAspect * gTanHalfFovY * vzN)
+                       + gCamUp    * ((1.0 - uvN.y * 2.0) * gTanHalfFovY * vzN)
+                       + gCamForward * vzN;
+    float3 vmin = floor(center / S) * S;
+
+    float tHit; uint face; float3 hitW;
+    // tHit > epsilon: a real hit in FRONT of the camera. RayAabb clamps tHit to 0
+    // when the camera is inside the box — which happens for near voxels the octet
+    // near-plane cull pushed to the splat path; without this guard every such
+    // pixel "hits" at t=0 and the screen looks like the inside of one big cube.
+    if (RayAabb(ro, rd, invRd, vmin, vmin + S, mask, tHit, face) && tHit > 1e-3)
+    {
+        hitW = ro + rd * tHit;
+        outViewZ = max(0.001, dot(hitW - gCamPos, gCamForward));
+    }
+    else
+    {
+        // Ray missed (or camera inside) — fall back to the dominant camera-facing
+        // visible face so coverage pixels still shade sensibly.
+        float best = -1e9; face = 0u;
+        float3 vc = gCamPos - center;
+        [unroll] for (uint f = 0u; f < 6u; ++f)
+        {
+            if (((mask >> f) & 1u) == 0u) continue;
+            float dd = dot(kFaceN[f], vc);
+            if (dd > best) { best = dd; face = f; }
+        }
+        hitW = center;
+        outViewZ = vzN;
+    }
+
+    float  ao  = (float)((aoPck >> (face * 4u)) & 0xFu) * (1.0 / 15.0);
+    float3 lit = ShadeFace(albedo, face, ao, hitW);
+    uint R8 = (uint)clamp(lit.r * 255.0, 0.0, 255.0);
+    uint G8 = (uint)clamp(lit.g * 255.0, 0.0, 255.0);
+    uint B8 = (uint)clamp(lit.b * 255.0, 0.0, 255.0);
+    return 0xFF000000u | (B8 << 16) | (G8 << 8) | R8;
+}
+
+// Scalar fallback (R > pxPadMax): no LDS, reads textures directly.
 void DilateAtRef(int2 pix)
 {
     int W = (int)gVwSize.x;
     int H = (int)gVwSize.y;
     if (pix.x >= W || pix.y >= H) return;
 
-    // A pixel is coloured iff some neighbour voxel's projected screen footprint
-    // covers it: |dx|,|dy| within that voxel's projected half-size in px
-    // (0.5 * S * focalPx / viewZ, S = true voxel world size from the LOD tag).
-    // The footprint is centred on the splat pixel (where the voxel really
-    // projected), so it can't extend past the voxel's true extent into sky.
-    // Among covering voxels the nearest depth wins (occlusion).
-    float  focalPx   = gScreenSize.y * 0.5 / gTanHalfFovY;
-    float2 invScreen = float2(1.0 / (float)W, 1.0 / (float)H);
+    float3 ro = gCamPos;
+    float3 rd = PixelWorldDir(float2(pix) + 0.5, gInvVwSize);
+    float3 invRd = 1.0 / rd;
     int    R = max(gSplatRadius, 1);
 
-    uint winCol = 0; uint bestD = 0xFFFFFFFFu; bool found = false;
+    // Primary: nearest ray-cube hit (watertight). Fallback: footprint coverage,
+    // nearest depth (fills sub-pixel-size voxels in the distance + boundary misses
+    // up close where depth quantisation snaps the cube to the wrong cell).
+    int2 winSp = int2(0, 0); uint winC = 0, winAo = 0; uint bestD = 0xFFFFFFFFu;
+    float bestT = 1e30;            // nearest ray-cube hit distance
+    bool found = false;            // slab hit found
+    int2 fbSp = int2(0, 0); uint fbC = 0, fbAo = 0, fbD = 0xFFFFFFFFu;
+    bool fbFound = false;          // footprint fallback found
     [loop] for (int dy = -R; dy <= R; ++dy)
-    [loop] for (int dx = -R; dx <= R; ++dx)
     {
-        int2 sp = pix + int2(dx, dy);
-        if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) continue;
-        uint c = gDilateColorIn.Load(int3(sp, 0));
-        if (c == 0u) continue;
-        uint d = gDilateDepthSrv.Load(int3(sp, 0));
-        if (d == 0xFFFFFFFFu) continue;
-
-        float vzN  = (float)d / kLinDepthScale;          // forward distance (view-Z)
-        float S    = (float)(1u << ((c >> 24) & 0x7Fu)); // true voxel world size
-        // Edge stretch 1/cosθ (= unnormalised view-ray length) so the footprint
-        // matches the real splat spacing at screen sides; +1px for rounding seams.
-        float2 uvN = (float2(sp) + 0.5) * invScreen;
-        float3 vdir = float3((uvN.x * 2.0 - 1.0) * gAspect * gTanHalfFovY,
-                             (1.0 - uvN.y * 2.0) * gTanHalfFovY, 1.0);
-        float invCos = length(vdir);
-        float half = 0.5 * S * focalPx * invCos / max(vzN, 1e-4) + 1.0;
-        if (max(abs(dx), abs(dy)) <= half && d < bestD)
+        [loop] for (int dx = -R; dx <= R; ++dx)
         {
-            bestD = d; winCol = c; found = true;
-        }
-    }
+            int2 sp = pix + int2(dx, dy);
+            if (sp.x < 0 || sp.x >= W || sp.y < 0 || sp.y >= H) 
+                continue;
+            
+            // Just get the depth and determine t of when this ray intersects box.
+            
+            
+            uint c = gDilateColorIn.Load(int3(sp, 0));
+            if (c == 0u) continue;
+            
+            uint d = gDilateDepthSrv.Load(int3(sp, 0));
+            if (d == 0xFFFFFFFFu) continue;
+            
+            uint ao = gDilateAoIn.Load(int3(sp, 0));
+            
+            
+            
 
-    if (found)                                            // covered by a voxel
+            float S    = (float)(1u << ((c >> 26) & 0xFu));   // LOD from colour bits
+            float vzN  = (float)d / kLinDepthScale;
+
+            // --- Slab-test path: reconstruct this neighbour's voxel cube and
+            //     intersect THIS pixel's ray with it. Nearest tHit wins → exact
+            //     watertight cubes (no footprint gaps). LOD baked in S (lod0=1).
+            float2 uvN = (float2(sp) + 0.5) * gInvVwSize;
+            float3 center = ro
+                + gCamRight   * ((uvN.x * 2.0 - 1.0) * gAspect * gTanHalfFovY * vzN)
+                + gCamUp      * ((1.0 - uvN.y * 2.0) * gTanHalfFovY * vzN)
+                + gCamForward * vzN;
+            float3 vmin = floor(center / S) * S;
+            uint   mask = (c >> 20) & 0x3Fu;
+            float  tHit; uint face;
+            if (RayAabb(ro, rd, invRd, vmin, vmin + S, mask, tHit, face)
+                && tHit > 1e-3 && tHit < bestT)
+            {
+                bestT = tHit; bestD = d; winSp = sp; winC = c; winAo = ao; found = true;
+            }
+
+            // --- Footprint coverage fallback: sub-pixel-size voxels never get a
+            //     real ray-cube hit, and boundary pixels can miss; keep the nearest
+            //     covered splat so those pixels still draw (shaded center+face).
+            float half = DilateHalfPx(sp, S, vzN, gFocalPx, gInvVwSize);
+            if (max(abs(dx), abs(dy)) <= half && d < fbD)
+            {
+                fbD = d; fbSp = sp; fbC = c; fbAo = ao; fbFound = true;
+            }
+        }
+ 
+    }
+   
+    if (!found && fbFound)        // no slab hit → use footprint coverage winner
     {
-        gDilateColorOut[pix] = winCol;
-        gDilateDepthOut[pix] = gNearZ / max((float)bestD / kLinDepthScale, 1e-4);
+        winSp = fbSp; winC = fbC; winAo = fbAo; bestD = fbD; found = true;
+    }
+    if (found)
+    {
+        float viewZ;
+        gDilateColorOut[pix] = ShadeDilateWinner(winSp, winC, winAo, bestD,
+                                                 ro, rd, invRd, gInvVwSize, viewZ);
+        gDilateDepthOut[pix] = gNearZ / max(viewZ, 1e-4);
         return;
     }
     gDilateColorOut[pix] = 0;                              // true sky
@@ -337,44 +408,30 @@ static const int pxPadMax = 3;                          // max supported radius
 static const int groupSz   = 8;
 static const int PadSz     = groupSz + pxPadMax + pxPadMax;   // 14 (fixed stride)
 
-// Window cache: the dilate scans an (8+2R)x(8+2R) neighbourhood per output
-// pixel. The whole 8x8 group only touches one such screen region, so cache it
-// once in LDS. The reconstructed voxel AABB (vmin + size S) for a cell depends
-// ONLY on that cell's screen pos + depth — not on the output pixel — so it's
-// identical for every one of the 64 threads that scan it. We therefore do the
-// expensive reconstruction (log2/floor/divide) ONCE per window cell in the fill
-// and cache the AABB; the inner loop then only runs the cheap RayAabb. Colour is
-// NOT cached: the scan is pure geometry, so we resolve the single winning cell
-// and do ONE texture Load for its (already-lit) colour at the end. Splats are
-// co-located (pass1 depth + pass2 colour hit the same pixel), so valid depth
-// implies a colour — except pass2's grazing back-face skip, guarded by the c!=0
-// fallback. The arrays are sized for Rmax=3 (14x14=196); smaller R uses a
-// centred sub-region at the same fixed stride. Off-screen / empty cells store
-// the d==0xFFFFFFFF sentinel so the scan's skip covers edges with no bounds test.
+// Window cache: the dilate scans an (8+2R)x(8+2R) neighbourhood per output pixel.
+// The whole 8x8 group only touches one such screen region, so cache its splat
+// inputs in LDS once (3 loads/thread) instead of re-loading per scan cell. Cached
+// per cell: depth, colour (albedo+visMask), AO (per-face AO + LOD) and the
+// precomputed footprint half-size. Arrays sized for Rmax=3 (14x14=196); smaller R
+// uses a centred sub-region at the fixed stride. Empty/off-screen cells store the
+// d==0xFFFFFFFF sentinel so the scan's skip covers edges with no bounds test.
 groupshared uint   gsDepth[PadSz * PadSz];
-groupshared uint   gsColor[PadSz * PadSz];   // packed lit colour (+ LOD tag in a)
+groupshared uint   gsColor[PadSz * PadSz];   // albedo (0-23) + visMask (24-29)
+groupshared uint   gsAo   [PadSz * PadSz];   // per-face AO (0-23) + LOD (24-27)
 groupshared float  gsHalf [PadSz * PadSz];   // projected half-size in px (footprint)
 
 void DilateAt(int2 pix, int2 gtid)
 {
     int R = max(gSplatRadius, 1);
-    if (R > pxPadMax)
+   // if (R > pxPadMax)
         return DilateAtRef(pix);                // beyond cache size: scalar path
 
     int W = (int) gVwSize.x;
     int H = (int) gVwSize.y;
-    float  focalPx   = gScreenSize.y * 0.5 / gTanHalfFovY;
-    float2 invScreen = float2(1.0 / (float) W, 1.0 / (float) H);
 
     // Fill the (8+2R)x(8+2R) LDS window (8x8 group + R px pad each side, stored at
-    // fixed stride PadSz). For each splat cell, cache its colour, view depth and
-    // its voxel's PROJECTED HALF-SIZE in pixels (0.5 * S * focalPx / viewZ). We do
-    // NOT reconstruct a world cube: the splat is a single integer pixel, so the
-    // voxel's sub-pixel world position is lost, and snapping a reconstructed point
-    // to the LOD grid can land the cube in the wrong (sky-side) cell at distance —
-    // that misplacement is what bled coarse voxels into the sky. The footprint is
-    // centred on the splat pixel itself (where the voxel really projected), so it
-    // can never extend past the voxel's true screen extent.
+    // fixed stride PadSz). Footprint is centred on the splat pixel (where the voxel
+    // really projected), sized to the true voxel extent, so it can't reach sky.
     int  ext = groupSz + R + R;                 // window width this dispatch
     int2 winOrigin = (pix - gtid) - int2(R, R);
     int  tid = gtid.y * groupSz + gtid.x;       // 0..63
@@ -384,32 +441,22 @@ void DilateAt(int2 pix, int2 gtid)
         int2 sp = winOrigin + int2(lx, ly);
         int  slot = ly * PadSz + lx;            // fixed-stride LDS slot
         uint d = 0xFFFFFFFFu;
-        uint c = 0u;
+        uint c = 0u, ao = 0u;
         if (sp.x >= 0 && sp.x < W && sp.y >= 0 && sp.y < H)
         {
-            d = gDilateDepthSrv.Load(int3(sp, 0));
-            c = gDilateColorIn.Load(int3(sp, 0));
+            d  = gDilateDepthSrv.Load(int3(sp, 0));
+            c  = gDilateColorIn.Load(int3(sp, 0));
+            ao = gDilateAoIn.Load(int3(sp, 0));
         }
-        // A cell participates only if it has BOTH depth and colour. (Pass2 can
-        // write depth but skip colour on a grazing back-face → c==0; drop those
-        // by forcing the depth sentinel so the scan ignores them.)
-        if (c == 0u) d = 0xFFFFFFFFu;
+        if (c == 0u) d = 0xFFFFFFFFu;           // no splat here → ignore in scan
         gsDepth[slot] = d;
         gsColor[slot] = c;
+        gsAo[slot]    = ao;
         if (d != 0xFFFFFFFFu)
         {
-            float vzN = (float) d / kLinDepthScale;       // forward distance (view-Z)
-            uint  L   = (c >> 24) & 0x7Fu;                // LOD tag (lodScale = 1<<L)
-            float S   = (float) (1u << L);                // true voxel world size
-            // Edge stretch: off-axis the flat screen plane magnifies the projection
-            // radially by 1/cosθ = length of the unnormalised view ray. Without it
-            // the footprint underestimates the real splat spacing at screen sides →
-            // gaps there. +1px so adjacent footprints overlap (rounding seams).
-            float2 uvN = (float2(sp) + 0.5) * invScreen;
-            float3 vdir = float3((uvN.x * 2.0 - 1.0) * gAspect * gTanHalfFovY,
-                                 (1.0 - uvN.y * 2.0) * gTanHalfFovY, 1.0);
-            float invCos = length(vdir);                  // 1/cosθ
-            gsHalf[slot] = 0.5 * S * focalPx * invCos / max(vzN, 1e-4) + 1.0;
+            float S   = (float) (1u << ((c >> 26) & 0xFu));    // LOD from colour bits
+            float vzN = (float) d / kLinDepthScale;
+            gsHalf[slot] = DilateHalfPx(sp, S, vzN, gFocalPx, gInvVwSize);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -419,36 +466,40 @@ void DilateAt(int2 pix, int2 gtid)
         return;
 
     // This pixel is coloured iff some neighbour voxel's projected footprint covers
-    // it (|dx|,|dy| within that voxel's projected half-size). No proximity/nearest
-    // fallback beyond the footprint, so a sky pixel no voxel projects onto stays
-    // sky → tight silhouettes. Among covering voxels the nearest depth wins.
+    // it. No proximity fallback beyond the footprint, so a sky pixel no voxel
+    // projects onto stays sky. Nearest depth wins (occlusion).
     int   winLidx = -1;
+    int2  winSp   = int2(0, 0);
     uint  bestD   = 0xFFFFFFFFu;
+  /*
     [loop]
     for (int dy = -R; dy <= R; ++dy)
-    [loop]
+    {
+        [loop]
         for (int dx = -R; dx <= R; ++dx)
         {
-            // Local index = (group thread + pad + delta); off-screen cells carry
-            // the d sentinel so this skip also covers screen edges.
             int  lidx = (gtid.y + R + dy) * PadSz + (gtid.x + R + dx);
             uint d = gsDepth[lidx];
             if (d == 0xFFFFFFFFu)
                 continue;
-
-            // Is this pixel within the neighbour voxel's projected footprint?
-            float half = gsHalf[lidx];
-            if (max(abs(dx), abs(dy)) <= half && d < bestD)
+            if (max(abs(dx), abs(dy)) <= gsHalf[lidx] && d < bestD)
             {
                 bestD   = d;
                 winLidx = lidx;
+                winSp   = pix + int2(dx, dy);
             }
         }
-
+    }
+*/
     if (winLidx >= 0)                                      // covered by a voxel
     {
-        gDilateColorOut[pix] = gsColor[winLidx];
-        gDilateDepthOut[pix] = gNearZ / max((float) bestD / kLinDepthScale, 1e-4);
+        float3 ro = gCamPos;
+        float3 rd = PixelWorldDir(float2(pix) + 0.5, gInvVwSize);
+        float  viewZ;
+        gDilateColorOut[pix] = ShadeDilateWinner(winSp, gsColor[winLidx],
+                                                 gsAo[winLidx], bestD,
+                                                 ro, rd, 1.0 / rd, gInvVwSize, viewZ);
+        gDilateDepthOut[pix] = gNearZ / max(viewZ, 1e-4);
         return;
     }
     gDilateColorOut[pix] = 0; // true sky

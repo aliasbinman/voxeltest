@@ -1916,8 +1916,12 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     const float lodScaleUi = std::max(args.pointLodScale, 0.01f);
     const float thresh   = 1.0f / lodScaleUi;
 
+    // "Point LOD" pulldown: Auto = distance-based; L0..L3 force that level globally.
+    const int forcedLod = ((int)args.pointLod < (int)PointLod::Auto)
+                        ? std::min((int)args.pointLod, lw::kLodCount - 1) : -1;
     auto desiredLodForDist = [&](float dist) -> int
     {
+        if (forcedLod >= 0) return forcedLod;
         if (dist < 1.0f) return 0;
         for (int L = 0; L < lw::kLodCount; ++L)
         {
@@ -2200,7 +2204,8 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
     };
     static_assert(sizeof(CBFrame) == 576, "CBFrame size mismatch");
     struct CBLwCs  { uint32_t vwSize[2]; uint32_t pointCount; uint32_t numItems;
-                     uint32_t lodIdx; int32_t splatRadius; uint32_t _pad[2]; };
+                     uint32_t lodIdx; int32_t splatRadius; uint32_t _pad[2];
+                     float invVwSize[2]; float focalPx; float _padLw; };
 
     // Halton(2/3) jitter, applied in NDC (so worldPos * jitteredVP shifts
     // sub-pixel each frame). Reset history when camera moved noticeably.
@@ -2319,6 +2324,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         // voxel for LOD index. So one global radius is fine for M4c.
         cbcs.splatRadius = std::max(0, args.splatRadius);
         cbcs._pad[1]     = (uint32_t)std::max(0, args.tileCS); // gTileCS (dilate swizzle)
+        cbcs.invVwSize[0] = visTexW_ ? 1.0f / (float)visTexW_ : 0.0f;
+        cbcs.invVwSize[1] = visTexH_ ? 1.0f / (float)visTexH_ : 0.0f;
+        cbcs.focalPx      = cbf.screenSize[1] * 0.5f / cbf.tanHalfFovY;
         cbcsAlloc[L] = graphicsMemory_->AllocateConstant(cbcs);
         wlAlloc[L]   = graphicsMemory_->Allocate(perLodWl[L].size() * sizeof(WI));
         std::memcpy(wlAlloc[L].Memory(), perLodWl[L].data(), perLodWl[L].size() * sizeof(WI));
@@ -2338,6 +2346,9 @@ void Renderer::DrawLwScene(const Camera& cam, const DrawSceneParams& args)
         cbcs.lodIdx     = 0;
         cbcs.splatRadius = 0;
         cbcs._pad[0]     = lwGpu_[0].blockAoSb ? (lwGpu_[0].blockCount * 8u) : 0u;  // gAoCount: clamp root-SRV read
+        cbcs.invVwSize[0] = visTexW_ ? 1.0f / (float)visTexW_ : 0.0f;
+        cbcs.invVwSize[1] = visTexH_ ? 1.0f / (float)visTexH_ : 0.0f;
+        cbcs.focalPx      = cbf.screenSize[1] * 0.5f / cbf.tanHalfFovY;
         octetCbAlloc[t] = graphicsMemory_->AllocateConstant(cbcs);
         octetWlAlloc[t] = graphicsMemory_->Allocate(octetWl[t].size() * sizeof(WI));
         std::memcpy(octetWlAlloc[t].Memory(), octetWl[t].data(), octetWl[t].size() * sizeof(WI));
